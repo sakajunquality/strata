@@ -6,6 +6,7 @@
 //! - `GET /api/repos/<id>/refs`
 //! - `GET /api/repos/<id>/commits?rev=<rev>&skip=<n>&limit=<1..100>`
 //! - `GET /api/repos/<id>/commit?rev=<rev>`
+//! - `GET /api/repos/<id>/compare?base=<rev>&head=<rev>`, see [`crate::merge`]
 //! - `GET /api/repos/<id>/tree?rev=<rev>&path=<dir>`
 //! - `GET /api/repos/<id>/blob?rev=<rev>&path=<file>` or `?oid=<id>`
 //!
@@ -28,7 +29,7 @@ use crate::{blocking, App, HttpError};
 /// How many changed files a commit view lists before it gives up.
 const MAX_CHANGES: usize = 1000;
 
-pub(crate) const VIEWS: [&str; 5] = ["refs", "commits", "commit", "tree", "blob"];
+pub(crate) const VIEWS: [&str; 6] = ["refs", "commits", "commit", "compare", "tree", "blob"];
 
 pub(crate) async fn handle(app: &App, repo: RepoState, view: &str, query: &str) -> Result<Response, HttpError> {
     let params: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
@@ -74,6 +75,7 @@ fn respond(repo: &RepoState, packs: &PackSet, view: &str, params: &HashMap<Strin
             commit["truncated"] = Value::Bool(!complete);
             Ok(crate::json(StatusCode::OK, commit))
         }
+        "compare" => crate::merge::compare(repo, packs, params),
         "tree" => {
             let oid = resolve(repo, packs, param("rev"))?;
             let info = packs.commit(&oid)?.ok_or_else(HttpError::not_found)?;
@@ -133,7 +135,7 @@ fn kind_of(mode: u32) -> &'static str {
 }
 
 /// The commit a revision names.
-fn resolve(repo: &RepoState, packs: &PackSet, rev: &str) -> Result<Oid, HttpError> {
+pub(crate) fn resolve(repo: &RepoState, packs: &PackSet, rev: &str) -> Result<Oid, HttpError> {
     let unknown = || HttpError::new(StatusCode::NOT_FOUND, "unknown revision");
     let named = match rev {
         "" | "HEAD" => repo.refs.get(&repo.head).copied(),
@@ -192,7 +194,7 @@ fn find(packs: &PackSet, commit: &CommitInfo, path: &str) -> Result<Option<(u32,
     Ok(Some(at))
 }
 
-fn entries(packs: &PackSet, tree: Option<Oid>) -> Result<BTreeMap<Vec<u8>, (u32, Oid)>, HttpError> {
+pub(crate) fn entries(packs: &PackSet, tree: Option<Oid>) -> Result<BTreeMap<Vec<u8>, (u32, Oid)>, HttpError> {
     let Some(tree) = tree else { return Ok(BTreeMap::new()) };
     let Some(object) = packs.get(&tree)? else { return Ok(BTreeMap::new()) };
     Ok(parse_tree(&object.data)?.iter().map(|entry| (entry.name.to_vec(), (entry.mode, entry.oid))).collect())
@@ -200,7 +202,7 @@ fn entries(packs: &PackSet, tree: Option<Oid>) -> Result<BTreeMap<Vec<u8>, (u32,
 
 /// Lists the files that differ between two trees. Returns false if the list
 /// was cut off at [`MAX_CHANGES`]. Only subtrees that differ are read.
-fn changes(packs: &PackSet, old: Option<Oid>, new: Option<Oid>, prefix: &str, out: &mut Vec<Value>) -> Result<bool, HttpError> {
+pub(crate) fn changes(packs: &PackSet, old: Option<Oid>, new: Option<Oid>, prefix: &str, out: &mut Vec<Value>) -> Result<bool, HttpError> {
     let (before, after) = (entries(packs, old)?, entries(packs, new)?);
     let names: std::collections::BTreeSet<&Vec<u8>> = before.keys().chain(after.keys()).collect();
     for name in names {
@@ -250,7 +252,7 @@ fn person(line: &str) -> Value {
     json!({ "name": name, "email": email, "time": time.parse::<i64>().unwrap_or(0), "zone": zone })
 }
 
-fn commit_json(packs: &PackSet, oid: &Oid) -> Result<Value, HttpError> {
+pub(crate) fn commit_json(packs: &PackSet, oid: &Oid) -> Result<Value, HttpError> {
     let object = packs.get(oid)?.filter(|object| object.kind == ObjectKind::Commit).ok_or_else(HttpError::not_found)?;
     let text = String::from_utf8_lossy(&object.data);
     let (headers, message) = text.split_once("\n\n").unwrap_or((&text, ""));

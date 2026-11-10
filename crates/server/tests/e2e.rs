@@ -918,6 +918,128 @@ async fn content_can_be_read_through_the_api() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn branches_can_be_compared_and_merged() {
+    let base = start(false).await;
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = format!("{base}/api/repos/r-9");
+        let url = format!("{base}/r-9.git");
+        let get = |path: &str| api("GET", &format!("{repo}/{path}"), None);
+        let merge = |body: serde_json::Value| api_with("POST", &format!("{repo}/merge"), None, Some(&body.to_string()));
+        let lines = |changed: &[(usize, &str)]| {
+            let mut lines: Vec<String> = (1..=10).map(|n| n.to_string()).collect();
+            for (n, text) in changed {
+                lines[n - 1] = text.to_string();
+            }
+            lines.join("\n") + "\n"
+        };
+        assert_eq!(api("PUT", &repo, None).0, 201);
+
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(work.join("dir")).unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("a.txt"), lines(&[])).unwrap();
+        std::fs::write(work.join("dir/b.txt"), "b\n").unwrap();
+        std::fs::write(work.join("gone.txt"), "gone\n").unwrap();
+        let first = commit_on(&work, 1, "first");
+        // A topic that edits the top of a file, adds one and removes one.
+        git(&work, &["checkout", "-q", "-b", "topic"]);
+        std::fs::write(work.join("a.txt"), lines(&[(2, "two")])).unwrap();
+        std::fs::write(work.join("dir/new.txt"), "new\n").unwrap();
+        std::fs::remove_file(work.join("gone.txt")).unwrap();
+        let topic = commit_on(&work, 2, "topic work");
+        // Meanwhile main edits the bottom of the same file and adds another.
+        git(&work, &["checkout", "-q", "main"]);
+        std::fs::write(work.join("a.txt"), lines(&[(9, "nine")])).unwrap();
+        std::fs::write(work.join("c.txt"), "c\n").unwrap();
+        let main = commit_on(&work, 3, "main work");
+        // And a third branch edits that bottom line differently.
+        git(&work, &["checkout", "-q", "-b", "clash", &first]);
+        std::fs::write(work.join("a.txt"), lines(&[(9, "NINE")])).unwrap();
+        std::fs::write(work.join("dir/b.txt"), "\0binary\n").unwrap();
+        commit_on(&work, 4, "clashing work");
+        git(&work, &["push", "-q", &url, "main", "topic", "clash"]);
+
+        // The comparison is against where the two parted, so main's own work is not in it.
+        let compared = json(&get("compare?base=main&head=topic").1);
+        assert_eq!(compared["base"], main.as_str());
+        assert_eq!(compared["head"], topic.as_str());
+        assert_eq!(compared["merge_base"], first.as_str());
+        assert_eq!((&compared["ahead"], &compared["behind"]), (&serde_json::json!(1), &serde_json::json!(1)));
+        assert_eq!(compared["commits"][0]["oid"], topic.as_str());
+        let files: Vec<(&str, &str)> =
+            compared["files"].as_array().unwrap().iter().map(|f| (f["path"].as_str().unwrap(), f["status"].as_str().unwrap())).collect();
+        assert_eq!(files, [("a.txt", "modified"), ("dir/new.txt", "added"), ("gone.txt", "deleted")]);
+        assert_eq!(get("compare?base=main&head=nope").0, 404);
+
+        // Asking first changes nothing.
+        let asked = json(&merge(serde_json::json!({ "base": "main", "head": "topic", "dry_run": true })).1);
+        assert_eq!(asked["mergeable"], true);
+        assert_eq!(json(&get("refs").1)["refs"][1]["oid"], main.as_str());
+        // What was looked at must be what is merged.
+        assert_eq!(merge(serde_json::json!({ "base": "main", "head": "topic", "expect_head": first })).0, 409);
+
+        let merged = merge(serde_json::json!({
+            "base": "main", "head": "topic", "expect_head": topic, "actor": "alice",
+            "message": "Merge pull request #1\n\nTopic work",
+            "author": { "name": "Alice <A>", "email": "alice@example.com" },
+        }));
+        assert_eq!(merged.0, 200, "{}", merged.1);
+        let merged = json(&merged.1);
+        let oid = merged["oid"].as_str().unwrap().to_string();
+        let copy = tmp.path().join("copy");
+        git(tmp.path(), &["clone", "-q", &url, "copy"]);
+        assert_eq!(git(&copy, &["rev-parse", "HEAD"]), oid);
+        git(&copy, &["fsck", "--strict"]);
+        assert_eq!(git(&copy, &["log", "-1", "--format=%P"]), format!("{main} {topic}"));
+        assert_eq!(git(&copy, &["log", "-1", "--format=%an <%ae>|%s|%b"]), "Alice A <alice@example.com>|Merge pull request #1|Topic work");
+        // Both sides' edits to the same file, and each side's own files.
+        assert_eq!(std::fs::read_to_string(copy.join("a.txt")).unwrap(), lines(&[(2, "two"), (9, "nine")]));
+        assert_eq!(git(&copy, &["ls-files"]), "a.txt\nc.txt\ndir/b.txt\ndir/new.txt");
+        // The merge is in the feed like any push.
+        let events = json(&api("GET", &format!("{base}/api/events"), None).1);
+        let last = events["events"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["event"]["actor"], "alice");
+        assert_eq!(last["event"]["updates"][0], serde_json::json!({ "ref": "refs/heads/main", "old": main, "new": oid, "change": "fast-forward" }));
+        assert_eq!(last["event"]["merge"]["head"], topic.as_str());
+
+        // Merged: nothing is left to compare or to merge.
+        assert_eq!(json(&get("compare?base=main&head=topic").1)["ahead"], 0);
+        let again = merge(serde_json::json!({ "base": "main", "head": "topic" }));
+        assert_eq!(again, (409, "nothing to merge".to_string()));
+
+        // Overlapping edits and binary files are conflicts, and leave the branch alone.
+        let asked = json(&merge(serde_json::json!({ "base": "main", "head": "clash", "dry_run": true })).1);
+        assert_eq!(asked["mergeable"], false);
+        assert_eq!(asked["conflicts"], serde_json::json!(["a.txt"]));
+        let refused = merge(serde_json::json!({ "base": "main", "head": "clash" }));
+        assert_eq!(refused, (409, "conflicting changes in a.txt".to_string()));
+        assert_eq!(json(&get("refs").1)["refs"][1]["oid"], oid.as_str());
+
+        // A squash puts a branch's commits on top as one. Here main has not moved since.
+        git(&copy, &["checkout", "-q", "-b", "two-steps"]);
+        std::fs::write(copy.join("d.txt"), "d\n").unwrap();
+        commit_on(&copy, 5, "step one");
+        std::fs::create_dir_all(copy.join("deep/er")).unwrap();
+        std::fs::write(copy.join("deep/er/e.txt"), "e\n").unwrap();
+        commit_on(&copy, 6, "step two");
+        git(&copy, &["push", "-q", "origin", "two-steps"]);
+        let squashed = merge(serde_json::json!({ "base": "refs/heads/main", "head": "two-steps", "method": "squash" }));
+        assert_eq!(squashed.0, 200, "{}", squashed.1);
+        git(&copy, &["fetch", "-q", "origin"]);
+        assert_eq!(git(&copy, &["log", "-1", "--format=%P|%s", "origin/main"]), format!("{oid}|Merge two-steps into main"));
+        assert_eq!(git(&copy, &["diff", "--stat", "origin/main", "two-steps"]), "");
+        git(&copy, &["fsck", "--strict"]);
+
+        assert_eq!(merge(serde_json::json!({ "base": "nope", "head": "topic" })).0, 404);
+        assert_eq!(merge(serde_json::json!({ "base": "main", "head": "topic", "method": "rebase" })).0, 400);
+        assert_eq!(api("GET", &format!("{repo}/merge"), None).0, 405);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn older_protocol_versions_can_fetch() {
     let url = format!("{}/acme/legacy.git", start(true).await);
     tokio::task::spawn_blocking(move || {

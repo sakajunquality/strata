@@ -161,6 +161,8 @@ CI triggers and audit logs are built from this, with whatever retries they need.
 | `GET /api/repos/<id>/commit?rev=` | One commit and the files it changed against its first parent. |
 | `GET /api/repos/<id>/tree?rev=&path=` | A directory listing. |
 | `GET /api/repos/<id>/blob?rev=&path=` | A file's bytes (or `?oid=` for a blob by id). |
+| `GET /api/repos/<id>/compare?base=&head=` | What `head` has that `base` does not: the merge base, the commits, and the files changed since the two parted. |
+| `POST /api/repos/<id>/merge` | Merge a revision into a branch, as a merge commit or squashed into one. |
 | `GET /api/events` | The feed above. |
 | `GET /healthz` | Liveness, without credentials. |
 
@@ -169,11 +171,30 @@ defaults to HEAD. These read calls are what a code browser is built from;
 they do no access control of their own, which is the application's to do
 before it asks.
 
+A merge takes a JSON body:
+
+```json
+{ "base": "main", "head": "topic", "method": "merge", "message": "Merge topic",
+  "author": { "name": "Alice", "email": "alice@example.com" }, "actor": "alice",
+  "expect_head": "<commit id>", "dry_run": false }
+```
+
+Only `base` (a branch) and `head` (any revision) are required. It is a
+three-way merge against the merge base, done without a working copy: files
+changed on both sides are merged line by line, and overlapping edits, binary
+files or a change to something the other side deleted are conflicts, answered
+with 409 and nothing written. `method` is `merge` (a commit with both
+parents, even where a fast-forward would do) or `squash`. `expect_head`
+refuses the merge if the head is no longer that commit, and `dry_run` only
+says whether it would work (`{"mergeable": ..., "conflicts": [...]}`). A
+merge appears in the event feed as a push by `actor`, with a `merge` field.
+The pre-receive hook is not asked: the application is the one calling.
+
 The server speaks plain HTTP: put TLS in front of it.
 
 [`examples/hub`](examples/hub) is such an application, small but whole:
 accounts, organizations, private repositories, a protected default branch,
-a code browser and an activity feed, in Bun, Hono and React.
+a code browser, pull requests and an activity feed, in Bun, Hono and React.
 
 ## Test
 

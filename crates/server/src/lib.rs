@@ -18,6 +18,7 @@ mod auth;
 mod compaction;
 mod content;
 mod hooks;
+mod merge;
 mod receive_pack;
 mod upload_pack;
 
@@ -265,7 +266,8 @@ fn json(status: StatusCode, value: serde_json::Value) -> Response {
 /// - `PUT /api/repos/<id>` creates it, `DELETE` removes it, `GET` describes it
 /// - `PUT /api/repos/<id>/head` points HEAD at the ref named in the body
 /// - `POST /api/repos/<id>/compact` rewrites its packs into one
-/// - `GET /api/repos/<id>/{refs,commits,commit,tree,blob}` read its content, see [`content`]
+/// - `GET /api/repos/<id>/{refs,commits,commit,compare,tree,blob}` read its content, see [`content`]
+/// - `POST /api/repos/<id>/merge` merges a revision into a branch, see [`merge`]
 async fn repos(app: &App, method: &Method, rest: &str, query: &str, body: Body) -> Result<Response, HttpError> {
     if let Some((name, view)) = rest.rsplit_once('/').filter(|(_, view)| content::VIEWS.contains(view)) {
         let name = repo_name(name)?;
@@ -274,6 +276,13 @@ async fn repos(app: &App, method: &Method, rest: &str, query: &str, body: Body) 
         }
         let repo = app.meta.get_repo(name).await?.ok_or_else(HttpError::not_found)?;
         return content::handle(app, repo, view, query).await;
+    }
+    if let Some(name) = rest.strip_suffix("/merge") {
+        let name = repo_name(name)?;
+        if method != Method::POST {
+            return Err(method_not_allowed());
+        }
+        return merge::merge(app, name, body).await;
     }
     if let Some(name) = rest.strip_suffix("/compact") {
         let name = repo_name(name)?;
