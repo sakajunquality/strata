@@ -830,6 +830,93 @@ async fn repositories_are_managed_through_the_api() {
     assert_eq!(sweep_orphans(&app).await.unwrap(), 0);
 }
 
+/// What an application needs to show code: refs, history, listings, files
+/// and what a commit changed.
+#[tokio::test(flavor = "multi_thread")]
+async fn content_can_be_read_through_the_api() {
+    let base = start(false).await;
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = format!("{base}/api/repos/r-7");
+        let get = |path: &str| api("GET", &format!("{repo}/{path}"), None);
+        assert_eq!(api("PUT", &repo, None).0, 201);
+        // Nothing pushed yet: no refs, and HEAD names nothing.
+        assert_eq!(json(&get("refs").1), serde_json::json!({ "head": "refs/heads/main", "refs": [] }));
+        assert_eq!(get("commits").0, 404);
+
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(work.join("src/deep")).unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("README.md"), "# hello\n").unwrap();
+        std::fs::write(work.join("src/deep/a.txt"), "one\n").unwrap();
+        std::fs::write(work.join("src/b.txt"), "b\n").unwrap();
+        let first = commit_on(&work, 1, "first");
+        std::fs::write(work.join("src/deep/a.txt"), "one\ntwo\n").unwrap();
+        std::fs::remove_file(work.join("src/b.txt")).unwrap();
+        std::fs::write(work.join("new file.txt"), "new\n").unwrap();
+        let second = commit_on(&work, 2, "second\n\nwith a body");
+        git(&work, &["tag", "-a", "-m", "release", "v1", &first]);
+        git(&work, &["push", "-q", &format!("{base}/r-7.git"), "main", "main:refs/heads/topic/x", "v1"]);
+
+        let refs = json(&get("refs").1);
+        let names: Vec<&str> = refs["refs"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["refs/heads/main", "refs/heads/topic/x", "refs/tags/v1"]);
+        assert_eq!(refs["refs"][0]["oid"], second.as_str());
+
+        // History, newest first, a page at a time.
+        let page = json(&get("commits?limit=1").1);
+        assert_eq!(page["commits"].as_array().unwrap().len(), 1);
+        assert_eq!(page["commits"][0]["oid"], second.as_str());
+        assert_eq!(page["commits"][0]["message"], "second\n\nwith a body\n");
+        assert_eq!(page["commits"][0]["parents"], serde_json::json!([first]));
+        assert_eq!(page["commits"][0]["author"]["name"], "Test");
+        assert_eq!(page["commits"][0]["author"]["email"], "test@example.com");
+        assert_eq!(page["next"], 1);
+        let page = json(&get("commits?limit=1&skip=1&rev=topic%2Fx").1);
+        assert_eq!(page["commits"][0]["oid"], first.as_str());
+        assert_eq!(page["next"], serde_json::Value::Null);
+        // An annotated tag names the commit it points at.
+        assert_eq!(json(&get("commits?rev=v1").1)["commits"][0]["oid"], first.as_str());
+        assert_eq!(get("commits?rev=nope").0, 404);
+        assert_eq!(get("commits?limit=0").0, 400);
+
+        let root = json(&get("tree").1);
+        let listing: Vec<(&str, &str)> =
+            root["entries"].as_array().unwrap().iter().map(|e| (e["name"].as_str().unwrap(), e["type"].as_str().unwrap())).collect();
+        assert_eq!(listing, [("README.md", "blob"), ("new file.txt", "blob"), ("src", "tree")]);
+        assert_eq!(root["commit"], second.as_str());
+        let deep = json(&get(&format!("tree?rev={first}&path=src")).1);
+        assert_eq!(deep["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(get("tree?path=README.md").0, 400);
+        assert_eq!(get("tree?path=missing").0, 404);
+
+        assert_eq!(get("blob?path=src/deep/a.txt").1, "one\ntwo");
+        assert_eq!(get(&format!("blob?rev={first}&path=src/deep/a.txt")).1, "one");
+        assert_eq!(get("blob?path=new%20file.txt").1, "new");
+        assert_eq!(get("blob?path=src").0, 400);
+        assert_eq!(get("blob?path=src/b.txt").0, 404);
+        let oid = root["entries"][0]["oid"].as_str().unwrap();
+        assert_eq!(get(&format!("blob?oid={oid}")).1, "# hello");
+
+        let shown = json(&get("commit").1);
+        assert_eq!(shown["oid"], second.as_str());
+        assert_eq!(shown["truncated"], false);
+        let files: Vec<(&str, &str)> =
+            shown["files"].as_array().unwrap().iter().map(|f| (f["path"].as_str().unwrap(), f["status"].as_str().unwrap())).collect();
+        assert_eq!(files, [("new file.txt", "added"), ("src/b.txt", "deleted"), ("src/deep/a.txt", "modified")]);
+        assert_eq!(shown["files"][1]["new"], serde_json::Value::Null);
+        // The first commit added everything it holds.
+        let shown = json(&get(&format!("commit?rev={first}")).1);
+        assert_eq!(shown["files"].as_array().unwrap().len(), 3);
+        assert!(shown["files"].as_array().unwrap().iter().all(|f| f["status"] == "added"));
+
+        assert_eq!(api("POST", &format!("{repo}/refs"), None).0, 405);
+        assert_eq!(api("GET", &format!("{base}/api/repos/r-8/refs"), None).0, 404);
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn older_protocol_versions_can_fetch() {
     let url = format!("{}/acme/legacy.git", start(true).await);

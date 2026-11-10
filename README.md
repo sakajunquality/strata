@@ -156,10 +156,24 @@ CI triggers and audit logs are built from this, with whatever retries they need.
 | `PUT /api/repos/<id>/head` | Point HEAD (the default branch) at the ref named in the body. |
 | `DELETE /api/repos/<id>` | Remove it. It is gone at once; its packs are deleted after the grace period. |
 | `POST /api/repos/<id>/compact` | Rewrite its packs into one now. |
+| `GET /api/repos/<id>/refs` | HEAD and every ref with the id it points at. |
+| `GET /api/repos/<id>/commits?rev=&skip=&limit=` | History of a revision, newest first, up to 100 at a time. |
+| `GET /api/repos/<id>/commit?rev=` | One commit and the files it changed against its first parent. |
+| `GET /api/repos/<id>/tree?rev=&path=` | A directory listing. |
+| `GET /api/repos/<id>/blob?rev=&path=` | A file's bytes (or `?oid=` for a blob by id). |
 | `GET /api/events` | The feed above. |
 | `GET /healthz` | Liveness, without credentials. |
 
+A `rev` is a ref (in full, or a branch or tag name) or a commit id, and
+defaults to HEAD. These read calls are what a code browser is built from;
+they do no access control of their own, which is the application's to do
+before it asks.
+
 The server speaks plain HTTP: put TLS in front of it.
+
+[`examples/hub`](examples/hub) is such an application, small but whole:
+accounts, organizations, private repositories, a protected default branch,
+a code browser and an activity feed, in Bun, Hono and React.
 
 ## Test
 

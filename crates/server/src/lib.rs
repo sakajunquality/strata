@@ -16,6 +16,7 @@ use strata_store::{MetaError, MetaStore, PackStore, Txn};
 
 mod auth;
 mod compaction;
+mod content;
 mod hooks;
 mod receive_pack;
 mod upload_pack;
@@ -189,7 +190,7 @@ async fn route(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body: 
     }
     if let Some(rest) = path.strip_prefix("api/repos/") {
         auth::authorize_admin(app, headers)?;
-        return repos(app, &method, rest, body).await;
+        return repos(app, &method, rest, uri.query().unwrap_or(""), body).await;
     }
 
     if let Some(name) = path.strip_suffix("/info/refs") {
@@ -264,7 +265,16 @@ fn json(status: StatusCode, value: serde_json::Value) -> Response {
 /// - `PUT /api/repos/<id>` creates it, `DELETE` removes it, `GET` describes it
 /// - `PUT /api/repos/<id>/head` points HEAD at the ref named in the body
 /// - `POST /api/repos/<id>/compact` rewrites its packs into one
-async fn repos(app: &App, method: &Method, rest: &str, body: Body) -> Result<Response, HttpError> {
+/// - `GET /api/repos/<id>/{refs,commits,commit,tree,blob}` read its content, see [`content`]
+async fn repos(app: &App, method: &Method, rest: &str, query: &str, body: Body) -> Result<Response, HttpError> {
+    if let Some((name, view)) = rest.rsplit_once('/').filter(|(_, view)| content::VIEWS.contains(view)) {
+        let name = repo_name(name)?;
+        if method != Method::GET {
+            return Err(method_not_allowed());
+        }
+        let repo = app.meta.get_repo(name).await?.ok_or_else(HttpError::not_found)?;
+        return content::handle(app, repo, view, query).await;
+    }
     if let Some(name) = rest.strip_suffix("/compact") {
         let name = repo_name(name)?;
         if method != Method::POST {

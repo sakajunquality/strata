@@ -237,7 +237,7 @@ fn io_error(e: std::io::Error) -> Error {
 }
 
 /// Resolves a ref the way a user would name it: in full, or as a tag or branch.
-fn resolve_ref(repo: &RepoState, name: &str) -> Option<Oid> {
+pub(crate) fn resolve_ref(repo: &RepoState, name: &str) -> Option<Oid> {
     ["", "refs/", "refs/tags/", "refs/heads/"].iter().find_map(|prefix| repo.refs.get(&format!("{prefix}{name}")).copied())
 }
 
