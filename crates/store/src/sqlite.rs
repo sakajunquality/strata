@@ -1,5 +1,5 @@
-//! Single-node metadata store. The schema is deliberately plain SQL so it
-//! ports to a shared database (which several nodes need) unchanged in shape.
+//! Single-node metadata store, in a file. Several nodes need one of the
+//! shared backends instead.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use strata_git::Oid;
 
-use crate::meta::{new_repo, unix_now, Access, Garbage, Grant, MetaError, MetaStore, RepoState, TokenRecord, Txn};
+use crate::meta::{decode_grants, encode_grants, new_repo, unix_now, Garbage, MetaError, MetaStore, RepoState, TokenRecord, Txn};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS repos (
@@ -121,19 +121,6 @@ fn load_repo(conn: &Connection, name: &str) -> Result<Option<RepoState>, MetaErr
         epoch: epoch as u64,
         refs_version: refs_version as u64,
     }))
-}
-
-fn encode_grants(grants: &[Grant]) -> String {
-    grants.iter().map(|g| format!("{}\t{}", g.pattern, g.access.name())).collect::<Vec<_>>().join("\n")
-}
-
-fn decode_grants(text: &str) -> Vec<Grant> {
-    text.lines()
-        .filter_map(|line| {
-            let (pattern, access) = line.split_once('\t')?;
-            Some(Grant { pattern: pattern.to_string(), access: Access::parse(access)? })
-        })
-        .collect()
 }
 
 #[async_trait]
@@ -308,97 +295,12 @@ impl MetaStore for SqliteMetaStore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use crate::meta::RefUpdate;
 
     #[tokio::test]
-    async fn cas_and_manifest() {
-        let store = SqliteMetaStore::open(":memory:").unwrap();
-        let repo = store.create_repo("a/b").await.unwrap();
-        assert!(matches!(store.create_repo("a/b").await, Err(MetaError::AlreadyExists)));
-        assert_eq!(store.list_repos().await.unwrap(), vec!["a/b".to_string()]);
-
-        let one = Oid::from_bytes(&[1; 20]).unwrap();
-        let two = Oid::from_bytes(&[2; 20]).unwrap();
-        let update = |old, new| RefUpdate { name: "refs/heads/main".into(), old, new };
-
-        let txn = Txn { ref_updates: vec![update(None, Some(one))], add_pack: Some("p1".into()), ..Txn::default() };
-        store.commit("a/b", txn).await.unwrap();
-
-        // A stale expectation must change nothing, including the manifest.
-        let stale = Txn { ref_updates: vec![update(None, Some(two))], add_pack: Some("p2".into()), ..Txn::default() };
-        assert!(matches!(store.commit("a/b", stale).await, Err(MetaError::Conflict { .. })));
-
-        let state = store.get_repo("a/b").await.unwrap().unwrap();
-        assert_eq!(state.pool_id, repo.pool_id);
-        assert_eq!(state.refs.get("refs/heads/main"), Some(&one));
-        assert_eq!(state.packs, vec!["p1".to_string()]);
-        assert_eq!((state.epoch, state.refs_version), (0, 1));
-
-        let delete = Txn { ref_updates: vec![update(Some(one), None)], ..Txn::default() };
-        store.commit("a/b", delete).await.unwrap();
-        assert!(store.get_repo("a/b").await.unwrap().unwrap().refs.is_empty());
-
-        // Compaction swaps packs atomically; whoever loses a race changes nothing.
-        let swap = |add: &str, remove: &str| Txn { add_pack: Some(add.into()), remove_packs: vec![remove.into()], ..Txn::default() };
-        store.commit("a/b", swap("merged", "p1")).await.unwrap();
-        assert!(matches!(store.commit("a/b", swap("other", "p1")).await, Err(MetaError::PackConflict)));
-        assert_eq!(store.get_repo("a/b").await.unwrap().unwrap().packs, vec!["merged".to_string()]);
-
-        // The replaced pack waits out its grace period, then is forgotten.
-        let garbage = Garbage { pool_id: repo.pool_id.clone(), pack_id: "p1".into() };
-        assert!(store.list_garbage(0).await.unwrap().is_empty());
-        assert_eq!(store.list_garbage(i64::MAX).await.unwrap(), vec![garbage.clone()]);
-        store.purge_garbage(&garbage).await.unwrap();
-        assert!(store.list_garbage(i64::MAX).await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn versions_guard_against_changes_in_between() {
-        let store = SqliteMetaStore::open(":memory:").unwrap();
-        store.create_repo("r").await.unwrap();
-        let one = Oid::from_bytes(&[1; 20]).unwrap();
-        let push = |epoch| Txn {
-            ref_updates: vec![RefUpdate { name: "refs/heads/main".into(), old: None, new: Some(one) }],
-            expect_epoch: Some(epoch),
-            ..Txn::default()
-        };
-
-        // Objects were removed after the pusher looked: its checks no longer hold.
-        store.commit("r", Txn { bump_epoch: true, ..Txn::default() }).await.unwrap();
-        assert!(matches!(store.commit("r", push(0)).await, Err(MetaError::Stale)));
-        store.commit("r", push(1)).await.unwrap();
-
-        // Refs moved after a pruning compaction verified them: it must look again.
-        let prune = |version| Txn { bump_epoch: true, expect_refs_version: Some(version), ..Txn::default() };
-        assert!(matches!(store.commit("r", prune(0)).await, Err(MetaError::Stale)));
-        store.commit("r", prune(1)).await.unwrap();
-        assert_eq!(store.get_repo("r").await.unwrap().unwrap().epoch, 2);
-    }
-
-    #[tokio::test]
-    async fn leases_and_tokens() {
-        let store = SqliteMetaStore::open(":memory:").unwrap();
-        assert!(store.try_lease("compact/r", "node-a", 60).await.unwrap());
-        assert!(store.try_lease("compact/r", "node-a", 60).await.unwrap());
-        assert!(!store.try_lease("compact/r", "node-b", 60).await.unwrap());
-        store.release_lease("compact/r", "node-b").await.unwrap();
-        assert!(!store.try_lease("compact/r", "node-b", 60).await.unwrap());
-        store.release_lease("compact/r", "node-a").await.unwrap();
-        assert!(store.try_lease("compact/r", "node-b", 0).await.unwrap());
-        // An expired lease is up for grabs.
-        assert!(store.try_lease("compact/r", "node-a", 60).await.unwrap());
-
-        let token = TokenRecord {
-            name: "ci".into(),
-            hash: "abc".into(),
-            grants: vec![Grant { pattern: "acme/*".into(), access: Access::Read }, Grant { pattern: "acme/app".into(), access: Access::Write }],
-        };
-        store.put_token(token.clone()).await.unwrap();
-        assert_eq!(store.find_token("abc").await.unwrap(), Some(token));
-        assert_eq!(store.find_token("other").await.unwrap(), None);
-        assert!(store.delete_token("ci").await.unwrap());
-        assert!(!store.delete_token("ci").await.unwrap());
-        assert_eq!(store.find_token("abc").await.unwrap(), None);
+    async fn conforms() {
+        crate::conformance::check(Arc::new(SqliteMetaStore::open(":memory:").unwrap())).await;
     }
 }

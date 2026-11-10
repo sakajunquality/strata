@@ -9,16 +9,22 @@ use object_store::local::LocalFileSystem;
 use object_store::prefix::PrefixStore;
 use object_store::ObjectStore;
 use strata_server::{router, spawn_background, App, Options};
-use strata_store::{CacheConfig, PackStore, SqliteMetaStore};
+use strata_store::{open_meta, CacheConfig, PackStore};
 
 #[derive(Parser)]
 #[command(about = "Git server with separated storage and compute")]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
-    /// Holds the SQLite metadata store and, unless --object-store is given, the packs.
+    /// Holds the metadata (unless --meta is given) and the packs (unless --object-store is given).
     #[arg(long, default_value = "./data")]
     data_dir: PathBuf,
+    /// Where refs and pack lists are stored, as a URL. Several nodes need a
+    /// shared one: postgres://user:password@host/database or
+    /// spanner://projects/<p>/instances/<i>/databases/<d>. A single node can
+    /// use sqlite:///path/to/file [default: a SQLite file in --data-dir].
+    #[arg(long, env = "STRATA_META", hide_env_values = true)]
+    meta: Option<String>,
     /// Where packs are stored, as a URL: s3://bucket/prefix, gs://bucket/prefix,
     /// az://container/prefix or file:///path. Credentials come from the usual
     /// AWS_*, GOOGLE_* and AZURE_* environment variables.
@@ -79,6 +85,9 @@ fn open_object_store(args: &Args) -> anyhow::Result<Arc<dyn ObjectStore>> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    // Two TLS backends are linked in (by different dependencies); the HTTP
+    // and gRPC clients need to be told which one to use.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let args = Args::parse();
 
     std::fs::create_dir_all(&args.data_dir).with_context(|| format!("creating {}", args.data_dir.display()))?;
@@ -104,7 +113,11 @@ async fn main() -> anyhow::Result<()> {
         admin_token: args.admin_token,
         anonymous_read: args.anonymous_read,
     };
-    let meta = Arc::new(SqliteMetaStore::open(args.data_dir.join("meta.sqlite"))?);
+    let meta = match &args.meta {
+        Some(location) => open_meta(location).await,
+        None => open_meta(&args.data_dir.join("meta.sqlite").to_string_lossy()).await,
+    }
+    .context("opening the metadata store")?;
     let app = Arc::new(App::new(meta, packs, options));
     spawn_background(app.clone(), Duration::from_secs(60));
 

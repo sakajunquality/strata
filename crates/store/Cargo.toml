@@ -15,3 +15,17 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 moka = { version = "0.12", features = ["sync"] }
 tokio-stream = "0.1"
 uuid = { version = "1", features = ["v4"] }
+tracing.workspace = true
+tokio-postgres = { version = "0.7", optional = true }
+deadpool-postgres = { version = "0.14", optional = true }
+tokio-postgres-rustls = { version = "0.13", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+gcloud-spanner = { version = "1.9", optional = true }
+gcloud-gax = { version = "1", optional = true }
+gcloud-googleapis = { version = "1", features = ["spanner"], optional = true }
+
+[features]
+default = ["postgres", "spanner"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-native-certs"]
+spanner = ["dep:gcloud-spanner", "dep:gcloud-gax", "dep:gcloud-googleapis"]

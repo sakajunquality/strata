@@ -153,6 +153,26 @@ pub trait MetaStore: Send + Sync {
     async fn delete_token(&self, name: &str) -> Result<bool, MetaError>;
 }
 
+/// Grants as stored by the SQL backends: one `pattern<TAB>access` per line.
+pub(crate) fn encode_grants(grants: &[Grant]) -> String {
+    grants.iter().map(|g| format!("{}\t{}", g.pattern, g.access.name())).collect::<Vec<_>>().join("\n")
+}
+
+pub(crate) fn decode_grants(text: &str) -> Vec<Grant> {
+    text.lines()
+        .filter_map(|line| {
+            let (pattern, access) = line.split_once('\t')?;
+            Some(Grant { pattern: pattern.to_string(), access: Access::parse(access)? })
+        })
+        .collect()
+}
+
+/// What a set of ref updates leaves behind: per ref, its final value. A ref
+/// named twice ends up as its last update says.
+pub(crate) fn final_refs(updates: &[RefUpdate]) -> BTreeMap<&str, Option<Oid>> {
+    updates.iter().map(|u| (u.name.as_str(), u.new)).collect()
+}
+
 pub(crate) fn unix_now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
@@ -290,7 +310,14 @@ impl MetaStore for MemoryMetaStore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+
+    #[tokio::test]
+    async fn conforms() {
+        crate::conformance::check(Arc::new(MemoryMetaStore::default())).await;
+    }
 
     #[test]
     fn grant_patterns() {

@@ -61,6 +61,30 @@ To keep packs in a bucket: `--object-store s3://bucket/prefix` (or `gs://`,
 environment variables. Give the bucket a lifecycle rule that aborts incomplete
 multipart uploads.
 
+### Several nodes
+
+Refs and pack lists live in a metadata store, chosen with `--meta` (or
+`STRATA_META`, which keeps a password out of the process list):
+
+| | |
+|---|---|
+| `sqlite:///path/to/file` | One node. The default, as a file in `--data-dir`. |
+| `postgres://user:password@host/database` | Several nodes. |
+| `spanner://projects/<p>/instances/<i>/databases/<d>` | Several nodes, several regions. |
+
+Point every node at the same metadata store and the same bucket, and put any
+load balancer in front: nodes keep nothing of their own. The shared stores
+create their tables on first start (on Spanner that needs permission to change
+the schema, once).
+
+- PostgreSQL: the server's certificate is verified against the system's
+  authorities whenever TLS is used; set `SSL_CERT_FILE` for a private one, or
+  add `?sslmode=disable` for a server without TLS.
+- Spanner: Google's application default credentials, or the emulator when
+  `SPANNER_EMULATOR_HOST` is set.
+
+Node clocks time leases and grace periods; keep them within seconds of each other.
+
 ### Access control
 
 Started without an admin token, the server allows everything: use that only on
@@ -87,12 +111,13 @@ front of it, since tokens travel as Basic credentials.
 cargo test --workspace   # includes end-to-end tests driving the real git client
 ./scripts/smoke.sh       # push, restart the server, clone
 ./scripts/s3-smoke.sh    # the same through the S3 API, against LocalStack in Docker
+./scripts/meta-test.sh   # PostgreSQL and the Spanner emulator in Docker: backend tests, then two nodes sharing each
 cargo build --release && FILES=50000 COMMITS=100 ./scripts/bench.sh   # timings and server memory on a synthetic repository
 ```
 
 ## Not done
 
-- **Several nodes need a shared metadata store.** Only SQLite and an in-memory store exist. Everything else is ready for it: nodes share no state, and maintenance is coordinated through leases in the metadata store.
+- **The shared metadata stores are tested against local servers only.** PostgreSQL 17 in Docker and the Cloud Spanner emulator, each with two nodes on one database (`./scripts/meta-test.sh`). Not tested: Cloud Spanner itself (the emulator runs one transaction at a time, so real contention and Google credentials are unexercised), managed PostgreSQL services, and more than two nodes or any load.
 - **Real cloud buckets are untested.** The S3 API path is exercised against LocalStack (`./scripts/s3-smoke.sh`); AWS S3 itself, GCS and Azure are not.
 - **SSH.** Access is over HTTP(S) only.
 - **SHA-256 repositories.**
