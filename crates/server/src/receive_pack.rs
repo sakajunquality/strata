@@ -262,8 +262,9 @@ fn one_line(s: &str) -> String {
 
 /// Validates and commits a push against one snapshot of the repository.
 ///
-/// Returns `None` if objects were removed from the pool in the meantime, in
-/// which case the caller should try again with a fresh snapshot. `uploaded`
+/// Returns `None` if objects were removed from the pool in the meantime (or
+/// this push's own upload was), in which case the caller should try again
+/// with a fresh snapshot. `uploaded`
 /// carries the id of this push's pack from one attempt to the next, so that
 /// it is indexed and uploaded only once.
 async fn apply(
@@ -327,6 +328,16 @@ async fn apply(
             .iter()
             .find(|c| c.name.starts_with("refs/heads/") && !c.new.is_zero())
             .map(|c| c.name.clone());
+    }
+
+    // The orphan sweep deletes uploads it takes for abandoned. Never let the
+    // manifest name a pack that is gone: upload it again instead.
+    if let Some(pack_id) = &txn.add_pack {
+        if !app.packs.is_stored(&repo.pool_id, pack_id).await? {
+            tracing::warn!(repo = repo.name, pack = pack_id, "uploaded pack disappeared before commit, uploading again");
+            *uploaded = None;
+            return Ok(None);
+        }
     }
 
     let adds_pack = txn.add_pack.is_some();

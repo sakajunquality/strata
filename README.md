@@ -35,7 +35,10 @@ bitmaps a clone is a sequential copy of the packs. A merge of the whole pool
 also drops objects no ref reaches (`--no-prune` keeps them) and stores changed
 files as deltas against their previous versions. Replaced packs are deleted
 after a grace period (`--gc-grace-secs`), as are packs left behind by pushes
-that never committed (`--orphan-grace-secs`).
+that never committed (`--orphan-grace-secs`). A push or compaction checks that
+its pack is still in storage right before committing it, so a pack the orphan
+sweep removed is uploaded again rather than listed. The check and the commit
+are not atomic: keep the orphan grace far above the time a commit can take.
 
 Pruning is safe against concurrent pushes: a push commits only if no objects
 were removed since it checked its history, and re-checks otherwise; a pruning
@@ -83,13 +86,14 @@ front of it, since tokens travel as Basic credentials.
 ```sh
 cargo test --workspace   # includes end-to-end tests driving the real git client
 ./scripts/smoke.sh       # push, restart the server, clone
+./scripts/s3-smoke.sh    # the same through the S3 API, against LocalStack in Docker
 cargo build --release && FILES=50000 COMMITS=100 ./scripts/bench.sh   # timings and server memory on a synthetic repository
 ```
 
 ## Not done
 
 - **Several nodes need a shared metadata store.** Only SQLite and an in-memory store exist. Everything else is ready for it: nodes share no state, and maintenance is coordinated through leases in the metadata store.
-- **Cloud object stores are wired but untested.** Only the local filesystem and the in-memory store have been exercised.
+- **Real cloud buckets are untested.** The S3 API path is exercised against LocalStack (`./scripts/s3-smoke.sh`); AWS S3 itself, GCS and Azure are not.
 - **SSH.** Access is over HTTP(S) only.
 - **SHA-256 repositories.**
 - **`sparse:oid` and combined partial clone filters.** `blob:none`, `blob:limit=<n>` and `tree:<n>` work.

@@ -268,6 +268,25 @@ impl PackStore {
         self.finish_pack(pool_id, pack_id, size, index, Some(graph), None).await
     }
 
+    /// Whether a pack's data and index are in storage right now.
+    ///
+    /// Asked just before a pack is added to a manifest: an upload that took
+    /// longer than the orphan sweep allows may have been deleted since. A
+    /// missing pack is also forgotten here, so that it can be uploaded again.
+    pub async fn is_stored(&self, pool_id: &str, pack_id: &str) -> anyhow::Result<bool> {
+        for ext in [INDEX, PACK] {
+            match self.blocks.store.head(&object_path(pool_id, pack_id, ext)).await {
+                Ok(_) => {}
+                Err(object_store::Error::NotFound { .. }) => {
+                    self.opened.invalidate(&cache_key(pool_id, pack_id));
+                    return Ok(false);
+                }
+                Err(e) => return Err(e).with_context(|| format!("checking pack {pack_id}")),
+            }
+        }
+        Ok(true)
+    }
+
     /// Fetches a sidecar that a pack may or may not have.
     async fn optional(&self, path: &Path) -> anyhow::Result<Option<Bytes>> {
         match self.blocks.store.get(path).await {
@@ -334,5 +353,28 @@ impl PackStore {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use object_store::memory::InMemory;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_pack_is_stored_only_with_both_its_data_and_its_index() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let packs = PackStore::new(store.clone(), CacheConfig::default());
+        assert!(!packs.is_stored("pool", "abc").await.unwrap());
+
+        store.put(&object_path("pool", "abc", PACK), Bytes::from_static(b"data").into()).await.unwrap();
+        assert!(!packs.is_stored("pool", "abc").await.unwrap());
+        store.put(&object_path("pool", "abc", INDEX), Bytes::from_static(b"index").into()).await.unwrap();
+        assert!(packs.is_stored("pool", "abc").await.unwrap());
+
+        // What the orphan sweep does to a pack it takes for abandoned.
+        packs.delete("pool", "abc").await.unwrap();
+        assert!(!packs.is_stored("pool", "abc").await.unwrap());
     }
 }

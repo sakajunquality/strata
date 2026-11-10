@@ -155,6 +155,11 @@ async fn compact_leased(app: &App, name: &str, full: bool) -> anyhow::Result<Opt
             txn.expect_epoch = Some(repo.epoch);
             txn.expect_refs_version = Some(current.refs_version);
         }
+        // The orphan sweep may have taken a slow upload for abandoned.
+        if !app.packs.is_stored(&repo.pool_id, &pack_id).await? {
+            tracing::warn!(repo = name, pack = pack_id, "abandoning compaction: its pack disappeared before commit");
+            break;
+        }
         match app.meta.commit(name, txn).await {
             Ok(()) => {
                 let merged = replaced.len();
