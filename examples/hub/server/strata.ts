@@ -1,0 +1,59 @@
+// The hub's side of Strata's management and content API.
+import { config } from "./config";
+
+export class StrataError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
+async function call(method: string, path: string, body?: string): Promise<Response> {
+  let response: Response;
+  try {
+    response = await fetch(`${config.strataUrl}${path}`, {
+      method,
+      body,
+      headers: config.adminToken ? { authorization: `Bearer ${config.adminToken}` } : {},
+    });
+  } catch {
+    throw new StrataError(502, "the git backend cannot be reached");
+  }
+  if (!response.ok) {
+    const message = (await response.text()).trim();
+    // Only "not there" and "bad request" are the caller's doing.
+    throw new StrataError([400, 404, 409].includes(response.status) ? response.status : 502, message || "the git backend failed");
+  }
+  return response;
+}
+
+const query = (params: Record<string, string | number | undefined>) => {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) if (value !== undefined && value !== "") search.set(key, String(value));
+  const text = search.toString();
+  return text ? `?${text}` : "";
+};
+
+export type Ref = { name: string; oid: string };
+export type Refs = { head: string; refs: Ref[] };
+export type StrataEvent = {
+  cursor: string;
+  repo: string;
+  time: number;
+  event: { type?: string; actor?: string | null; updates?: { ref: string; old: string | null; new: string | null; change: string }[] } | null;
+};
+
+const repo = (id: string) => `/api/repos/${id}`;
+
+export const strata = {
+  create: (id: string) => call("PUT", repo(id)),
+  remove: (id: string) => call("DELETE", repo(id)),
+  setHead: (id: string, ref: string) => call("PUT", `${repo(id)}/head`, ref),
+  info: async (id: string) => (await call("GET", repo(id))).json() as Promise<{ packs: number; objects: number; bytes: number }>,
+  refs: async (id: string) => (await call("GET", `${repo(id)}/refs`)).json() as Promise<Refs>,
+  commits: async (id: string, rev: string, skip: number, limit: number) => (await call("GET", `${repo(id)}/commits${query({ rev, skip, limit })}`)).json(),
+  commit: async (id: string, rev: string) => (await call("GET", `${repo(id)}/commit${query({ rev })}`)).json(),
+  tree: async (id: string, rev: string, path: string) => (await call("GET", `${repo(id)}/tree${query({ rev, path })}`)).json(),
+  blob: (id: string, params: { rev?: string; path?: string; oid?: string }) => call("GET", `${repo(id)}/blob${query(params)}`),
+  events: async (after: string | null) =>
+    (await call("GET", `/api/events${query({ after: after ?? undefined, limit: 200 })}`)).json() as Promise<{ events: StrataEvent[]; next: string | null }>,
+};
