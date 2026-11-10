@@ -50,6 +50,22 @@ pub struct Txn {
     pub expect_refs_version: Option<u64>,
     /// Set by a change that removes objects from the pool.
     pub bump_epoch: bool,
+    /// Recorded in the event feed if, and only if, this change commits.
+    pub event: Option<String>,
+}
+
+/// One entry of the event feed: something that happened to a repository,
+/// recorded in the same transaction as the change itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Event {
+    /// Where this event sits in the feed. Opaque; pass it back as `after`
+    /// to read what follows.
+    pub cursor: String,
+    pub repo: String,
+    /// Unix seconds, by the clock of the node that committed it.
+    pub created_at: i64,
+    /// What happened, as the JSON text given in [`Txn::event`].
+    pub payload: String,
 }
 
 /// A pack no manifest refers to any more.
@@ -57,59 +73,6 @@ pub struct Txn {
 pub struct Garbage {
     pub pool_id: String,
     pub pack_id: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Access {
-    Read,
-    Write,
-    Admin,
-}
-
-impl Access {
-    pub fn parse(s: &str) -> Option<Access> {
-        match s {
-            "read" => Some(Access::Read),
-            "write" => Some(Access::Write),
-            "admin" => Some(Access::Admin),
-            _ => None,
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Access::Read => "read",
-            Access::Write => "write",
-            Access::Admin => "admin",
-        }
-    }
-}
-
-/// Access to the repositories matching `pattern`: a full name, a prefix
-/// ending in `/*`, or `*` for all.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Grant {
-    pub pattern: String,
-    pub access: Access,
-}
-
-impl Grant {
-    pub fn covers(&self, repo: &str) -> bool {
-        match self.pattern.strip_suffix('*') {
-            Some("") => true,
-            Some(prefix) => prefix.ends_with('/') && repo.starts_with(prefix),
-            None => self.pattern == repo,
-        }
-    }
-}
-
-/// An access token. Only a hash of the secret is stored.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TokenRecord {
-    pub name: String,
-    /// Hex SHA-256 of the secret.
-    pub hash: String,
-    pub grants: Vec<Grant>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -124,6 +87,8 @@ pub enum MetaError {
     PackConflict,
     #[error("repository changed since it was read")]
     Stale,
+    #[error("not a position in the event feed")]
+    BadCursor,
     #[error("metadata backend: {0}")]
     Backend(String),
 }
@@ -134,6 +99,16 @@ pub trait MetaStore: Send + Sync {
     async fn get_repo(&self, name: &str) -> Result<Option<RepoState>, MetaError>;
     async fn list_repos(&self) -> Result<Vec<String>, MetaError>;
     async fn commit(&self, name: &str, txn: Txn) -> Result<(), MetaError>;
+    /// Forgets a repository. Its packs become garbage. Returns whether it existed.
+    async fn delete_repo(&self, name: &str) -> Result<bool, MetaError>;
+
+    /// Up to `limit` events that follow `after` (or the oldest ones kept), in
+    /// the order they were committed. An event is never inserted before one
+    /// that was already returned, so a reader that remembers the last cursor
+    /// it saw misses nothing.
+    async fn list_events(&self, after: Option<&str>, limit: usize) -> Result<Vec<Event>, MetaError>;
+    /// Drops events created before `created_before` (Unix seconds).
+    async fn purge_events(&self, created_before: i64) -> Result<(), MetaError>;
 
     /// Packs removed from their manifest before `removed_before` (Unix seconds).
     async fn list_garbage(&self, removed_before: i64) -> Result<Vec<Garbage>, MetaError>;
@@ -145,26 +120,6 @@ pub trait MetaStore: Send + Sync {
     /// maintenance at a time; correctness never depends on it.
     async fn try_lease(&self, key: &str, holder: &str, ttl_secs: i64) -> Result<bool, MetaError>;
     async fn release_lease(&self, key: &str, holder: &str) -> Result<(), MetaError>;
-
-    /// Stores a token, replacing any other of the same name.
-    async fn put_token(&self, token: TokenRecord) -> Result<(), MetaError>;
-    async fn find_token(&self, hash: &str) -> Result<Option<TokenRecord>, MetaError>;
-    /// Returns whether a token of that name existed.
-    async fn delete_token(&self, name: &str) -> Result<bool, MetaError>;
-}
-
-/// Grants as stored by the SQL backends: one `pattern<TAB>access` per line.
-pub(crate) fn encode_grants(grants: &[Grant]) -> String {
-    grants.iter().map(|g| format!("{}\t{}", g.pattern, g.access.name())).collect::<Vec<_>>().join("\n")
-}
-
-pub(crate) fn decode_grants(text: &str) -> Vec<Grant> {
-    text.lines()
-        .filter_map(|line| {
-            let (pattern, access) = line.split_once('\t')?;
-            Some(Grant { pattern: pattern.to_string(), access: Access::parse(access)? })
-        })
-        .collect()
 }
 
 /// What a set of ref updates leaves behind: per ref, its final value. A ref
@@ -195,7 +150,8 @@ pub struct MemoryMetaStore {
     repos: Mutex<HashMap<String, RepoState>>,
     garbage: Mutex<Vec<(Garbage, i64)>>,
     leases: Mutex<HashMap<String, (String, i64)>>,
-    tokens: Mutex<Vec<TokenRecord>>,
+    /// Numbered from 1 in the order committed.
+    events: Mutex<Vec<(u64, Event)>>,
 }
 
 #[async_trait]
@@ -259,6 +215,33 @@ impl MetaStore for MemoryMetaStore {
         if txn.bump_epoch {
             repo.epoch += 1;
         }
+        if let Some(payload) = txn.event {
+            let mut events = self.events.lock().unwrap();
+            let id = events.last().map_or(1, |(id, _)| id + 1);
+            events.push((id, Event { cursor: id.to_string(), repo: name.to_string(), created_at: now, payload }));
+        }
+        Ok(())
+    }
+
+    async fn delete_repo(&self, name: &str) -> Result<bool, MetaError> {
+        let Some(repo) = self.repos.lock().unwrap().remove(name) else { return Ok(false) };
+        let now = unix_now();
+        let pool_id = repo.pool_id;
+        self.garbage
+            .lock()
+            .unwrap()
+            .extend(repo.packs.into_iter().map(|pack_id| (Garbage { pool_id: pool_id.clone(), pack_id }, now)));
+        Ok(true)
+    }
+
+    async fn list_events(&self, after: Option<&str>, limit: usize) -> Result<Vec<Event>, MetaError> {
+        let after: u64 = after.map_or(Ok(0), str::parse).map_err(|_| MetaError::BadCursor)?;
+        let events = self.events.lock().unwrap();
+        Ok(events.iter().filter(|(id, _)| *id > after).take(limit).map(|(_, event)| event.clone()).collect())
+    }
+
+    async fn purge_events(&self, created_before: i64) -> Result<(), MetaError> {
+        self.events.lock().unwrap().retain(|(_, event)| event.created_at >= created_before);
         Ok(())
     }
 
@@ -288,24 +271,6 @@ impl MetaStore for MemoryMetaStore {
         }
         Ok(())
     }
-
-    async fn put_token(&self, token: TokenRecord) -> Result<(), MetaError> {
-        let mut tokens = self.tokens.lock().unwrap();
-        tokens.retain(|t| t.name != token.name);
-        tokens.push(token);
-        Ok(())
-    }
-
-    async fn find_token(&self, hash: &str) -> Result<Option<TokenRecord>, MetaError> {
-        Ok(self.tokens.lock().unwrap().iter().find(|t| t.hash == hash).cloned())
-    }
-
-    async fn delete_token(&self, name: &str) -> Result<bool, MetaError> {
-        let mut tokens = self.tokens.lock().unwrap();
-        let before = tokens.len();
-        tokens.retain(|t| t.name != name);
-        Ok(tokens.len() != before)
-    }
 }
 
 #[cfg(test)]
@@ -317,20 +282,5 @@ mod tests {
     #[tokio::test]
     async fn conforms() {
         crate::conformance::check(Arc::new(MemoryMetaStore::default())).await;
-    }
-
-    #[test]
-    fn grant_patterns() {
-        let grant = |pattern: &str| Grant { pattern: pattern.into(), access: Access::Read };
-        assert!(grant("*").covers("acme/app"));
-        assert!(grant("acme/*").covers("acme/app"));
-        assert!(grant("acme/*").covers("acme/team/app"));
-        assert!(!grant("acme/*").covers("acme-evil/app"));
-        assert!(!grant("acme/*").covers("acme"));
-        assert!(grant("acme/app").covers("acme/app"));
-        assert!(!grant("acme/app").covers("acme/app2"));
-        // A bare prefix is not a wildcard.
-        assert!(!grant("acme*").covers("acme/app"));
-        assert!(Access::Admin > Access::Write && Access::Write > Access::Read);
     }
 }

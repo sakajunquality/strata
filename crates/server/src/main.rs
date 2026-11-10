@@ -37,9 +37,29 @@ struct Args {
     /// authentication is off: use that only on a trusted network.
     #[arg(long, env = "STRATA_ADMIN_TOKEN", hide_env_values = true)]
     admin_token: Option<String>,
-    /// Let anyone fetch without credentials.
+    /// Let anyone fetch without credentials. Ignored with --authz-url.
     #[arg(long)]
     anonymous_read: bool,
+    /// The application's authorization hook. Each git request is POSTed to it
+    /// as {"path", "access", "authorization"}; it answers {"allow": true,
+    /// "repo": "<id to serve>", "actor": "<who>"} or {"allow": false}.
+    #[arg(long, env = "STRATA_AUTHZ_URL")]
+    authz_url: Option<String>,
+    /// Seconds to reuse an answer from the authorization hook: a revoked
+    /// permission keeps working that long. 0 asks every time.
+    #[arg(long, default_value_t = 10)]
+    authz_cache_secs: u64,
+    /// The application's push rules. Each push is POSTed to it before it is
+    /// committed, as {"repo", "actor", "updates"}; it answers {"allow": true}
+    /// or {"allow": false, "message": "..."}.
+    #[arg(long, env = "STRATA_PRE_RECEIVE_URL")]
+    pre_receive_url: Option<String>,
+    /// Sent to both hooks as a Bearer token, so that they know who is asking.
+    #[arg(long, env = "STRATA_HOOK_SECRET", hide_env_values = true)]
+    hook_secret: Option<String>,
+    /// Seconds to keep events in the feed at /api/events.
+    #[arg(long, default_value_t = 604800)]
+    event_retention_secs: u64,
     /// Where incoming packs are spooled while they are validated [default: the system temp directory].
     #[arg(long)]
     scratch_dir: Option<PathBuf>,
@@ -101,6 +121,8 @@ async fn main() -> anyhow::Result<()> {
         },
     );
     if args.admin_token.is_none() {
+        // With a hook deciding git access, an open management API would be a way around it.
+        anyhow::ensure!(args.authz_url.is_none(), "--authz-url needs --admin-token: the management API would be open to anyone");
         tracing::warn!("no admin token configured: authentication is OFF and every request is allowed");
     }
     let options = Options {
@@ -112,6 +134,11 @@ async fn main() -> anyhow::Result<()> {
         orphan_grace: Duration::from_secs(args.orphan_grace_secs),
         admin_token: args.admin_token,
         anonymous_read: args.anonymous_read,
+        authz_url: args.authz_url,
+        authz_cache: Duration::from_secs(args.authz_cache_secs),
+        pre_receive_url: args.pre_receive_url,
+        hook_secret: args.hook_secret,
+        event_retention: Duration::from_secs(args.event_retention_secs),
     };
     let meta = match &args.meta {
         Some(location) => open_meta(location).await,

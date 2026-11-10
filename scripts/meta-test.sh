@@ -96,6 +96,13 @@ two_nodes() { # label
   [ "$(git ls-remote "$a/acme/demo.git" | wc -l | tr -d ' ')" = 4 ]
   [ "$(git ls-remote "$a/acme/demo.git")" = "$(git ls-remote "$b/acme/demo.git")" ]
 
+  # One feed for all nodes: nine pushes landed (the stale one did not), whoever took them.
+  local feed_a feed_b
+  feed_a="$(curl -sf "$a/api/events?limit=1000")"
+  feed_b="$(curl -sf "$b/api/events?limit=1000")"
+  [ "$feed_a" = "$feed_b" ]
+  [ "$(grep -o '"repo":"acme/demo"' <<<"$feed_a" | wc -l | tr -d ' ')" = 9 ]
+
   # Compacted by one node, read through the other.
   echo "  compaction via node b: $(curl -sf -X POST "$b/api/repos/acme/demo/compact")"
   git clone -q "$a/acme/demo.git" after
@@ -109,6 +116,10 @@ two_nodes() { # label
   start_node "$port_a" node-a
   git -C clone fetch -q origin
   [ "$(git -C clone rev-parse origin/main)" = "$(git -C src rev-parse HEAD)" ]
+  # Deleted through one node, gone from the other.
+  start_node "$port_b" node-b
+  curl -sf -X DELETE "$a/api/repos/acme/demo" >/dev/null
+  [ "$(curl -s -o /dev/null -w '%{http_code}' "$b/api/repos/acme/demo")" = 404 ]
   stop_nodes
 
   if grep -hE "ERROR|WARN" "$dir"/node-*.log | grep -v "no admin token configured" >&2; then
@@ -144,7 +155,7 @@ run_postgres() {
   conformance postgres STRATA_TEST_POSTGRES="$url"
   echo "postgres: two nodes"
   STRATA_META="$url" two_nodes postgres
-  docker exec "$c" psql -U postgres -Atc "SELECT 'rows: repos=' || (SELECT count(*) FROM repos) || ' refs=' || (SELECT count(*) FROM refs) || ' packs=' || (SELECT count(*) FROM packs) || ' garbage=' || (SELECT count(*) FROM garbage)" | sed 's/^/  /'
+  docker exec "$c" psql -U postgres -Atc "SELECT 'rows: repos=' || (SELECT count(*) FROM repos) || ' refs=' || (SELECT count(*) FROM refs) || ' packs=' || (SELECT count(*) FROM packs) || ' garbage=' || (SELECT count(*) FROM garbage) || ' events=' || (SELECT count(*) FROM events)" | sed 's/^/  /'
 }
 
 run_spanner() {

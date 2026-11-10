@@ -24,50 +24,71 @@ use gcloud_spanner::session::SessionError;
 use gcloud_spanner::statement::Statement;
 use gcloud_spanner::transaction::Transaction;
 use gcloud_spanner::transaction_rw::ReadWriteTransaction;
+use gcloud_spanner::value::CommitTimestamp;
 use strata_git::Oid;
 
-use crate::meta::{
-    decode_grants, encode_grants, final_refs, new_repo, unix_now, Garbage, MetaError, MetaStore,
-    RepoState, TokenRecord, Txn,
-};
+use crate::meta::{final_refs, new_repo, unix_now, Event, Garbage, MetaError, MetaStore, RepoState, Txn};
 
-/// `refs` is stored inside its repository's row range, so a repository's
-/// metadata is read and written in one place. Column names avoid Spanner's
-/// reserved words (`key`, `hash`).
-const SCHEMA: &[&str] = &[
-    "CREATE TABLE repos (
-        repo         STRING(MAX) NOT NULL,
-        pool_id      STRING(64) NOT NULL,
-        head         STRING(MAX) NOT NULL,
-        epoch        INT64 NOT NULL,
-        refs_version INT64 NOT NULL
-    ) PRIMARY KEY (repo)",
-    "CREATE TABLE refs (
-        repo STRING(MAX) NOT NULL,
-        name STRING(MAX) NOT NULL,
-        oid  STRING(64) NOT NULL
-    ) PRIMARY KEY (repo, name), INTERLEAVE IN PARENT repos ON DELETE CASCADE",
-    "CREATE TABLE packs (
-        pool_id STRING(64) NOT NULL,
-        pack_id STRING(64) NOT NULL,
-        seq     INT64 NOT NULL
-    ) PRIMARY KEY (pool_id, pack_id)",
-    "CREATE TABLE garbage (
-        pool_id    STRING(64) NOT NULL,
-        pack_id    STRING(64) NOT NULL,
-        removed_at INT64 NOT NULL
-    ) PRIMARY KEY (pool_id, pack_id)",
-    "CREATE TABLE leases (
-        lease_key  STRING(MAX) NOT NULL,
-        holder     STRING(MAX) NOT NULL,
-        expires_at INT64 NOT NULL
-    ) PRIMARY KEY (lease_key)",
-    "CREATE TABLE tokens (
-        name       STRING(MAX) NOT NULL,
-        token_hash STRING(128) NOT NULL,
-        grants     STRING(MAX) NOT NULL
-    ) PRIMARY KEY (name)",
-    "CREATE UNIQUE INDEX tokens_by_hash ON tokens (token_hash)",
+/// Tables, each with the statements that create it. `refs` is stored
+/// inside its repository's row range, so a repository's metadata is read and
+/// written in one place. Column names avoid Spanner's reserved words.
+const SCHEMA: &[(&str, &[&str])] = &[
+    (
+        "repos",
+        &["CREATE TABLE repos (
+            repo         STRING(MAX) NOT NULL,
+            pool_id      STRING(64) NOT NULL,
+            head         STRING(MAX) NOT NULL,
+            epoch        INT64 NOT NULL,
+            refs_version INT64 NOT NULL
+        ) PRIMARY KEY (repo)"],
+    ),
+    (
+        "refs",
+        &["CREATE TABLE refs (
+            repo STRING(MAX) NOT NULL,
+            name STRING(MAX) NOT NULL,
+            oid  STRING(64) NOT NULL
+        ) PRIMARY KEY (repo, name), INTERLEAVE IN PARENT repos ON DELETE CASCADE"],
+    ),
+    (
+        "packs",
+        &["CREATE TABLE packs (
+            pool_id STRING(64) NOT NULL,
+            pack_id STRING(64) NOT NULL,
+            seq     INT64 NOT NULL
+        ) PRIMARY KEY (pool_id, pack_id)"],
+    ),
+    (
+        "garbage",
+        &["CREATE TABLE garbage (
+            pool_id    STRING(64) NOT NULL,
+            pack_id    STRING(64) NOT NULL,
+            removed_at INT64 NOT NULL
+        ) PRIMARY KEY (pool_id, pack_id)"],
+    ),
+    (
+        "leases",
+        &["CREATE TABLE leases (
+            lease_key  STRING(MAX) NOT NULL,
+            holder     STRING(MAX) NOT NULL,
+            expires_at INT64 NOT NULL
+        ) PRIMARY KEY (lease_key)"],
+    ),
+    (
+        // Ordered by commit timestamp, which Spanner hands out in commit order.
+        "events",
+        &[
+            "CREATE TABLE events (
+                event_id     STRING(36) NOT NULL,
+                committed_at TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp = true),
+                repo         STRING(MAX) NOT NULL,
+                created_at   INT64 NOT NULL,
+                payload      STRING(MAX) NOT NULL
+            ) PRIMARY KEY (event_id)",
+            "CREATE INDEX events_feed ON events (committed_at, event_id)",
+        ],
+    ),
 ];
 
 fn backend(e: impl std::fmt::Display) -> MetaError {
@@ -171,26 +192,26 @@ impl SpannerMetaStore {
         }
         let client = Client::new(database, config).await?;
         let store = SpannerMetaStore { client };
-        if !store.has_schema().await? {
+        let existing = store.tables().await?;
+        let missing: Vec<String> = SCHEMA
+            .iter()
+            .filter(|(table, _)| !existing.iter().any(|t| t == table))
+            .flat_map(|(_, statements)| statements.iter().map(|s| s.to_string()))
+            .collect();
+        if !missing.is_empty() {
             tracing::info!(database, "creating metadata tables");
             let mut admin = AdminClientConfig::default();
             if !emulated {
                 admin = admin.with_auth().await.map_err(backend)?;
             }
             let admin = AdminClient::new(admin).await.map_err(backend)?;
-            let request = UpdateDatabaseDdlRequest {
-                database: database.to_string(),
-                statements: SCHEMA.iter().map(|s| s.to_string()).collect(),
-                ..Default::default()
-            };
+            let request = UpdateDatabaseDdlRequest { database: database.to_string(), statements: missing, ..Default::default() };
             match admin.database().update_database_ddl(request, None).await {
                 Ok(mut operation) => {
                     operation.wait(None).await?;
                 }
                 // Another node got there first; it is still creating them.
-                Err(status)
-                    if status.code() == Code::AlreadyExists
-                        || status.message().contains("Duplicate name") => {}
+                Err(status) if status.code() == Code::AlreadyExists || status.message().contains("Duplicate name") => {}
                 Err(status) => return Err(status.into()),
             }
         }
@@ -221,17 +242,14 @@ impl SpannerMetaStore {
         }
     }
 
-    async fn has_schema(&self) -> Result<bool, MetaError> {
-        let stmt = Statement::new(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = '' AND table_name IN ('repos', 'tokens')",
-        );
+    async fn tables(&self) -> Result<Vec<String>, MetaError> {
         let mut tx = self.client.single().await?;
-        let mut rows = tx.query(stmt).await?;
-        let mut found = 0;
-        while rows.next().await?.is_some() {
-            found += 1;
+        let mut rows = tx.query(Statement::new("SELECT table_name FROM information_schema.tables WHERE table_schema = ''")).await?;
+        let mut tables = Vec::new();
+        while let Some(row) = rows.next().await? {
+            tables.push(row.column(0)?);
         }
-        Ok(found == 2)
+        Ok(tables)
     }
 }
 
@@ -423,6 +441,14 @@ impl MetaStore for SpannerMetaStore {
                         &(refs_version + i64::from(refs_changed)),
                     ],
                 ));
+                if let Some(payload) = &txn.event {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    writes.push(insert(
+                        "events",
+                        &["event_id", "committed_at", "repo", "created_at", "payload"],
+                        &[&id, &CommitTimestamp::new(), &name, &unix_now(), payload],
+                    ));
+                }
                 tx.buffer_write(writes);
                 Ok(())
             })
@@ -496,44 +522,67 @@ impl MetaStore for SpannerMetaStore {
         .await
     }
 
-    async fn put_token(&self, token: TokenRecord) -> Result<(), MetaError> {
-        let row = insert_or_update(
-            "tokens",
-            &["name", "token_hash", "grants"],
-            &[&token.name, &token.hash, &encode_grants(&token.grants)],
-        );
-        self.client.apply(vec![row]).await?;
-        Ok(())
-    }
-
-    async fn find_token(&self, hash: &str) -> Result<Option<TokenRecord>, MetaError> {
-        let mut stmt = Statement::new("SELECT name, grants FROM tokens WHERE token_hash = @hash");
-        stmt.add_param("hash", &hash);
-        let mut tx = self.client.single().await?;
-        let mut rows = tx.query(stmt).await?;
-        let Some(row) = rows.next().await? else {
-            return Ok(None);
-        };
-        let grants: String = row.column(1)?;
-        Ok(Some(TokenRecord {
-            name: row.column(0)?,
-            hash: hash.to_string(),
-            grants: decode_grants(&grants),
-        }))
-    }
-
-    async fn delete_token(&self, name: &str) -> Result<bool, MetaError> {
+    async fn delete_repo(&self, name: &str) -> Result<bool, MetaError> {
         self.transact(|tx| {
             let name = name.to_string();
             Box::pin(async move {
-                let existed = tx
-                    .read_row("tokens", &["name"], Key::new(&name))
-                    .await?
-                    .is_some();
-                if existed {
-                    tx.buffer_write(vec![delete("tokens", Key::new(&name))]);
+                let Some(row) = tx.read_row("repos", &["pool_id"], Key::new(&name)).await? else {
+                    return Ok(false);
+                };
+                let pool_id: String = row.column(0)?;
+                let now = unix_now();
+                let mut writes = Vec::new();
+                for (pack, _) in read_packs(tx, &pool_id).await? {
+                    writes.push(delete("packs", Key::composite(&[&pool_id, &pack])));
+                    writes.push(insert_or_update("garbage", &["pool_id", "pack_id", "removed_at"], &[&pool_id, &pack, &now]));
                 }
-                Ok(existed)
+                // Its refs go with it (ON DELETE CASCADE).
+                writes.push(delete("repos", Key::new(&name)));
+                tx.buffer_write(writes);
+                Ok(true)
+            })
+        })
+        .await
+    }
+
+    async fn list_events(&self, after: Option<&str>, limit: usize) -> Result<Vec<Event>, MetaError> {
+        // A cursor is "<commit time in microseconds>.<event id>".
+        let (micros, id) = match after {
+            None => (0i64, String::new()),
+            Some(cursor) => {
+                let (micros, id) = cursor.split_once('.').ok_or(MetaError::BadCursor)?;
+                (micros.parse().map_err(|_| MetaError::BadCursor)?, id.to_string())
+            }
+        };
+        let mut stmt = Statement::new(
+            "SELECT UNIX_MICROS(committed_at), event_id, repo, created_at, payload FROM events
+             WHERE committed_at > TIMESTAMP_MICROS(@micros) OR (committed_at = TIMESTAMP_MICROS(@micros) AND event_id > @id)
+             ORDER BY committed_at, event_id LIMIT @limit",
+        );
+        stmt.add_param("micros", &micros);
+        stmt.add_param("id", &id);
+        stmt.add_param("limit", &(limit as i64));
+        let mut tx = self.client.single().await?;
+        let mut rows = tx.query(stmt).await?;
+        let mut events = Vec::new();
+        while let Some(row) = rows.next().await? {
+            events.push(Event {
+                cursor: format!("{}.{}", row.column::<i64>(0)?, row.column::<String>(1)?),
+                repo: row.column(2)?,
+                created_at: row.column(3)?,
+                payload: row.column(4)?,
+            });
+        }
+        Ok(events)
+    }
+
+    async fn purge_events(&self, created_before: i64) -> Result<(), MetaError> {
+        self.transact(|tx| {
+            Box::pin(async move {
+                let mut stmt = Statement::new("DELETE FROM events WHERE created_at < @before");
+                stmt.add_param("before", &created_before);
+                tx.update(stmt).await?;
+                Ok(())
             })
         })
         .await

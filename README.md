@@ -1,16 +1,21 @@
 # strata
 
-A git server with storage and compute separated. Server processes are
+A git engine with storage and compute separated. Server processes are
 stateless; refs live in a transactional metadata store and objects live as
 immutable packfiles in object storage.
+
+Strata stores and serves repositories, and stops there. Users, organisations,
+permissions, repository names, webhooks and a UI belong to an application
+built on top, which Strata asks and informs over HTTP (see
+[Building on it](#building-on-it)).
 
 ## Layout
 
 | Crate | Role |
 |---|---|
 | `crates/git` | Git formats, independent of storage: pkt-line, objects, delta apply/encode, pack read/write/index, `.idx` v2, commit-graph, bitmaps, graph walks, compaction |
-| `crates/store` | `MetaStore` (refs, pack manifest, garbage list, tokens, leases; compare-and-swap commit) and `PackStore` (packs in object storage, bounded caches) |
-| `crates/server` | Smart HTTP: fetch (protocol v2, and v0/v1 for older clients), push, tokens, background compaction and sweeping |
+| `crates/store` | `MetaStore` (refs, pack manifest, garbage list, event feed, leases; compare-and-swap commit) on SQLite, PostgreSQL or Cloud Spanner, and `PackStore` (packs in object storage, bounded caches) |
+| `crates/server` | Smart HTTP: fetch (protocol v2, and v0/v1 for older clients), push, the hooks and management API for the application, background compaction and sweeping |
 
 A push is spooled to a scratch file, validated, and uploaded as one pack with
 a commit-graph; then a single metadata transaction adds the pack to the
@@ -85,25 +90,76 @@ the schema, once).
 
 Node clocks time leases and grace periods; keep them within seconds of each other.
 
-### Access control
+## Building on it
 
-Started without an admin token, the server allows everything: use that only on
-a trusted network. With one, every request needs credentials:
+Strata talks to one application, which owns everything about people. There
+are four points of contact; all are optional, and without them Strata is a
+plain git server guarded by one admin token.
 
-```sh
-STRATA_ADMIN_TOKEN=... cargo run
+**The admin token** (`STRATA_ADMIN_TOKEN`) is the application's credential
+for the management API below. Started without one, the server allows
+everything: use that only on a trusted network. Without an authorization
+hook it is also the only credential git clients can use (`--anonymous-read`
+lets anyone fetch).
 
-# Issue tokens (the secret is shown once). A grant is <pattern>:<read|write|admin>,
-# where the pattern is a repository, a prefix ending in /*, or * for all.
-curl -X POST -H "Authorization: Bearer $STRATA_ADMIN_TOKEN" \
-  'http://127.0.0.1:8080/api/tokens?name=ci&grant=acme/*:read'
-curl -X DELETE -H "Authorization: Bearer $STRATA_ADMIN_TOKEN" http://127.0.0.1:8080/api/tokens/ci
+**The authorization hook** (`--authz-url`) decides every git request. Strata
+POSTs what was asked for, with the client's `Authorization` header untouched,
+so the application can use any credential scheme it likes:
 
-git clone http://git:<token>@127.0.0.1:8080/acme/app.git   # or via a credential helper
+```
+-> {"path": "acme/app", "access": "write", "authorization": "Basic Z2l0Oi4uLg=="}
+<- {"allow": true, "repo": "r-8f3a", "actor": "alice"}
+<- {"allow": false, "status": 404, "message": "no such repository"}   # status: 401, 403 or 404
 ```
 
-`--anonymous-read` lets anyone fetch. The server speaks plain HTTP: put TLS in
-front of it, since tokens travel as Basic credentials.
+`repo` is the repository Strata then serves. Let it be an id the application
+never changes: a rename, or a move to another organisation, is then a change
+to the application's own table, and nothing moves inside Strata. `actor` is
+recorded with pushes. Answers are reused for `--authz-cache-secs` (10 by
+default), which is how long a revoked permission keeps working. If the hook
+cannot be reached, the request is refused.
+
+**The pre-receive hook** (`--pre-receive-url`) can veto a push before
+anything is stored, which is where protected branches go:
+
+```
+-> {"repo": "r-8f3a", "actor": "alice", "updates": [
+     {"ref": "refs/heads/main", "old": "1f3c...", "new": "9a0b...", "change": "forced"}]}
+<- {"allow": false, "message": "main is protected"}      # shown to the person pushing
+```
+
+`change` is `create`, `delete`, `fast-forward` or `forced`. The hook cannot
+fetch the pushed commits: they are not visible until the push commits.
+
+Both hooks receive `--hook-secret` as a Bearer token, to tell Strata from
+anyone else who finds the URL.
+
+**The event feed** tells the application what happened. Each push that lands
+is recorded in the same transaction that moves the refs, so the feed has
+exactly the pushes that happened, in order. Poll it, and keep `next`:
+
+```
+GET /api/events?after=<next>&limit=100
+<- {"events": [{"cursor": "...", "repo": "r-8f3a", "time": 1794311777,
+     "event": {"type": "push", "actor": "alice", "updates": [...]}}], "next": "..."}
+```
+
+Events are kept for `--event-retention-secs` (a week by default). Webhooks,
+CI triggers and audit logs are built from this, with whatever retries they need.
+
+**The management API**, all under the admin token:
+
+| | |
+|---|---|
+| `PUT /api/repos/<id>` | Create a repository. |
+| `GET /api/repos/<id>` | Its HEAD, and counts of refs, packs, objects and bytes stored. |
+| `PUT /api/repos/<id>/head` | Point HEAD (the default branch) at the ref named in the body. |
+| `DELETE /api/repos/<id>` | Remove it. It is gone at once; its packs are deleted after the grace period. |
+| `POST /api/repos/<id>/compact` | Rewrite its packs into one now. |
+| `GET /api/events` | The feed above. |
+| `GET /healthz` | Liveness, without credentials. |
+
+The server speaks plain HTTP: put TLS in front of it.
 
 ## Test
 
@@ -125,4 +181,6 @@ cargo build --release && FILES=50000 COMMITS=100 ./scripts/bench.sh   # timings 
 - **Pruned objects are gone at once.** There is no window in which a force-pushed-away commit can still be fetched by id after the next full compaction.
 - **Indexing a push keeps about 50 bytes per object in memory**, plus one delta family at a time; the spool file needs local disk the size of the push.
 - **Compaction computes deltas only for files changed since the last full merge**, against their previous version. It does not search for better bases.
-- **TLS, rate limiting, hooks, and per-branch protections.**
+- **The pre-receive hook cannot inspect pushed content**, only which refs move and how. Rules about commit contents (signatures, file sizes, secrets) need a way to read a push before it commits.
+- **The event feed covers pushes only.** Repositories created, deleted or compacted are the application's own actions and are not echoed back.
+- **TLS, rate limiting, and quotas.** `GET /api/repos/<id>` reports the bytes a repository holds; nothing enforces a limit.

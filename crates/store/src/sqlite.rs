@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use strata_git::Oid;
 
-use crate::meta::{decode_grants, encode_grants, new_repo, unix_now, Garbage, MetaError, MetaStore, RepoState, TokenRecord, Txn};
+use crate::meta::{new_repo, unix_now, Event, Garbage, MetaError, MetaStore, RepoState, Txn};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS repos (
@@ -42,10 +42,11 @@ CREATE TABLE IF NOT EXISTS leases (
     holder     TEXT NOT NULL,
     expires_at INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS tokens (
-    name   TEXT PRIMARY KEY,
-    hash   TEXT NOT NULL UNIQUE,
-    grants TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo       TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    payload    TEXT NOT NULL
 );
 ";
 
@@ -214,7 +215,49 @@ impl MetaStore for SqliteMetaStore {
                 "UPDATE repos SET epoch = epoch + ?1, refs_version = refs_version + ?2 WHERE name = ?3",
                 params![i64::from(txn.bump_epoch), i64::from(refs_changed), name],
             )?;
+            if let Some(payload) = &txn.event {
+                tx.execute("INSERT INTO events (repo, created_at, payload) VALUES (?1, ?2, ?3)", params![name, unix_now(), payload])?;
+            }
             tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_repo(&self, name: &str) -> Result<bool, MetaError> {
+        let name = name.to_string();
+        self.run(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let pool_id: Option<String> = tx.query_row("SELECT pool_id FROM repos WHERE name = ?1", [&name], |r| r.get(0)).optional()?;
+            let Some(pool_id) = pool_id else { return Ok(false) };
+            tx.execute(
+                "INSERT OR REPLACE INTO garbage (pool_id, pack_id, removed_at) SELECT pool_id, pack_id, ?2 FROM packs WHERE pool_id = ?1",
+                params![pool_id, unix_now()],
+            )?;
+            tx.execute("DELETE FROM packs WHERE pool_id = ?1", [&pool_id])?;
+            tx.execute("DELETE FROM refs WHERE repo = ?1", [&name])?;
+            tx.execute("DELETE FROM repos WHERE name = ?1", [&name])?;
+            tx.commit()?;
+            Ok(true)
+        })
+        .await
+    }
+
+    async fn list_events(&self, after: Option<&str>, limit: usize) -> Result<Vec<Event>, MetaError> {
+        let after: i64 = after.map_or(Ok(0), str::parse).map_err(|_| MetaError::BadCursor)?;
+        self.run(move |conn| {
+            let mut stmt = conn.prepare("SELECT id, repo, created_at, payload FROM events WHERE id > ?1 ORDER BY id LIMIT ?2")?;
+            let rows = stmt.query_map(params![after, limit as i64], |r| {
+                Ok(Event { cursor: r.get::<_, i64>(0)?.to_string(), repo: r.get(1)?, created_at: r.get(2)?, payload: r.get(3)? })
+            })?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+    }
+
+    async fn purge_events(&self, created_before: i64) -> Result<(), MetaError> {
+        self.run(move |conn| {
+            conn.execute("DELETE FROM events WHERE created_at < ?1", [created_before])?;
             Ok(())
         })
         .await
@@ -261,35 +304,6 @@ impl MetaStore for SqliteMetaStore {
             Ok(())
         })
         .await
-    }
-
-    async fn put_token(&self, token: TokenRecord) -> Result<(), MetaError> {
-        self.run(move |conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO tokens (name, hash, grants) VALUES (?1, ?2, ?3)",
-                params![token.name, token.hash, encode_grants(&token.grants)],
-            )?;
-            Ok(())
-        })
-        .await
-    }
-
-    async fn find_token(&self, hash: &str) -> Result<Option<TokenRecord>, MetaError> {
-        let hash = hash.to_string();
-        self.run(move |conn| {
-            let row = conn
-                .query_row("SELECT name, grants FROM tokens WHERE hash = ?1", [&hash], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                })
-                .optional()?;
-            Ok(row.map(|(name, grants)| TokenRecord { name, hash, grants: decode_grants(&grants) }))
-        })
-        .await
-    }
-
-    async fn delete_token(&self, name: &str) -> Result<bool, MetaError> {
-        let name = name.to_string();
-        self.run(move |conn| Ok(conn.execute("DELETE FROM tokens WHERE name = ?1", [&name])? > 0)).await
     }
 }
 

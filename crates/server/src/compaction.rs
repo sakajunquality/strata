@@ -213,17 +213,25 @@ pub async fn sweep(app: &App) -> anyhow::Result<usize> {
 /// packs older than [`crate::Options::orphan_grace`] are touched.
 pub async fn sweep_orphans(app: &App) -> anyhow::Result<usize> {
     let cutoff = unix_now() - app.options.orphan_grace.as_secs() as i64 + 1;
-    let garbage = app.meta.list_garbage(i64::MAX).await?;
-    let mut deleted = 0;
+    // Listed before the manifests are read: a pack committed in between is then seen as known.
+    let mut stored = Vec::new();
+    for pool_id in app.packs.list_pools().await? {
+        stored.push((app.packs.list_stored(&pool_id).await?, pool_id));
+    }
+    let mut known: HashSet<(String, String)> =
+        app.meta.list_garbage(i64::MAX).await?.into_iter().map(|g| (g.pool_id, g.pack_id)).collect();
     for name in app.meta.list_repos().await? {
         let Some(repo) = app.meta.get_repo(&name).await? else { continue };
-        let stored = app.packs.list_stored(&repo.pool_id).await?;
-        // Read the manifest after the listing: a pack committed in between is then seen as known.
-        let Some(repo) = app.meta.get_repo(&name).await? else { continue };
-        for (pack_id, written) in stored {
-            let known = repo.packs.contains(&pack_id) || garbage.iter().any(|g| g.pool_id == repo.pool_id && g.pack_id == pack_id);
-            if !known && written < cutoff {
-                app.packs.delete(&repo.pool_id, &pack_id).await?;
+        known.extend(repo.packs.into_iter().map(|pack_id| (repo.pool_id.clone(), pack_id)));
+    }
+    // Pools are walked from storage, not from the repositories: a push that
+    // was still uploading when its repository was deleted leaves a pack in a
+    // pool that no repository names any more.
+    let mut deleted = 0;
+    for (packs, pool_id) in stored {
+        for (pack_id, written) in packs {
+            if written < cutoff && !known.contains(&(pool_id.clone(), pack_id.clone())) {
+                app.packs.delete(&pool_id, &pack_id).await?;
                 deleted += 1;
             }
         }
@@ -265,6 +273,10 @@ pub fn spawn_background(app: Arc<App>, sweep_every: Duration) {
                 Ok(0) => {}
                 Ok(deleted) => tracing::info!(deleted, "deleted replaced packs"),
                 Err(e) => tracing::error!("sweeping replaced packs failed: {e:#}"),
+            }
+            let cutoff = unix_now() - app.options.event_retention.as_secs() as i64;
+            if let Err(e) = app.meta.purge_events(cutoff).await {
+                tracing::error!("trimming the event feed failed: {e}");
             }
             match sweep_orphans(&app).await {
                 Ok(0) => {}

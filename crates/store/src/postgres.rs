@@ -13,10 +13,7 @@ use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use strata_git::Oid;
 use tokio_postgres::IsolationLevel;
 
-use crate::meta::{
-    decode_grants, encode_grants, final_refs, new_repo, unix_now, Garbage, MetaError, MetaStore,
-    RepoState, TokenRecord, Txn,
-};
+use crate::meta::{final_refs, new_repo, unix_now, Event, Garbage, MetaError, MetaStore, RepoState, Txn};
 
 /// Run under an advisory lock, so that nodes starting together do not trip
 /// over each other creating the same tables.
@@ -53,11 +50,14 @@ CREATE TABLE IF NOT EXISTS leases (
     holder     TEXT NOT NULL,
     expires_at BIGINT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS tokens (
-    name   TEXT PRIMARY KEY,
-    hash   TEXT NOT NULL UNIQUE,
-    grants TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS events (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    xid        xid8 NOT NULL DEFAULT pg_current_xact_id(),
+    repo       TEXT NOT NULL,
+    created_at BIGINT NOT NULL,
+    payload    TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS events_feed ON events (xid, id);
 COMMIT;
 ";
 
@@ -308,7 +308,72 @@ impl MetaStore for PostgresMetaStore {
             &[&txn.set_head, &i64::from(txn.bump_epoch), &i64::from(refs_changed), &name],
         )
         .await?;
+        if let Some(payload) = &txn.event {
+            tx.execute("INSERT INTO events (repo, created_at, payload) VALUES ($1, $2, $3)", &[&name, &unix_now(), payload]).await?;
+        }
         tx.commit().await?;
+        Ok(())
+    }
+
+    async fn delete_repo(&self, name: &str) -> Result<bool, MetaError> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        // The same lock commits take, so none is half-way through.
+        let Some(row) = tx.query_opt("SELECT pool_id FROM repos WHERE name = $1 FOR UPDATE", &[&name]).await? else {
+            return Ok(false);
+        };
+        let pool_id: String = row.get(0);
+        tx.execute(
+            "INSERT INTO garbage (pool_id, pack_id, removed_at) SELECT pool_id, pack_id, $2 FROM packs WHERE pool_id = $1
+             ON CONFLICT (pool_id, pack_id) DO UPDATE SET removed_at = excluded.removed_at",
+            &[&pool_id, &unix_now()],
+        )
+        .await?;
+        tx.execute("DELETE FROM packs WHERE pool_id = $1", &[&pool_id]).await?;
+        // Its refs go with it (ON DELETE CASCADE).
+        tx.execute("DELETE FROM repos WHERE name = $1", &[&name]).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn list_events(&self, after: Option<&str>, limit: usize) -> Result<Vec<Event>, MetaError> {
+        // A cursor is "<transaction id>.<row id>".
+        let (after_xid, after_id) = match after {
+            None => (String::from("0"), 0i64),
+            Some(cursor) => {
+                let (xid, id) = cursor.split_once('.').ok_or(MetaError::BadCursor)?;
+                let xid: u64 = xid.parse().map_err(|_| MetaError::BadCursor)?;
+                (xid.to_string(), id.parse().map_err(|_| MetaError::BadCursor)?)
+            }
+        };
+        // Row ids are handed out before commit, so a row can appear behind one
+        // already read. Transactions older than every one still running are
+        // settled, though: reading only those, ordered by transaction, never
+        // skips an event. A long-running transaction elsewhere delays the feed.
+        let rows = self
+            .pool
+            .get()
+            .await?
+            .query(
+                "SELECT xid::text, id, repo, created_at, payload FROM events
+                 WHERE xid < pg_snapshot_xmin(pg_current_snapshot()) AND (xid, id) > ($1::text::xid8, $2)
+                 ORDER BY xid, id LIMIT $3",
+                &[&after_xid, &after_id, &(limit as i64)],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| Event {
+                cursor: format!("{}.{}", r.get::<_, String>(0), r.get::<_, i64>(1)),
+                repo: r.get(2),
+                created_at: r.get(3),
+                payload: r.get(4),
+            })
+            .collect())
+    }
+
+    async fn purge_events(&self, created_before: i64) -> Result<(), MetaError> {
+        self.pool.get().await?.execute("DELETE FROM events WHERE created_at < $1", &[&created_before]).await?;
         Ok(())
     }
 
@@ -370,43 +435,6 @@ impl MetaStore for PostgresMetaStore {
             )
             .await?;
         Ok(())
-    }
-
-    async fn put_token(&self, token: TokenRecord) -> Result<(), MetaError> {
-        self.pool
-            .get()
-            .await?
-            .execute(
-                "INSERT INTO tokens (name, hash, grants) VALUES ($1, $2, $3)
-                 ON CONFLICT (name) DO UPDATE SET hash = excluded.hash, grants = excluded.grants",
-                &[&token.name, &token.hash, &encode_grants(&token.grants)],
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn find_token(&self, hash: &str) -> Result<Option<TokenRecord>, MetaError> {
-        let row = self
-            .pool
-            .get()
-            .await?
-            .query_opt("SELECT name, grants FROM tokens WHERE hash = $1", &[&hash])
-            .await?;
-        Ok(row.map(|r| TokenRecord {
-            name: r.get(0),
-            hash: hash.to_string(),
-            grants: decode_grants(r.get(1)),
-        }))
-    }
-
-    async fn delete_token(&self, name: &str) -> Result<bool, MetaError> {
-        Ok(self
-            .pool
-            .get()
-            .await?
-            .execute("DELETE FROM tokens WHERE name = $1", &[&name])
-            .await?
-            > 0)
     }
 }
 

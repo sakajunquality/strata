@@ -475,18 +475,30 @@ async fn pushes_trigger_compaction_in_the_background() {
 
 /// Calls the HTTP API and returns the status code and body.
 fn api(method: &str, url: &str, token: Option<&str>) -> (u16, String) {
+    api_with(method, url, token, None)
+}
+
+fn api_with(method: &str, url: &str, token: Option<&str>, body: Option<&str>) -> (u16, String) {
     let mut command = Command::new("curl");
     command.args(["-s", "-X", method, "-w", "\n%{http_code}", url]);
     if let Some(token) = token {
         command.args(["-H", &format!("Authorization: Bearer {token}")]);
+    }
+    if let Some(body) = body {
+        command.args(["--data-binary", body]);
     }
     let out = String::from_utf8(command.output().expect("curl must be installed").stdout).unwrap();
     let (body, status) = out.rsplit_once('\n').unwrap();
     (status.parse().unwrap(), body.trim().to_string())
 }
 
+fn json(text: &str) -> serde_json::Value {
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"))
+}
+
+/// Without an application behind it, the admin token is the only credential.
 #[tokio::test(flavor = "multi_thread")]
-async fn tokens_gate_access() {
+async fn the_admin_token_gates_access() {
     let options = Options { auto_create: true, compact_at: usize::MAX, admin_token: Some("root-secret".into()), ..Options::default() };
     let (base, _app) = start_with(options).await;
     tokio::task::spawn_blocking(move || {
@@ -494,13 +506,13 @@ async fn tokens_gate_access() {
         let root = tmp.path();
         let with = |secret: &str, repo: &str| format!("{}/{repo}.git", base.replace("http://", &format!("http://git:{secret}@")));
 
-        // The admin secret can do everything, including the first push.
         let work = root.join("work");
         std::fs::create_dir(&work).unwrap();
         git(&work, &["init", "-q", "-b", "main"]);
         std::fs::write(work.join("file.txt"), "one\n").unwrap();
         commit_on(&work, 1, "one");
         git(&work, &["push", "-q", &with("root-secret", "acme/app"), "main"]);
+        git(root, &["clone", "-q", &with("root-secret", "acme/app"), "clone"]);
 
         // Without credentials, or with wrong ones, nothing is visible: not even whether a repository exists.
         for url in [format!("{base}/acme/app.git"), with("wrong", "acme/app"), format!("{base}/acme/nope.git")] {
@@ -510,39 +522,312 @@ async fn tokens_gate_access() {
             // Always an authentication problem, never "not found".
             assert!(message.contains("Authentication failed") || message.contains("could not read Username"), "{url}: {message}");
         }
-
-        // Only an administrator issues tokens.
-        let issue = format!("{base}/api/tokens?name=ci&grant=acme/*:read");
-        assert_eq!(api("POST", &issue, None).0, 401);
-        assert_eq!(api("POST", &issue, Some("wrong")).0, 401);
-        let (status, reader) = api("POST", &issue, Some("root-secret"));
-        assert_eq!(status, 201);
-        let (status, writer) = api("POST", &format!("{base}/api/tokens?name=dev&grant=acme/app:write"), Some("root-secret"));
-        assert_eq!(status, 201);
-        assert_eq!(api("POST", &format!("{base}/api/tokens?name=bad&grant=acme/app:owner"), Some("root-secret")).0, 400);
-        // A token is not an administrator, whatever it grants on repositories.
-        assert_eq!(api("POST", &issue, Some(&writer)).0, 403);
-        assert_eq!(api("POST", &format!("{base}/api/repos/acme/app/compact"), Some(&writer)).0, 403);
-
-        // Read access: fetch yes, push no, other namespaces no.
-        git(root, &["clone", "-q", &with(&reader, "acme/app"), "clone"]);
-        std::fs::write(work.join("file.txt"), "two\n").unwrap();
-        commit_on(&work, 2, "two");
-        assert!(!git_in(&work, &["push", "-q", &with(&reader, "acme/app"), "main"]).status.success());
-        assert!(!git_in(&work, &["push", "-q", &with(&reader, "other/app"), "main"]).status.success());
-
-        // Write access to one repository: push there, and only there.
-        git(&work, &["push", "-q", &with(&writer, "acme/app"), "main"]);
-        assert!(!git_in(&work, &["push", "-q", &with(&writer, "acme/other"), "main"]).status.success());
-        git(&root.join("clone"), &["pull", "-q", "--ff-only"]);
-        assert_eq!(git(&root.join("clone"), &["rev-parse", "HEAD"]), git(&work, &["rev-parse", "HEAD"]));
-
-        // Revoked tokens stop working at once.
-        assert_eq!(api("DELETE", &format!("{base}/api/tokens/ci"), Some("root-secret")).0, 200);
-        assert!(!git_in(&root.join("clone"), &["fetch", "-q"]).status.success());
+        for (method, path) in [("GET", "api/repos/acme/app"), ("DELETE", "api/repos/acme/app"), ("GET", "api/events")] {
+            assert_eq!(api(method, &format!("{base}/{path}"), None).0, 401, "{method} {path}");
+            assert_eq!(api(method, &format!("{base}/{path}"), Some("wrong")).0, 401, "{method} {path}");
+        }
+        assert_eq!(api("GET", &format!("{base}/api/repos/acme/app"), Some("root-secret")).0, 200);
+        // Load balancers need no secret to ask whether the node is up.
+        assert_eq!(api("GET", &format!("{base}/healthz"), None), (200, "ok".to_string()));
     })
     .await
     .unwrap();
+}
+
+/// A stand-in for the application Strata serves. It knows two users and one
+/// repository, which it calls `r-1` whatever name people reach it under.
+mod application {
+    use std::sync::{Arc, Mutex};
+
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use serde_json::{json, Value};
+
+    #[derive(Default)]
+    pub struct Seen {
+        pub authz_questions: usize,
+        pub pushes: Vec<Value>,
+    }
+
+    type Shared = Arc<Mutex<Seen>>;
+
+    fn from_strata(headers: &HeaderMap) -> bool {
+        headers.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer hook-secret")
+    }
+
+    async fn authz(State(seen): State<Shared>, headers: HeaderMap, Json(q): Json<Value>) -> Json<Value> {
+        seen.lock().unwrap().authz_questions += 1;
+        if !from_strata(&headers) {
+            return Json(json!({ "allow": false, "status": 403, "message": "who is asking?" }));
+        }
+        // "Basic " + base64("git:<token>")
+        let user = match q["authorization"].as_str() {
+            Some("Basic Z2l0OmFsaWNlLXRva2Vu") => "alice",
+            Some("Basic Z2l0OmJvYi10b2tlbg==") => "bob",
+            Some(_) => return Json(json!({ "allow": false, "status": 401 })),
+            None => return Json(json!({ "allow": false })),
+        };
+        // The repository was renamed once; both names lead to it.
+        if !matches!(q["path"].as_str(), Some("acme/app" | "acme/renamed")) {
+            return Json(json!({ "allow": false, "status": 404, "message": "no such repository" }));
+        }
+        if q["access"] == "write" && user != "alice" {
+            return Json(json!({ "allow": false, "message": "bob may only read" }));
+        }
+        Json(json!({ "allow": true, "repo": "r-1", "actor": user }))
+    }
+
+    /// `main` is protected: it only moves forward.
+    async fn pre_receive(State(seen): State<Shared>, headers: HeaderMap, Json(q): Json<Value>) -> Json<Value> {
+        assert!(from_strata(&headers));
+        seen.lock().unwrap().pushes.push(q.clone());
+        let protected = q["updates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["ref"] == "refs/heads/main" && !matches!(u["change"].as_str(), Some("create" | "fast-forward")));
+        match protected {
+            true => Json(json!({ "allow": false, "message": "main is protected" })),
+            false => Json(json!({ "allow": true })),
+        }
+    }
+
+    pub async fn start() -> (String, Shared) {
+        let seen = Shared::default();
+        let router = Router::new().route("/authz", post(authz)).route("/pre-receive", post(pre_receive)).with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_application_decides_who_may_do_what() {
+    let (application, seen) = application::start().await;
+    let options = Options {
+        compact_at: usize::MAX,
+        admin_token: Some("root-secret".into()),
+        authz_url: Some(format!("{application}/authz")),
+        authz_cache: Duration::ZERO,
+        pre_receive_url: Some(format!("{application}/pre-receive")),
+        hook_secret: Some("hook-secret".into()),
+        ..Options::default()
+    };
+    let (base, app) = start_with(options).await;
+    // The application creates repositories, under ids of its own.
+    app.meta.create_repo("r-1").await.unwrap();
+
+    let strata = base.clone();
+    let (first, second) = tokio::task::spawn_blocking(move || {
+        let base = strata;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let with = |token: &str, repo: &str| format!("{}/{repo}.git", base.replace("http://", &format!("http://git:{token}@")));
+        let stderr = |out: std::process::Output| String::from_utf8_lossy(&out.stderr).to_string();
+
+        let work = root.join("work");
+        std::fs::create_dir(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("file.txt"), "one\n").unwrap();
+        let first = commit_on(&work, 1, "one");
+
+        // Bob reads, Alice writes, strangers get nothing, and the admin
+        // token is no way around the application.
+        let refused = stderr(git_in(&work, &["push", &with("bob-token", "acme/app"), "main"]));
+        assert!(refused.contains("403"), "{refused}");
+        assert!(!git_in(&work, &["push", "-q", &with("root-secret", "acme/app"), "main"]).status.success());
+        assert!(!git_in(&work, &["push", "-q", &format!("{base}/acme/app.git"), "main"]).status.success());
+        git(&work, &["push", "-q", &with("alice-token", "acme/app"), "main"]);
+        git(root, &["clone", "-q", &with("bob-token", "acme/app"), "clone"]);
+        assert!(!git_in(root, &["ls-remote", &with("mallory-token", "acme/app")]).status.success());
+        let missing = stderr(git_in(root, &["ls-remote", &with("alice-token", "acme/other")]));
+        assert!(missing.contains("not found"), "{missing}");
+
+        // The new name reaches the same repository; nothing moved inside Strata.
+        std::fs::write(work.join("file.txt"), "two\n").unwrap();
+        let second = commit_on(&work, 2, "two");
+        git(&work, &["push", "-q", &with("alice-token", "acme/renamed"), "main", "main:refs/heads/topic"]);
+        git(&root.join("clone"), &["pull", "-q", "--ff-only"]);
+        assert_eq!(git(&root.join("clone"), &["rev-parse", "HEAD"]), second);
+
+        // The application's rules: main only moves forward, other branches are free.
+        git(&work, &["reset", "-q", "--hard", &first]);
+        let refused = stderr(git_in(&work, &["push", "--force", &with("alice-token", "acme/app"), "main"]));
+        assert!(refused.contains("main is protected"), "{refused}");
+        let refused = stderr(git_in(&work, &["push", &with("alice-token", "acme/app"), ":main"]));
+        assert!(refused.contains("main is protected"), "{refused}");
+        git(&work, &["push", "-q", "--force", &with("alice-token", "acme/app"), "main:topic"]);
+        git(&work, &["push", "-q", &with("alice-token", "acme/app"), ":topic"]);
+        assert!(git(root, &["ls-remote", &with("bob-token", "acme/app"), "refs/heads/main"]).starts_with(&second));
+        (first, second)
+    })
+    .await
+    .unwrap();
+
+    // Everything landed in the repository the application named, and only there.
+    let repo = app.meta.get_repo("r-1").await.unwrap().unwrap();
+    assert_eq!(repo.refs.keys().collect::<Vec<_>>(), ["refs/heads/main"]);
+    assert_eq!(app.meta.list_repos().await.unwrap(), ["r-1"]);
+
+    // The rules were asked about every push that could have landed, with what it would do.
+    let asked: Vec<(String, String)> = seen
+        .lock()
+        .unwrap()
+        .pushes
+        .iter()
+        .map(|q| {
+            assert_eq!((q["repo"].as_str(), q["actor"].as_str()), (Some("r-1"), Some("alice")));
+            let update = q["updates"].as_array().unwrap().last().unwrap();
+            (update["ref"].as_str().unwrap().to_string(), update["change"].as_str().unwrap().to_string())
+        })
+        .collect();
+    let expected = [
+        ("refs/heads/main", "create"),
+        ("refs/heads/topic", "create"),
+        ("refs/heads/main", "forced"),
+        ("refs/heads/main", "delete"),
+        ("refs/heads/topic", "forced"),
+        ("refs/heads/topic", "delete"),
+    ];
+    assert_eq!(asked, expected.map(|(name, change)| (name.to_string(), change.to_string())));
+
+    // The feed has the pushes that did land, in order, and nothing else.
+    let feed = tokio::task::spawn_blocking(move || {
+        let (status, page) = api("GET", &format!("{base}/api/events?limit=3"), Some("root-secret"));
+        assert_eq!(status, 200);
+        let page = json(&page);
+        let mut events = page["events"].as_array().unwrap().clone();
+        assert_eq!(events.len(), 3);
+        let next = page["next"].as_str().unwrap().to_string();
+        let (_, rest) = api("GET", &format!("{base}/api/events?after={next}"), Some("root-secret"));
+        let rest = json(&rest);
+        events.extend(rest["events"].as_array().unwrap().iter().cloned());
+        // At the end of the feed: the same position, to poll again from.
+        let end = rest["next"].as_str().unwrap().to_string();
+        let (_, empty) = api("GET", &format!("{base}/api/events?after={end}"), Some("root-secret"));
+        assert_eq!(json(&empty), serde_json::json!({ "events": [], "next": end }));
+        assert_eq!(api("GET", &format!("{base}/api/events?after=nonsense"), Some("root-secret")).0, 400);
+        events
+    })
+    .await
+    .unwrap();
+    let summary: Vec<Vec<(String, String)>> = feed
+        .iter()
+        .map(|e| {
+            assert_eq!((e["repo"].as_str(), e["event"]["type"].as_str(), e["event"]["actor"].as_str()), (Some("r-1"), Some("push"), Some("alice")));
+            assert!(e["time"].as_i64().unwrap() > 1_600_000_000);
+            let updates = e["event"]["updates"].as_array().unwrap();
+            updates.iter().map(|u| (u["ref"].as_str().unwrap().to_string(), u["change"].as_str().unwrap().to_string())).collect()
+        })
+        .collect();
+    let pair = |name: &str, change: &str| (name.to_string(), change.to_string());
+    assert_eq!(
+        summary,
+        [
+            vec![pair("refs/heads/main", "create")],
+            vec![pair("refs/heads/main", "fast-forward"), pair("refs/heads/topic", "create")],
+            vec![pair("refs/heads/topic", "forced")],
+            vec![pair("refs/heads/topic", "delete")],
+        ]
+    );
+    let moved = &feed[1]["event"]["updates"][0];
+    assert_eq!((moved["old"].as_str(), moved["new"].as_str()), (Some(first.as_str()), Some(second.as_str())));
+    assert!(feed[0]["event"]["updates"][0]["old"].is_null());
+    assert!(seen.lock().unwrap().authz_questions > 10);
+}
+
+/// With the application out of reach, nobody gets in. Answers are
+/// remembered briefly, so that one git command is one question, not several.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_application_means_no() {
+    let (application, seen) = application::start().await;
+    let options = |url: String, cache: u64| Options {
+        compact_at: usize::MAX,
+        admin_token: Some("root-secret".into()),
+        authz_url: Some(url),
+        authz_cache: Duration::from_secs(cache),
+        hook_secret: Some("hook-secret".into()),
+        ..Options::default()
+    };
+    // A port nothing listens on.
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+    let (down, _) = start_with(options(format!("http://{closed}/authz"), 0)).await;
+    let (cached, app) = start_with(options(format!("{application}/authz"), 60)).await;
+    app.meta.create_repo("r-1").await.unwrap();
+
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempfile::tempdir().unwrap();
+        let alice = |base: &str| format!("{}/acme/app.git", base.replace("http://", "http://git:alice-token@"));
+        let out = git_in(tmp.path(), &["ls-remote", &alice(&down)]);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("503"), "{}", String::from_utf8_lossy(&out.stderr));
+
+        git(tmp.path(), &["ls-remote", &alice(&cached)]);
+        let asked = seen.lock().unwrap().authz_questions;
+        git(tmp.path(), &["ls-remote", &alice(&cached)]);
+        git(tmp.path(), &["ls-remote", &alice(&cached)]);
+        assert_eq!(seen.lock().unwrap().authz_questions, asked, "remembered answers are not asked for again");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repositories_are_managed_through_the_api() {
+    let options = Options { compact_at: usize::MAX, gc_grace: Duration::ZERO, orphan_grace: Duration::ZERO, ..Options::default() };
+    let (base, app) = start_with(options).await;
+    let server = base.clone();
+    tokio::task::spawn_blocking(move || {
+        let base = server;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = format!("{base}/api/repos/r-42");
+        assert_eq!(api("GET", &repo, None).0, 404);
+        assert_eq!(api("DELETE", &repo, None).0, 404);
+        assert_eq!(api_with("PUT", &format!("{repo}/head"), None, Some("refs/heads/trunk")).0, 404);
+        assert_eq!(api("PUT", &repo, None).0, 201);
+        assert_eq!(api("PUT", &repo, None).0, 409);
+        let empty = serde_json::json!({ "repo": "r-42", "head": "refs/heads/main", "refs": 0, "packs": 0, "objects": 0, "bytes": 0 });
+        assert_eq!(json(&api("GET", &repo, None).1), empty);
+
+        let work = tmp.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "trunk"]);
+        std::fs::write(work.join("file.txt"), "one\n").unwrap();
+        commit_on(&work, 1, "one");
+        git(&work, &["push", "-q", &format!("{base}/r-42.git"), "trunk", "trunk:refs/heads/other"]);
+        let info = json(&api("GET", &repo, None).1);
+        assert_eq!((info["refs"].as_u64(), info["packs"].as_u64(), info["objects"].as_u64()), (Some(2), Some(1), Some(3)));
+        assert!(info["bytes"].as_u64().unwrap() > 100);
+
+        // The default branch is the application's to choose.
+        assert_eq!(api_with("PUT", &format!("{repo}/head"), None, Some("not-a-ref")).0, 400);
+        assert_eq!(api_with("PUT", &format!("{repo}/head"), None, Some("refs/heads/other\n")).0, 200);
+        assert_eq!(json(&api("GET", &repo, None).1)["head"], "refs/heads/other");
+        git(tmp.path(), &["clone", "-q", &format!("{base}/r-42.git"), "clone"]);
+        assert_eq!(git(&tmp.path().join("clone"), &["symbolic-ref", "--short", "HEAD"]), "other");
+
+        assert_eq!(api("DELETE", &repo, None).0, 200);
+        assert_eq!(api("GET", &repo, None).0, 404);
+        assert!(!git_in(tmp.path(), &["ls-remote", &format!("{base}/r-42.git")]).status.success());
+    })
+    .await
+    .unwrap();
+
+    // The deleted repository's pack goes after the grace period (none, here)...
+    assert!(app.meta.list_repos().await.unwrap().is_empty());
+    assert_eq!(sweep(&app).await.unwrap(), 1);
+    // ...and so does what a push still in flight at that moment leaves behind.
+    let mut stray = app.packs.upload("a-pool-nobody-has", "0000stray").await.unwrap();
+    tokio::task::spawn_blocking(move || {
+        std::io::Write::write_all(&mut stray, b"not really a pack").unwrap();
+        stray.finish().unwrap();
+    })
+    .await
+    .unwrap();
+    assert_eq!(sweep_orphans(&app).await.unwrap(), 1);
+    assert_eq!(sweep_orphans(&app).await.unwrap(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

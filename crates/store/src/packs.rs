@@ -324,6 +324,12 @@ impl PackStore {
         Ok(PackSet::new(self.open_each(pool_id, pack_ids).await?))
     }
 
+    /// Lists the pools that have anything in storage.
+    pub async fn list_pools(&self) -> anyhow::Result<Vec<String>> {
+        let listing = self.blocks.store.list_with_delimiter(Some(&Path::from("pools"))).await.context("listing pools")?;
+        Ok(listing.common_prefixes.iter().filter_map(|prefix| prefix.filename().map(str::to_string)).collect())
+    }
+
     /// Lists the packs that have any file in a pool's storage, each with the
     /// time (Unix seconds) its newest file was written. Includes packs that no
     /// manifest knows about.

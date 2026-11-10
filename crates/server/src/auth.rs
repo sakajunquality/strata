@@ -1,24 +1,65 @@
-//! Token authentication and per-repository authorization.
+//! Who may do what.
 //!
-//! Git clients send tokens as the password of HTTP Basic credentials; scripts
-//! may use a Bearer header instead.
+//! Git requests are decided by the application's authorization hook when one
+//! is configured: it sees the requested path and the client's credentials,
+//! and answers with the repository to use. Without a hook, the admin token
+//! is the only credential there is. The management API always takes the
+//! admin token.
 
 use axum::http::{header, HeaderMap, StatusCode};
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use strata_store::Access;
 
-use crate::{App, HttpError};
+use crate::{repo_name, App, HttpError};
 
-/// What a request is about to do.
-pub(crate) enum Need<'a> {
-    Repo(&'a str, Access),
-    /// Managing tokens: reserved to holders of admin access to everything.
-    Tokens,
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Access {
+    Read,
+    Write,
 }
 
-pub(crate) fn hash_secret(secret: &str) -> String {
-    Sha256::digest(secret.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+/// A git request that may go ahead.
+#[derive(Clone, Debug)]
+pub(crate) struct Granted {
+    /// The repository to act on. With a hook, this is whatever it mapped the
+    /// requested path to: typically an id that survives renames.
+    pub repo: String,
+    /// Who is acting, as the hook named them. Recorded with pushes.
+    pub actor: Option<String>,
+}
+
+/// A remembered answer of the authorization hook.
+#[derive(Clone)]
+pub(crate) enum Decision {
+    Yes(Granted),
+    No(StatusCode, String),
+}
+
+#[derive(Serialize)]
+struct Question<'a> {
+    path: &'a str,
+    access: &'a str,
+    /// The client's `Authorization` header, untouched.
+    authorization: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct Answer {
+    allow: bool,
+    repo: Option<String>,
+    actor: Option<String>,
+    status: Option<u16>,
+    message: Option<String>,
+}
+
+fn sha256(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn presented_secret(headers: &HeaderMap) -> Option<String> {
@@ -34,34 +75,80 @@ fn presented_secret(headers: &HeaderMap) -> Option<String> {
     Some(if password.is_empty() { user } else { password }.to_string())
 }
 
-/// Checks that the request may do what it is about to. Runs before anything
-/// reveals whether a repository exists.
-pub(crate) async fn authorize(app: &App, headers: &HeaderMap, need: Need<'_>) -> Result<(), HttpError> {
+fn is_admin(app: &App, headers: &HeaderMap) -> Result<bool, HttpError> {
     let Some(admin_token) = &app.options.admin_token else {
         // No admin token configured: authentication is switched off.
-        return Ok(());
+        return Ok(true);
     };
-    if app.options.anonymous_read && matches!(need, Need::Repo(_, Access::Read)) {
-        return Ok(());
-    }
     let Some(secret) = presented_secret(headers) else {
         return Err(HttpError::unauthorized());
     };
-    let hash = hash_secret(&secret);
     // Comparing hashes keeps the comparison independent of where the secrets differ.
-    if hash == hash_secret(admin_token) {
-        return Ok(());
+    Ok(sha256(&[&secret]) == sha256(&[admin_token]))
+}
+
+/// For the management API.
+pub(crate) fn authorize_admin(app: &App, headers: &HeaderMap) -> Result<(), HttpError> {
+    match is_admin(app, headers)? {
+        true => Ok(()),
+        false => Err(HttpError::unauthorized()),
     }
-    let Some(token) = app.meta.find_token(&hash).await? else {
+}
+
+/// For git requests. Runs before anything reveals whether a repository exists.
+pub(crate) async fn authorize_git(app: &App, headers: &HeaderMap, path: &str, access: Access) -> Result<Granted, HttpError> {
+    let Some(url) = &app.options.authz_url else {
+        let open = app.options.anonymous_read && access == Access::Read;
+        if open || is_admin(app, headers)? {
+            return Ok(Granted { repo: path.to_string(), actor: None });
+        }
         return Err(HttpError::unauthorized());
     };
-    let allowed = match need {
-        Need::Repo(repo, access) => token.grants.iter().any(|grant| grant.covers(repo) && grant.access >= access),
-        Need::Tokens => token.grants.iter().any(|grant| grant.pattern == "*" && grant.access == Access::Admin),
-    };
-    if allowed {
-        Ok(())
-    } else {
-        Err(HttpError::new(StatusCode::FORBIDDEN, "this token does not grant that access"))
+
+    let authorization = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
+    let access_name = if access == Access::Read { "read" } else { "write" };
+    let key = sha256(&[path, access_name, authorization.unwrap_or("")]);
+    match app.decisions.as_ref().and_then(|cache| cache.get(&key)) {
+        Some(Decision::Yes(granted)) => return Ok(granted),
+        Some(Decision::No(status, message)) => return Err(HttpError::new(status, message)),
+        None => {}
     }
+    let question = Question { path, access: access_name, authorization };
+    let answer: Answer = app.hooks.ask(url, &question).await.map_err(|e| {
+        tracing::error!("authorization hook failed: {e:#}");
+        HttpError::new(StatusCode::SERVICE_UNAVAILABLE, "authorization is unavailable, try again")
+    })?;
+    if !answer.allow {
+        // Without credentials, "who are you?" makes git ask for them.
+        let fallback = if authorization.is_some() { StatusCode::FORBIDDEN } else { StatusCode::UNAUTHORIZED };
+        let status = match answer.status {
+            Some(401) => StatusCode::UNAUTHORIZED,
+            Some(403) => StatusCode::FORBIDDEN,
+            Some(404) => StatusCode::NOT_FOUND,
+            _ => fallback,
+        };
+        let message = answer.message.unwrap_or_else(|| "access denied".into());
+        // git asks without credentials first, every time. That one "no" is
+        // worth remembering; a "no" to someone in particular is not, or they
+        // would stay locked out for a while after being let in.
+        if let (Some(cache), None) = (&app.decisions, authorization) {
+            cache.insert(key, Decision::No(status, message.clone()));
+        }
+        return Err(HttpError::new(status, message));
+    }
+    let repo = match answer.repo {
+        None => path.to_string(),
+        Some(repo) => repo_name(&repo)
+            .map_err(|_| {
+                tracing::error!(repo, "authorization hook named an invalid repository");
+                HttpError::new(StatusCode::BAD_GATEWAY, "authorization gave an invalid answer")
+            })?
+            .to_string(),
+    };
+    let granted = Granted { repo, actor: answer.actor };
+    // Remembered only briefly: a revoked permission lingers that long.
+    if let Some(cache) = &app.decisions {
+        cache.insert(key, Decision::Yes(granted.clone()));
+    }
+    Ok(granted)
 }

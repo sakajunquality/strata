@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use strata_git::Oid;
 
-use crate::meta::{Access, Garbage, Grant, MetaError, MetaStore, RefUpdate, TokenRecord, Txn};
+use crate::meta::{Garbage, MetaError, MetaStore, RefUpdate, Txn};
 
 fn unique(what: &str) -> String {
     format!("test-{}/{what}", uuid::Uuid::new_v4().simple())
@@ -28,7 +28,8 @@ fn main_ref(old: Option<Oid>, new: Option<Oid>) -> RefUpdate {
 pub async fn check(store: Arc<dyn MetaStore>) {
     cas_and_manifest(&*store).await;
     versions_guard_against_changes_in_between(&*store).await;
-    leases_and_tokens(&*store).await;
+    leases(&*store).await;
+    events_and_deletion(&*store).await;
     concurrent_commits(store).await;
 }
 
@@ -233,7 +234,7 @@ async fn versions_guard_against_changes_in_between(store: &dyn MetaStore) {
     assert_eq!((state.epoch, state.refs_version), (2, 1));
 }
 
-async fn leases_and_tokens(store: &dyn MetaStore) {
+async fn leases(store: &dyn MetaStore) {
     let key = unique("lease");
     assert!(store.try_lease(&key, "node-a", 60).await.unwrap());
     assert!(store.try_lease(&key, "node-a", 60).await.unwrap());
@@ -244,40 +245,60 @@ async fn leases_and_tokens(store: &dyn MetaStore) {
     assert!(store.try_lease(&key, "node-b", 0).await.unwrap());
     // An expired lease is up for grabs.
     assert!(store.try_lease(&key, "node-a", 60).await.unwrap());
+}
 
-    let (name, hash) = (unique("token"), unique("hash"));
-    let token = TokenRecord {
-        name: name.clone(),
-        hash: hash.clone(),
-        grants: vec![
-            Grant {
-                pattern: "acme/*".into(),
-                access: Access::Read,
-            },
-            Grant {
-                pattern: "acme/app".into(),
-                access: Access::Write,
-            },
-        ],
+async fn events_and_deletion(store: &dyn MetaStore) {
+    let name = unique("events");
+    let repo = store.create_repo(&name).await.unwrap();
+    // Other tests (and other runs) write to the same feed: start at its end.
+    let mut start = None;
+    loop {
+        let page = store.list_events(start.as_deref(), 500).await.unwrap();
+        match page.last() {
+            Some(last) => start = Some(last.cursor.clone()),
+            None => break,
+        }
+    }
+    let ours = |events: Vec<crate::meta::Event>| events.into_iter().filter(|e| e.repo == name).collect::<Vec<_>>();
+
+    let push = |old, new, event: &str| Txn {
+        ref_updates: vec![main_ref(old, new)],
+        add_pack: Some(format!("pack-{event}")),
+        event: Some(event.to_string()),
+        ..Txn::default()
     };
-    store.put_token(token.clone()).await.unwrap();
-    assert_eq!(store.find_token(&hash).await.unwrap(), Some(token));
-    assert_eq!(store.find_token(&unique("other")).await.unwrap(), None);
+    store.commit(&name, push(None, Some(oid(1)), "first")).await.unwrap();
+    // A change that fails records nothing.
+    assert!(store.commit(&name, push(None, Some(oid(2)), "lost")).await.is_err());
+    store.commit(&name, push(Some(oid(1)), Some(oid(2)), "second")).await.unwrap();
+    store.commit(&name, push(Some(oid(2)), Some(oid(3)), "third")).await.unwrap();
 
-    // Reissuing a token under the same name retires the old secret.
-    let rehash = unique("hash");
-    let reissued = TokenRecord {
-        name: name.clone(),
-        hash: rehash.clone(),
-        grants: vec![],
-    };
-    store.put_token(reissued.clone()).await.unwrap();
-    assert_eq!(store.find_token(&hash).await.unwrap(), None);
-    assert_eq!(store.find_token(&rehash).await.unwrap(), Some(reissued));
+    let all = ours(store.list_events(start.as_deref(), 500).await.unwrap());
+    assert_eq!(all.iter().map(|e| e.payload.as_str()).collect::<Vec<_>>(), ["first", "second", "third"]);
+    assert!(all.iter().all(|e| e.created_at > 1_600_000_000));
+    // Reading on from any event gives exactly what followed it.
+    let rest = ours(store.list_events(Some(&all[0].cursor), 500).await.unwrap());
+    assert_eq!(rest, all[1..]);
+    assert!(ours(store.list_events(Some(&all[2].cursor), 500).await.unwrap()).is_empty());
+    assert!(store.list_events(start.as_deref(), 1).await.unwrap().len() <= 1);
+    assert!(matches!(store.list_events(Some("not a cursor"), 10).await, Err(MetaError::BadCursor)));
 
-    assert!(store.delete_token(&name).await.unwrap());
-    assert!(!store.delete_token(&name).await.unwrap());
-    assert_eq!(store.find_token(&rehash).await.unwrap(), None);
+    // Nothing is old enough to purge yet; then everything is.
+    store.purge_events(1_600_000_000).await.unwrap();
+    assert_eq!(ours(store.list_events(start.as_deref(), 500).await.unwrap()).len(), 3);
+
+    // A deleted repository is gone at once; its packs wait as garbage.
+    assert!(store.delete_repo(&name).await.unwrap());
+    assert!(!store.delete_repo(&name).await.unwrap());
+    assert!(store.get_repo(&name).await.unwrap().is_none());
+    assert!(!store.list_repos().await.unwrap().contains(&name));
+    assert!(matches!(store.commit(&name, Txn::default()).await, Err(MetaError::NotFound)));
+    let garbage = store.list_garbage(i64::MAX).await.unwrap();
+    assert_eq!(garbage.iter().filter(|g| g.pool_id == repo.pool_id).count(), 3);
+    // The name can be used again, for a repository that shares nothing with the old one.
+    let again = store.create_repo(&name).await.unwrap();
+    assert_ne!(again.pool_id, repo.pool_id);
+    assert!(store.get_repo(&name).await.unwrap().unwrap().refs.is_empty());
 }
 
 /// Several nodes at once: every race has exactly one winner.
@@ -329,6 +350,7 @@ async fn concurrent_commits(store: Arc<dyn MetaStore>) {
                     Txn {
                         ref_updates: vec![update],
                         add_pack: Some(format!("topic-{i}")),
+                        event: Some(format!("topic-{i}")),
                         ..Txn::default()
                     },
                 )
@@ -354,6 +376,16 @@ async fn concurrent_commits(store: Arc<dyn MetaStore>) {
         state.packs,
         "the order is stable"
     );
+
+    // Each of them left exactly one event.
+    let (mut seen, mut after) = (0, None);
+    loop {
+        let page = store.list_events(after.as_deref(), 100).await.unwrap();
+        let Some(last) = page.last() else { break };
+        after = Some(last.cursor.clone());
+        seen += page.iter().filter(|e| e.repo == name).count();
+    }
+    assert_eq!(seen, WRITERS as usize);
 
     // One lease, many nodes.
     let key = unique("lease");

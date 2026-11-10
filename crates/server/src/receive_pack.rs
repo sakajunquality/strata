@@ -11,6 +11,7 @@ use strata_store::{MetaError, PackStore, RefUpdate, RepoState, Txn};
 use tokio::io::AsyncWriteExt;
 use tokio_stream::StreamExt;
 
+use crate::auth::Granted;
 use crate::upload_pack::AGENT;
 use crate::{blocking, App, HttpError};
 
@@ -92,7 +93,7 @@ fn parse_commands(body: &[u8]) -> Result<(Vec<Command>, Vec<String>), HttpError>
 }
 
 /// A conservative subset of git's ref name rules.
-fn valid_ref_name(name: &str) -> bool {
+pub(crate) fn valid_ref_name(name: &str) -> bool {
     name.starts_with("refs/")
         && name.len() <= 1024
         && !name.ends_with('/')
@@ -180,7 +181,8 @@ async fn spool(app: &App, first: Bytes, mut body: BodyDataStream) -> Result<Opti
     Ok((size > 0).then_some(SpooledPack { file: file.into_std().await, size }))
 }
 
-pub(crate) async fn handle(app: &App, name: &str, repo: Option<RepoState>, body: Body) -> Result<Vec<u8>, HttpError> {
+pub(crate) async fn handle(app: &App, granted: &Granted, repo: Option<RepoState>, body: Body) -> Result<Vec<u8>, HttpError> {
+    let name = granted.repo.as_str();
     let mut body = body.into_data_stream();
     let mut head = BytesMut::new();
     let end = loop {
@@ -221,7 +223,7 @@ pub(crate) async fn handle(app: &App, name: &str, repo: Option<RepoState>, body:
     let mut uploaded = None;
     let mut result = Err(Rejection::All("the repository is being reorganised, try again".into()));
     for _ in 0..PUSH_ATTEMPTS {
-        match apply(app, &repo, &commands, pack.clone(), &mut uploaded).await? {
+        match apply(app, &repo, granted.actor.as_deref(), &commands, pack.clone(), &mut uploaded).await? {
             Some(outcome) => {
                 result = outcome;
                 break;
@@ -256,6 +258,29 @@ pub(crate) async fn handle(app: &App, name: &str, repo: Option<RepoState>, body:
     Ok(out)
 }
 
+/// The application's answer to a pre-receive question.
+#[derive(serde::Deserialize)]
+struct Verdict {
+    allow: bool,
+    message: Option<String>,
+}
+
+/// What an update does to its ref: `create`, `delete`, `fast-forward` (the
+/// old value is in the new one's history) or `forced` (history is replaced,
+/// or the ref is not a branch-like pointer to commits).
+fn change(src: &dyn strata_git::ObjectSource, old: &Oid, new: &Oid) -> &'static str {
+    if old.is_zero() {
+        return "create";
+    }
+    if new.is_zero() {
+        return "delete";
+    }
+    match walk::is_ancestor(src, old, new) {
+        Ok(true) => "fast-forward",
+        _ => "forced",
+    }
+}
+
 fn one_line(s: &str) -> String {
     s.replace(['\n', '\r'], " ")
 }
@@ -270,12 +295,19 @@ fn one_line(s: &str) -> String {
 async fn apply(
     app: &App,
     repo: &RepoState,
+    actor: Option<&str>,
     commands: &[Command],
     pack: Option<Arc<dyn PackData>>,
     uploaded: &mut Option<String>,
 ) -> Result<Option<Result<(), Rejection>>, HttpError> {
     if let Some(bad) = commands.iter().find(|c| !valid_ref_name(&c.name)) {
         return Ok(Some(Err(Rejection::Ref { name: bad.name.clone(), reason: "invalid ref name".into() })));
+    }
+
+    // Whoever pushes from a stale view loses to the ref's current value anyway;
+    // saying so now saves the work, and the hooks a question about a push that cannot land.
+    if let Some(stale) = commands.iter().find(|c| repo.refs.get(&c.name).copied().unwrap_or(Oid::ZERO) != c.old) {
+        return Ok(Some(Err(Rejection::Ref { name: stale.name.clone(), reason: "ref changed concurrently, fetch first".into() })));
     }
 
     let existing = app.packs.open(&repo.pool_id, &repo.packs).await?;
@@ -300,8 +332,39 @@ async fn apply(
     // Refuse refs whose history would be incomplete. Checked before upload so
     // a bad push leaves nothing behind.
     let tips: Vec<Oid> = commands.iter().map(|c| c.new).filter(|oid| !oid.is_zero()).collect();
-    if let Err(e) = blocking(move || walk::check_connected(&all, &existing, &tips)).await? {
-        return Ok(Some(Err(Rejection::All(format!("missing necessary objects: {e}")))));
+    let moves: Vec<(Oid, Oid)> = commands.iter().map(|c| (c.old, c.new)).collect();
+    let checked = blocking(move || {
+        walk::check_connected(&all, &existing, &tips)?;
+        Ok::<_, strata_git::Error>(moves.iter().map(|(old, new)| change(&all, old, new)).collect::<Vec<_>>())
+    })
+    .await?;
+    let changes = match checked {
+        Ok(changes) => changes,
+        Err(e) => return Ok(Some(Err(Rejection::All(format!("missing necessary objects: {e}"))))),
+    };
+    let updates: Vec<serde_json::Value> = commands
+        .iter()
+        .zip(&changes)
+        .map(|(c, change)| {
+            let hex = |oid: Oid| (!oid.is_zero()).then(|| oid.to_string());
+            serde_json::json!({ "ref": c.name, "old": hex(c.old), "new": hex(c.new), "change": change })
+        })
+        .collect();
+
+    // The application's rules (protected branches and the like), asked before
+    // anything is stored. No answer means no.
+    if let Some(url) = &app.options.pre_receive_url {
+        let question = serde_json::json!({ "repo": repo.name, "actor": actor, "updates": updates });
+        match app.hooks.ask::<_, Verdict>(url, &question).await {
+            Ok(Verdict { allow: true, .. }) => {}
+            Ok(Verdict { message, .. }) => {
+                return Ok(Some(Err(Rejection::All(message.unwrap_or_else(|| "rejected by the repository's rules".into())))));
+            }
+            Err(e) => {
+                tracing::error!(repo = repo.name, "pre-receive hook failed: {e:#}");
+                return Ok(Some(Err(Rejection::All("the repository's rules could not be checked, try again".into()))));
+            }
+        }
     }
 
     if let Some((data, index, graph)) = to_upload {
@@ -317,6 +380,7 @@ async fn apply(
         ref_updates: commands.iter().map(|c| RefUpdate { name: c.name.clone(), old: present(c.old), new: present(c.new) }).collect(),
         // The connectivity check above is only as good as the pool it saw.
         expect_epoch: Some(repo.epoch),
+        event: Some(serde_json::json!({ "type": "push", "actor": actor, "updates": updates }).to_string()),
         ..Txn::default()
     };
 

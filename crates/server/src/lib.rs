@@ -12,14 +12,15 @@ use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use bytes::Bytes;
-use strata_store::{Access, Grant, MetaError, MetaStore, PackStore, TokenRecord};
+use strata_store::{MetaError, MetaStore, PackStore, Txn};
 
 mod auth;
 mod compaction;
+mod hooks;
 mod receive_pack;
 mod upload_pack;
 
-use auth::Need;
+use auth::Access;
 pub use compaction::{compact, spawn_background, sweep, sweep_orphans, CompactionReport};
 
 /// Fetch requests are negotiation only; anything larger is not a git client.
@@ -45,8 +46,18 @@ pub struct Options {
     /// The secret that may do anything. Without one, authentication is off
     /// and every request is allowed.
     pub admin_token: Option<String>,
-    /// Let anyone fetch without credentials.
+    /// Let anyone fetch without credentials. Ignored with an authorization hook.
     pub anonymous_read: bool,
+    /// Where the application decides who may fetch and push. See [`auth`].
+    pub authz_url: Option<String>,
+    /// How long an answer from the authorization hook is reused. Zero asks every time.
+    pub authz_cache: Duration,
+    /// Where the application may veto a push before it is committed.
+    pub pre_receive_url: Option<String>,
+    /// Sent to the hooks as a Bearer token, so that they know Strata is asking.
+    pub hook_secret: Option<String>,
+    /// How long events stay in the feed.
+    pub event_retention: Duration,
 }
 
 impl Default for Options {
@@ -60,6 +71,11 @@ impl Default for Options {
             orphan_grace: Duration::from_secs(24 * 3600),
             admin_token: None,
             anonymous_read: false,
+            authz_url: None,
+            authz_cache: Duration::from_secs(10),
+            pre_receive_url: None,
+            hook_secret: None,
+            event_retention: Duration::from_secs(7 * 24 * 3600),
         }
     }
 }
@@ -71,11 +87,27 @@ pub struct App {
     /// Identifies this process when claiming maintenance leases.
     node_id: String,
     compactions: compaction::Queue,
+    hooks: hooks::Hooks,
+    /// Recent answers of the authorization hook.
+    decisions: Option<moka::sync::Cache<String, auth::Decision>>,
 }
 
 impl App {
     pub fn new(meta: Arc<dyn MetaStore>, packs: PackStore, options: Options) -> App {
-        App { meta, packs, options, node_id: PackStore::new_pack_id(), compactions: compaction::Queue::default() }
+        // Two TLS backends are linked in (by different dependencies); the HTTP
+        // and gRPC clients need to be told which one to use.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let decisions = (!options.authz_cache.is_zero())
+            .then(|| moka::sync::Cache::builder().max_capacity(100_000).time_to_live(options.authz_cache).build());
+        App {
+            meta,
+            packs,
+            hooks: hooks::Hooks::new(options.hook_secret.clone()),
+            decisions,
+            options,
+            node_id: PackStore::new_pack_id(),
+            compactions: compaction::Queue::default(),
+        }
     }
 }
 
@@ -89,7 +121,7 @@ pub(crate) struct HttpError {
 }
 
 impl HttpError {
-    fn new(status: StatusCode, message: impl Into<String>) -> HttpError {
+    pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> HttpError {
         HttpError { status, message: message.into() }
     }
 
@@ -145,12 +177,19 @@ fn method_not_allowed() -> HttpError {
 async fn route(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body: Body) -> Result<Response, HttpError> {
     let path = uri.path().trim_start_matches('/');
 
-    if path == "api/tokens" || path.starts_with("api/tokens/") {
-        auth::authorize(app, headers, Need::Tokens).await?;
-        return tokens(app, &method, path.strip_prefix("api/tokens").unwrap_or_default(), uri.query().unwrap_or("")).await;
+    if path == "healthz" {
+        return Ok("ok\n".into_response());
+    }
+    if path == "api/events" {
+        auth::authorize_admin(app, headers)?;
+        if method != Method::GET {
+            return Err(method_not_allowed());
+        }
+        return events(app, uri.query().unwrap_or("")).await;
     }
     if let Some(rest) = path.strip_prefix("api/repos/") {
-        return repos(app, headers, &method, rest).await;
+        auth::authorize_admin(app, headers)?;
+        return repos(app, &method, rest, body).await;
     }
 
     if let Some(name) = path.strip_suffix("/info/refs") {
@@ -161,15 +200,15 @@ async fn route(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body: 
         let service = uri.query().unwrap_or("").split('&').find_map(|kv| kv.strip_prefix("service="));
         return match service {
             Some("git-upload-pack") => {
-                auth::authorize(app, headers, Need::Repo(name, Access::Read)).await?;
-                let repo = app.meta.get_repo(name).await?.ok_or_else(HttpError::not_found)?;
+                let granted = auth::authorize_git(app, headers, name, Access::Read).await?;
+                let repo = app.meta.get_repo(&granted.repo).await?.ok_or_else(HttpError::not_found)?;
                 let advertisement =
                     if wants_v2(headers) { upload_pack::advertise() } else { upload_pack::advertise_v0(app, &repo).await? };
                 Ok(git_response("upload-pack-advertisement", advertisement))
             }
             Some("git-receive-pack") => {
-                auth::authorize(app, headers, Need::Repo(name, Access::Write)).await?;
-                let repo = app.meta.get_repo(name).await?;
+                let granted = auth::authorize_git(app, headers, name, Access::Write).await?;
+                let repo = app.meta.get_repo(&granted.repo).await?;
                 if repo.is_none() && !app.options.auto_create {
                     return Err(HttpError::not_found());
                 }
@@ -183,9 +222,8 @@ async fn route(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body: 
         if method != Method::POST {
             return Err(method_not_allowed());
         }
-        let name = repo_name(name)?;
-        auth::authorize(app, headers, Need::Repo(name, Access::Read)).await?;
-        let repo = app.meta.get_repo(name).await?.ok_or_else(HttpError::not_found)?;
+        let granted = auth::authorize_git(app, headers, repo_name(name)?, Access::Read).await?;
+        let repo = app.meta.get_repo(&granted.repo).await?.ok_or_else(HttpError::not_found)?;
         let body = axum::body::to_bytes(body, MAX_FETCH_REQUEST)
             .await
             .map_err(|_| HttpError::new(StatusCode::PAYLOAD_TOO_LARGE, "fetch request too large"))?;
@@ -202,27 +240,33 @@ async fn route(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body: 
         if method != Method::POST {
             return Err(method_not_allowed());
         }
-        let name = repo_name(name)?;
-        auth::authorize(app, headers, Need::Repo(name, Access::Write)).await?;
-        let repo = app.meta.get_repo(name).await?;
+        let granted = auth::authorize_git(app, headers, repo_name(name)?, Access::Write).await?;
+        let repo = app.meta.get_repo(&granted.repo).await?;
         if repo.is_none() && !app.options.auto_create {
             return Err(HttpError::not_found());
         }
         if headers.contains_key(header::CONTENT_ENCODING) {
             return Err(HttpError::new(StatusCode::UNSUPPORTED_MEDIA_TYPE, "compressed push bodies are not supported"));
         }
-        let result = receive_pack::handle(app, name, repo, body).await?;
+        let result = receive_pack::handle(app, &granted, repo, body).await?;
         return Ok(git_response("receive-pack-result", result));
     }
 
     Err(HttpError::not_found())
 }
 
-/// `PUT /api/repos/<name>` creates a repository; `POST /api/repos/<name>/compact` rewrites its pool.
-async fn repos(app: &App, headers: &HeaderMap, method: &Method, rest: &str) -> Result<Response, HttpError> {
+fn json(status: StatusCode, value: serde_json::Value) -> Response {
+    (status, [(header::CONTENT_TYPE, "application/json")], value.to_string() + "\n").into_response()
+}
+
+/// The management API for one repository:
+///
+/// - `PUT /api/repos/<id>` creates it, `DELETE` removes it, `GET` describes it
+/// - `PUT /api/repos/<id>/head` points HEAD at the ref named in the body
+/// - `POST /api/repos/<id>/compact` rewrites its packs into one
+async fn repos(app: &App, method: &Method, rest: &str, body: Body) -> Result<Response, HttpError> {
     if let Some(name) = rest.strip_suffix("/compact") {
         let name = repo_name(name)?;
-        auth::authorize(app, headers, Need::Repo(name, Access::Admin)).await?;
         if method != Method::POST {
             return Err(method_not_allowed());
         }
@@ -232,62 +276,84 @@ async fn repos(app: &App, headers: &HeaderMap, method: &Method, rest: &str) -> R
             None => "nothing to do\n".into_response(),
         });
     }
-    let name = repo_name(rest)?;
-    auth::authorize(app, headers, Need::Repo(name, Access::Admin)).await?;
-    if method != Method::PUT {
-        return Err(method_not_allowed());
+    if let Some(name) = rest.strip_suffix("/head") {
+        let name = repo_name(name)?;
+        if method != Method::PUT {
+            return Err(method_not_allowed());
+        }
+        let body = axum::body::to_bytes(body, 4096).await.map_err(|_| HttpError::bad_request("ref name too long"))?;
+        let head = std::str::from_utf8(&body).map(str::trim).map_err(|_| HttpError::bad_request("invalid ref name"))?;
+        if !receive_pack::valid_ref_name(head) {
+            return Err(HttpError::bad_request("HEAD must name a ref, like refs/heads/main"));
+        }
+        return match app.meta.commit(name, Txn { set_head: Some(head.to_string()), ..Txn::default() }).await {
+            Ok(()) => Ok("updated\n".into_response()),
+            Err(MetaError::NotFound) => Err(HttpError::not_found()),
+            Err(e) => Err(e.into()),
+        };
     }
-    match app.meta.create_repo(name).await {
-        Ok(_) => Ok((StatusCode::CREATED, "created\n").into_response()),
-        Err(MetaError::AlreadyExists) => Err(HttpError::new(StatusCode::CONFLICT, "repository already exists")),
-        Err(e) => Err(e.into()),
+
+    let name = repo_name(rest)?;
+    match *method {
+        Method::PUT => match app.meta.create_repo(name).await {
+            Ok(_) => Ok((StatusCode::CREATED, "created\n").into_response()),
+            Err(MetaError::AlreadyExists) => Err(HttpError::new(StatusCode::CONFLICT, "repository already exists")),
+            Err(e) => Err(e.into()),
+        },
+        Method::GET => {
+            let repo = app.meta.get_repo(name).await?.ok_or_else(HttpError::not_found)?;
+            let packs = app.packs.open_each(&repo.pool_id, &repo.packs).await?;
+            Ok(json(
+                StatusCode::OK,
+                serde_json::json!({
+                    "repo": repo.name,
+                    "head": repo.head,
+                    "refs": repo.refs.len(),
+                    "packs": packs.len(),
+                    // An object stored in two packs counts twice, until compaction merges them.
+                    "objects": packs.iter().map(|pack| pack.index().len()).sum::<usize>(),
+                    "bytes": packs.iter().map(|pack| pack.size()).sum::<u64>(),
+                }),
+            ))
+        }
+        // Gone for every request from here on; the packs follow after the grace period.
+        Method::DELETE => match app.meta.delete_repo(name).await? {
+            true => Ok("deleted\n".into_response()),
+            false => Err(HttpError::not_found()),
+        },
+        _ => Err(method_not_allowed()),
     }
 }
 
-/// `POST /api/tokens?name=<name>&grant=<pattern>:<access>...` issues a token
-/// and returns its secret, once. `DELETE /api/tokens/<name>` revokes one.
-async fn tokens(app: &App, method: &Method, rest: &str, query: &str) -> Result<Response, HttpError> {
-    if let Some(name) = rest.strip_prefix('/').filter(|name| !name.is_empty()) {
-        if method != Method::DELETE {
-            return Err(method_not_allowed());
-        }
-        return match app.meta.delete_token(name).await? {
-            true => Ok("revoked\n".into_response()),
-            false => Err(HttpError::not_found()),
-        };
-    }
-    if method != Method::POST {
-        return Err(method_not_allowed());
-    }
-    let mut name = None;
-    let mut grants = Vec::new();
-    for (key, value) in query.split('&').filter_map(|kv| kv.split_once('=')) {
-        match key {
-            "name" => name = Some(value),
-            "grant" => {
-                let grant = value.rsplit_once(':').and_then(|(pattern, access)| {
-                    let valid = pattern == "*" || repo_name(pattern.strip_suffix("/*").unwrap_or(pattern)).is_ok();
-                    Some(Grant { pattern: pattern.to_string(), access: Access::parse(access).filter(|_| valid)? })
-                });
-                grants.push(grant.ok_or_else(|| HttpError::bad_request("grants look like acme/*:read, acme/app:write or *:admin"))?);
-            }
-            _ => {}
-        }
-    }
-    let name = name
-        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')))
-        .ok_or_else(|| HttpError::bad_request("a token needs a name of letters, digits, '-', '_' or '.'"))?;
-    if grants.is_empty() {
-        return Err(HttpError::bad_request("a token needs at least one grant"));
-    }
-    let secret = format!("strata_{}{}", PackStore::new_pack_id(), PackStore::new_pack_id());
-    app.meta.put_token(TokenRecord { name: name.to_string(), hash: auth::hash_secret(&secret), grants }).await?;
-    Ok((StatusCode::CREATED, secret + "\n").into_response())
+/// `GET /api/events?after=<cursor>&limit=<n>`: what happened to repositories,
+/// oldest first. Poll with the `next` of the previous answer.
+async fn events(app: &App, query: &str) -> Result<Response, HttpError> {
+    let param = |name: &str| query.split('&').filter_map(|kv| kv.split_once('=')).find(|(key, _)| *key == name).map(|(_, v)| v);
+    let limit = match param("limit") {
+        None => 100,
+        Some(limit) => limit.parse::<usize>().ok().filter(|n| (1..=1000).contains(n)).ok_or_else(|| HttpError::bad_request("limit must be 1 to 1000"))?,
+    };
+    let after = param("after").filter(|cursor| !cursor.is_empty());
+    let events = match app.meta.list_events(after, limit).await {
+        Ok(events) => events,
+        Err(MetaError::BadCursor) => return Err(HttpError::bad_request("invalid cursor")),
+        Err(e) => return Err(e.into()),
+    };
+    // Nothing new: keep polling from the same place.
+    let next = events.last().map(|event| event.cursor.clone()).or_else(|| after.map(str::to_string));
+    let events: Vec<serde_json::Value> = events
+        .into_iter()
+        .map(|event| {
+            let detail = serde_json::from_str(&event.payload).unwrap_or(serde_json::Value::Null);
+            serde_json::json!({ "cursor": event.cursor, "repo": event.repo, "time": event.created_at, "event": detail })
+        })
+        .collect();
+    Ok(json(StatusCode::OK, serde_json::json!({ "events": events, "next": next })))
 }
 
 /// Normalises `owner/repo.git` to `owner/repo` and rejects anything that is
 /// not a plain slash-separated name.
-fn repo_name(raw: &str) -> Result<&str, HttpError> {
+pub(crate) fn repo_name(raw: &str) -> Result<&str, HttpError> {
     let name = raw.strip_suffix(".git").unwrap_or(raw);
     let segment_ok = |s: &str| {
         !s.is_empty()

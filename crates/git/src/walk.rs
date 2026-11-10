@@ -46,6 +46,34 @@ pub fn commit_tips(src: &dyn ObjectSource, oids: &[Oid]) -> Result<Vec<Oid>> {
     Ok(tips)
 }
 
+/// Whether commit `ancestor` is `descendant` or part of its history.
+///
+/// Walks newest first and stops as soon as the answer is yes, so the usual
+/// case (a branch moved forward by a few commits) reads a few commits. A
+/// "no" has to look at all of `descendant`'s history.
+pub fn is_ancestor(src: &dyn ObjectSource, ancestor: &Oid, descendant: &Oid) -> Result<bool> {
+    let mut seen = HashSet::new();
+    let mut queue = BinaryHeap::new();
+    let commit = src.commit(descendant)?.ok_or(Error::Missing(*descendant))?;
+    queue.push((commit.time, *descendant));
+    seen.insert(*descendant);
+    while let Some((_, oid)) = queue.pop() {
+        if oid == *ancestor {
+            return Ok(true);
+        }
+        let commit = src.commit(&oid)?.ok_or(Error::Missing(oid))?;
+        for parent in commit.parents {
+            if seen.insert(parent) {
+                // Parents this source lacks (beyond a shallow boundary) end the walk there.
+                if let Some(info) = src.commit(&parent)? {
+                    queue.push((info.time, parent));
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Collects every commit reachable from `tips` that is present in `src`.
 fn reachable_commits(src: &dyn ObjectSource, tips: &[Oid]) -> Result<HashSet<Oid>> {
     let mut commits = HashSet::new();
