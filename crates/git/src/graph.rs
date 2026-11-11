@@ -5,7 +5,7 @@
 //! describes a whole repository, not a pack).
 
 use bytes::Bytes;
-use sha1::{Digest, Sha1};
+use crate::sha1::Sha1;
 
 use crate::object::CommitInfo;
 use crate::{corrupt, Oid, Result};

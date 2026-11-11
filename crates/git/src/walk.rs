@@ -179,11 +179,7 @@ impl Filter {
         }
         match self.blob_limit {
             None => Ok(true),
-            // TODO: read the size from the pack entry header instead of inflating the blob.
-            Some(limit) => {
-                let blob = src.get(oid)?.ok_or(Error::Missing(*oid))?;
-                Ok((blob.data.len() as u64) < limit)
-            }
+            Some(limit) => Ok(src.size(oid)?.ok_or(Error::Missing(*oid))? < limit),
         }
     }
 

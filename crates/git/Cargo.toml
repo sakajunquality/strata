@@ -7,6 +7,6 @@ edition.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 crc32fast = "1"
-flate2 = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 hex = "0.4"
-sha1 = "0.10"
+sha1 = { version = "0.10", features = ["compress"] }

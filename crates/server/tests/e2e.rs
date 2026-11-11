@@ -469,6 +469,49 @@ async fn compaction_preserves_the_repository() {
     assert!(work.exists());
 }
 
+/// A push must bring, or find here already, everything its commits lead to.
+/// git would not send less; this request is made by hand.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_push_that_leaves_objects_out_is_refused() {
+    let base = start(true).await;
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("a.txt"), "a\n").unwrap();
+        let commit = commit_on(&work, 1, "first");
+        let tree = git(&work, &["rev-parse", "HEAD^{tree}"]);
+        let blob = git(&work, &["rev-parse", "HEAD:a.txt"]);
+        let push = |name: &str, objects: &[&str]| -> String {
+            let list = tmp.path().join("objects");
+            std::fs::write(&list, objects.join("\n") + "\n").unwrap();
+            let packed = Command::new("sh").current_dir(&work).args(["-c", "git pack-objects -q --stdout < \"$0\"", list.to_str().unwrap()]).output().unwrap();
+            let line = format!("{} {commit} refs/heads/{name}\0report-status\n", "0".repeat(40));
+            let request = [format!("{:04x}{line}0000", line.len() + 4).as_bytes(), &packed.stdout[..]].concat();
+            let body = tmp.path().join("request");
+            std::fs::write(&body, request).unwrap();
+            let url = format!("{base}/acme/partial.git/git-receive-pack");
+            let out = Command::new("curl")
+                .args(["-s", "-X", "POST", "-H", "Content-Type: application/x-git-receive-pack-request", "--data-binary", &format!("@{}", body.display()), &url])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+        // The commit without its tree, then with the tree but not the file in it.
+        assert!(push("one", &[&commit]).contains("ng refs/heads/one missing necessary objects"));
+        assert!(push("two", &[&commit, &tree]).contains("ng refs/heads/two missing necessary objects"));
+        let whole = push("three", &[&commit, &tree, &blob]);
+        assert!(whole.contains("ok refs/heads/three"), "{whole}");
+        // Only the whole one landed. And what is here already need not come again.
+        let refs = git(tmp.path(), &["ls-remote", "--heads", &format!("{base}/acme/partial.git")]);
+        assert_eq!(refs, format!("{commit}\trefs/heads/three"));
+        assert!(push("four", &[]).contains("ok refs/heads/four"));
+    })
+    .await
+    .unwrap();
+}
+
 /// Two directories trade contents, in commits that a merge and unordered
 /// dates make the server look at before the commit both contents come from.
 /// Each new tree then shares a file with a tree the server has yet to walk,

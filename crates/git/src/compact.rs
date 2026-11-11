@@ -64,6 +64,10 @@ struct WithGraph<'a> {
 }
 
 impl ObjectSource for WithGraph<'_> {
+    fn size(&self, oid: &Oid) -> Result<Option<u64>> {
+        self.objects.size(oid)
+    }
+
     fn get(&self, oid: &Oid) -> Result<Option<Object>> {
         self.objects.get(oid)
     }

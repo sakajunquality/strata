@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use sha1::{Digest, Sha1};
+use crate::sha1::Sha1;
 
 use crate::{corrupt, Oid, Result};
 

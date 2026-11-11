@@ -6,7 +6,7 @@ use axum::body::{Body, BodyDataStream};
 use bytes::{Bytes, BytesMut};
 use strata_git::pack::index_pack;
 use strata_git::pktline::{self, Pkt, Reader};
-use strata_git::{walk, Oid, PackData, PackFile, PackSet};
+use strata_git::{walk, ObjectSource, Oid, PackData, PackFile, PackSet};
 use strata_store::{MetaError, PackStore, RefUpdate, RepoState, Txn};
 use tokio::io::AsyncWriteExt;
 use tokio_stream::StreamExt;
@@ -19,8 +19,6 @@ use crate::{blocking, App, HttpError};
 const MAX_COMMANDS: usize = 16 << 20;
 /// Times a push is re-validated when the pool is pruned underneath it.
 const PUSH_ATTEMPTS: usize = 3;
-/// How much of a spooled pack is read at a time.
-const SPOOL_CHUNK: u64 = 256 << 10;
 
 /// `no-thin` is deliberately absent: thin packs are completed on receipt.
 fn capabilities() -> String {
@@ -124,44 +122,31 @@ fn commands_end(buf: &[u8]) -> Result<Option<usize>, HttpError> {
     }
 }
 
-/// A pack spooled to a scratch file, read back in pieces.
+/// A pack spooled to a scratch file and mapped into memory: read wherever
+/// the indexer asks, without copying, and paged in and out by the kernel as
+/// memory allows.
 struct SpooledPack {
-    file: std::fs::File,
-    size: u64,
+    data: Bytes,
+}
+
+impl SpooledPack {
+    fn open(file: &std::fs::File) -> std::io::Result<SpooledPack> {
+        // Safe as long as nobody else writes the file: it has no name, and
+        // this request holds the only handle.
+        let map = unsafe { memmap2::Mmap::map(file)? };
+        Ok(SpooledPack { data: Bytes::from_owner(map) })
+    }
 }
 
 impl PackData for SpooledPack {
     fn size(&self) -> u64 {
-        self.size
+        self.data.len() as u64
     }
 
     fn chunk(&self, offset: u64) -> strata_git::Result<Bytes> {
-        if offset >= self.size {
-            return Ok(Bytes::new());
-        }
-        let mut buf = vec![0u8; (self.size - offset).min(SPOOL_CHUNK) as usize];
-        read_exact_at(&self.file, &mut buf, offset).map_err(|e| strata_git::Error::Io(format!("reading spooled pack: {e}")))?;
-        Ok(buf.into())
+        let start = (offset as usize).min(self.data.len());
+        Ok(self.data.slice(start..))
     }
-}
-
-#[cfg(unix)]
-fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
-}
-
-#[cfg(windows)]
-fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
-    while !buf.is_empty() {
-        match std::os::windows::fs::FileExt::seek_read(file, buf, offset)? {
-            0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
-            n => {
-                buf = &mut buf[n..];
-                offset += n as u64;
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Writes the rest of the request to an anonymous scratch file, so that a
@@ -178,7 +163,11 @@ async fn spool(app: &App, first: Bytes, mut body: BodyDataStream) -> Result<Opti
         file.write_all(&chunk).await?;
     }
     file.flush().await?;
-    Ok((size > 0).then_some(SpooledPack { file: file.into_std().await, size }))
+    if size == 0 {
+        return Ok(None);
+    }
+    let file = file.into_std().await;
+    Ok(Some(blocking(move || SpooledPack::open(&file)).await??))
 }
 
 pub(crate) async fn handle(app: &App, granted: &Granted, repo: Option<RepoState>, body: Body) -> Result<Vec<u8>, HttpError> {
@@ -327,6 +316,8 @@ async fn apply(
     let existing = app.packs.open(&repo.pool_id, &repo.packs).await?;
     let mut all = existing.clone();
     let mut to_upload = None;
+    // What the new pack points at outside itself, when it was indexed just now.
+    let mut outside = None;
     if let Some(pack_id) = uploaded.as_ref() {
         all = app.packs.open(&repo.pool_id, std::slice::from_ref(pack_id)).await?.merged_with(&existing);
     } else if let Some(spooled) = pack {
@@ -336,6 +327,7 @@ async fn apply(
             // A push that only moves refs to existing objects carries an empty pack.
             Ok(indexed) if indexed.index.is_empty() => {}
             Ok(indexed) => {
+                outside = Some(indexed.outside.clone());
                 let data = indexed.data(spooled);
                 all = existing.with_pack(Arc::new(PackFile::new(data.clone(), indexed.index.clone(), None)?));
                 to_upload = Some((data, indexed.index, indexed.graph));
@@ -349,7 +341,16 @@ async fn apply(
     let moves: Vec<(Oid, Oid)> = commands.iter().map(|c| (c.old, c.new)).collect();
     let pushed = all.clone();
     let checked = blocking(move || {
-        walk::check_connected(&all, &existing, &tips)?;
+        match outside {
+            // Indexing saw every object of the pack and noted what each points
+            // at: the pack is connected if what lies outside it is here.
+            Some(outside) => {
+                if let Some(missing) = tips.iter().find(|tip| !all.contains(tip)).or_else(|| outside.iter().find(|oid| !existing.contains(oid))) {
+                    return Err(strata_git::Error::Missing(*missing));
+                }
+            }
+            None => walk::check_connected(&all, &existing, &tips)?,
+        }
         Ok::<_, strata_git::Error>(moves.iter().map(|(old, new)| change(&all, old, new)).collect::<Vec<_>>())
     })
     .await?;

@@ -1,6 +1,6 @@
 //! Packfile reading, writing, and indexing of packs received from clients.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -8,13 +8,13 @@ use std::sync::{Arc, OnceLock};
 use bytes::{Buf, Bytes};
 use flate2::write::ZlibEncoder;
 use flate2::{Compression, Decompress, FlushDecompress, Status};
-use sha1::{Digest, Sha1};
+use crate::sha1::Sha1;
 
 use crate::bitmap::PackBitmaps;
 use crate::bitset::BitSet;
 use crate::graph::CommitGraph;
 use crate::idx::{IdxEntry, PackIndex};
-use crate::object::{commit_info, object_id, CommitInfo};
+use crate::object::{commit_info, object_id, parse_tag, parse_tree, CommitInfo};
 use crate::{corrupt, delta, Error, Object, ObjectCache, ObjectKind, ObjectSource, Oid, PackData, Result};
 
 const HEADER_LEN: u64 = 12;
@@ -533,6 +533,34 @@ impl PackFile {
         }
     }
 
+    /// The size of the object stored at `offset`, without reading it: a
+    /// whole object's entry says, and a delta starts with the size of what
+    /// it produces.
+    pub fn size_at(&self, offset: u64) -> Result<u64> {
+        let (header, mut cursor) = entry_header_at(&*self.data, offset)?;
+        if let EntryKind::Full(_) = header.kind {
+            return Ok(header.size as u64);
+        }
+        // Two sizes of at most ten bytes each open a delta.
+        let mut start = [0u8; 20];
+        let mut z = Decompress::new(true);
+        let mut made = 0;
+        while made < start.len().min(header.size) {
+            let before = (z.total_in(), z.total_out());
+            let input = cursor.fill()?;
+            if input.is_empty() {
+                return Err(corrupt("truncated delta"));
+            }
+            let status = z.decompress(input, &mut start[made..], FlushDecompress::None).map_err(|e| corrupt(format!("zlib: {e}")))?;
+            cursor.consume((z.total_in() - before.0) as usize);
+            made += (z.total_out() - before.1) as usize;
+            if status == Status::StreamEnd {
+                break;
+            }
+        }
+        Ok(delta::result_size(&start[..made])? as u64)
+    }
+
     fn cached(&self, offset: u64) -> Option<Object> {
         self.cache.as_ref()?.get(self.id, offset)
     }
@@ -680,6 +708,10 @@ impl ObjectSource for PackSet {
         self.locate(oid).is_some()
     }
 
+    fn size(&self, oid: &Oid) -> Result<Option<u64>> {
+        self.locate(oid).map(|(pack, offset)| pack.size_at(offset)).transpose()
+    }
+
     fn commit(&self, oid: &Oid) -> Result<Option<CommitInfo>> {
         if let Some(info) = self.packs.iter().filter_map(|pack| pack.graph.as_ref()).find_map(|graph| graph.get(oid)) {
             return Ok(Some(info));
@@ -696,6 +728,10 @@ pub struct IndexedPack {
     pub index: PackIndex,
     /// The commits in the pack.
     pub graph: CommitGraph,
+    /// Objects that the pack's objects point at and the pack does not hold.
+    /// With these in place already, everything in the pack is connected:
+    /// nothing has to be read a second time to check.
+    pub outside: Vec<Oid>,
     /// End of the entries in the pack as received.
     body_end: u64,
     /// Present when the pack was thin and had to be completed.
@@ -774,6 +810,8 @@ struct Resolver<'a> {
     ofs_children: HashMap<usize, Vec<usize>>,
     /// Ref-deltas waiting on an object id.
     ref_waiting: HashMap<Oid, Vec<usize>>,
+    /// Every object some object of the pack points at.
+    references: HashSet<Oid>,
 }
 
 impl Resolver<'_> {
@@ -781,6 +819,28 @@ impl Resolver<'_> {
         let raw = &self.raws[index];
         let size = usize::try_from(raw.size).map_err(|_| corrupt("pack entry size overflow"))?;
         inflate(&mut Cursor::new(self.data, raw.offset + u64::from(raw.header_len)), size)
+    }
+
+    /// Notes what an object points at: a commit's tree and parents, a tag's
+    /// target, a tree's entries.
+    fn note(&mut self, oid: Oid, kind: ObjectKind, data: &[u8]) -> Result<()> {
+        match kind {
+            ObjectKind::Commit => {
+                let info = commit_info(data)?;
+                self.references.insert(info.tree);
+                self.references.extend(&info.parents);
+                self.commits.push((oid, info));
+            }
+            ObjectKind::Tag => {
+                self.references.insert(parse_tag(data)?);
+            }
+            ObjectKind::Tree => {
+                // A submodule's commit lives in another repository.
+                self.references.extend(parse_tree(data)?.iter().filter(|entry| !entry.is_gitlink()).map(|entry| entry.oid));
+            }
+            ObjectKind::Blob => {}
+        }
+        Ok(())
     }
 
     fn has_dependants(&self, index: usize, oid: &Oid) -> bool {
@@ -793,8 +853,9 @@ impl Resolver<'_> {
         let mut stack = vec![(index, object)];
         while let Some((index, object)) = stack.pop() {
             let oid = object.oid();
-            if object.kind == ObjectKind::Commit {
-                self.commits.push((oid, commit_info(&object.data)?));
+            // A whole object of the pack was noted when it was first read.
+            if index.is_none_or(|i| self.raws[i].whole.is_none()) && index.is_some() {
+                self.note(oid, object.kind, &object.data)?;
             }
             let mut children = Vec::new();
             if let Some(i) = index {
@@ -845,6 +906,7 @@ pub fn index_pack(data: &dyn PackData, existing: &dyn ObjectSource) -> Result<In
         commits: Vec::new(),
         ofs_children: HashMap::new(),
         ref_waiting: HashMap::new(),
+        references: HashSet::new(),
     };
     for i in 0..count {
         let offset = cursor.offset;
@@ -855,18 +917,17 @@ pub fn index_pack(data: &dyn PackData, existing: &dyn ObjectSource) -> Result<In
             EntryKind::Full(kind) => {
                 let mut hash = Sha1::new();
                 hash.update(format!("{} {}\0", kind.name(), entry.size));
-                // Commits are small and needed for the commit-graph: keep their text.
-                let mut commit_text = Vec::new();
+                // Everything but a blob points at other objects, and is
+                // kept for a moment to see which; blobs are only hashed.
+                let mut text = Vec::new();
                 inflate_to(&mut cursor, entry.size, &mut |piece| {
                     hash.update(piece);
-                    if kind == ObjectKind::Commit {
-                        commit_text.extend_from_slice(piece);
+                    if kind != ObjectKind::Blob {
+                        text.extend_from_slice(piece);
                     }
                 })?;
                 let oid = Oid::from_bytes(&hash.finalize()).expect("sha1 is 20 bytes");
-                if kind == ObjectKind::Commit {
-                    resolver.commits.push((oid, commit_info(&commit_text)?));
-                }
+                resolver.note(oid, kind, &text)?;
                 Some(oid)
             }
             EntryKind::OfsDelta(base) => {
@@ -931,9 +992,12 @@ pub fn index_pack(data: &dyn PackData, existing: &dyn ObjectSource) -> Result<In
     }
 
     let graph = CommitGraph::build(std::mem::take(&mut resolver.commits));
+    let own: HashSet<Oid> = entries.iter().map(|entry| entry.oid).collect();
+    let mut outside: Vec<Oid> = resolver.references.iter().filter(|oid| !own.contains(oid)).copied().collect();
+    outside.sort();
     if thin_bases.is_empty() {
         let checksum = Oid::from_bytes(&trailer).expect("20 bytes");
-        return Ok(IndexedPack { index: PackIndex::new(entries, checksum), graph, body_end, completion: None });
+        return Ok(IndexedPack { index: PackIndex::new(entries, checksum), graph, outside, body_end, completion: None });
     }
 
     // Appending keeps every existing entry offset (and thus every ofs-delta) valid.
@@ -961,7 +1025,7 @@ pub fn index_pack(data: &dyn PackData, existing: &dyn ObjectSource) -> Result<In
 
     let checksum = Oid::from_bytes(&checksum).expect("sha1 is 20 bytes");
     let completion = Completion { header: Bytes::copy_from_slice(&header), tail: tail.into() };
-    Ok(IndexedPack { index: PackIndex::new(entries, checksum), graph, body_end, completion: Some(completion) })
+    Ok(IndexedPack { index: PackIndex::new(entries, checksum), graph, outside, body_end, completion: Some(completion) })
 }
 
 #[cfg(test)]
@@ -1163,6 +1227,35 @@ pub(crate) mod tests {
         assert_eq!(indexed.graph.len(), 1);
         let info = indexed.graph.get(&commit.oid()).unwrap();
         assert_eq!((info.time, info.tree, info.parents.len()), (7, tree.oid(), 0));
+    }
+
+    #[test]
+    fn indexing_tells_what_the_pack_points_at_outside_itself() {
+        let (kept, absent) = (blob(b"kept"), blob(b"absent"));
+        let entry = |name: &str, object: &Object| [format!("100644 {name}\0").as_bytes(), object.oid().as_bytes()].concat();
+        let tree = Object { kind: ObjectKind::Tree, data: [entry("absent", &absent), entry("kept", &kept)].concat().into() };
+        let parent = Oid::from_hex("1111111111111111111111111111111111111111").unwrap();
+        let text = format!("tree {}\nparent {parent}\nauthor A <a@example.com> 5 +0000\ncommitter A <a@example.com> 7 +0000\n\nmsg\n", tree.oid());
+        let commit = Object { kind: ObjectKind::Commit, data: text.into_bytes().into() };
+        // Everything the commit needs is in the pack, but for its parent.
+        let whole = index_pack(&pack_of(&[commit.clone(), tree.clone(), kept.clone(), absent.clone()]), &PackSet::default()).unwrap();
+        assert_eq!(whole.outside, [parent]);
+        // Leave a file out, and it shows.
+        let mut expected = vec![parent, absent.oid()];
+        expected.sort();
+        assert_eq!(index_pack(&pack_of(&[commit, tree, kept]), &PackSet::default()).unwrap().outside, expected);
+    }
+
+    #[test]
+    fn sizes_are_read_without_the_objects() {
+        let base = blob(&[b'a'; 100]);
+        let existing = set_of(&pack_of(std::slice::from_ref(&base)), &PackSet::default());
+        // Stored as a delta: its size is in the delta, not in the entry.
+        let stored = existing.with_pack(open(&thin_pack(&base, b"!!"), &existing));
+        let derived = blob(&[&[b'a'; 100][..], b"!!"].concat());
+        assert_eq!(stored.size(&base.oid()).unwrap(), Some(100));
+        assert_eq!(stored.size(&derived.oid()).unwrap(), Some(102));
+        assert_eq!(stored.size(&blob(b"elsewhere").oid()).unwrap(), None);
     }
 
     #[test]

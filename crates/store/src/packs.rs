@@ -126,6 +126,9 @@ impl PackUpload {
     }
 }
 
+/// How much of a pack is handed to an upload at a time.
+const UPLOAD_PIECE: usize = 4 << 20;
+
 /// Immutable packs in object storage.
 pub struct PackStore {
     blocks: Arc<Blocks>,
@@ -259,8 +262,11 @@ impl PackStore {
             while offset < size {
                 let chunk = data.chunk(offset)?;
                 anyhow::ensure!(!chunk.is_empty(), "pack data ended early");
-                upload.write_all(&chunk)?;
-                offset += chunk.len() as u64;
+                // A chunk can be all that is left of the pack. Hand it over a
+                // piece at a time, so that the upload can hold the reader back.
+                let piece = &chunk[..chunk.len().min(UPLOAD_PIECE)];
+                upload.write_all(piece)?;
+                offset += piece.len() as u64;
             }
             upload.finish()
         })

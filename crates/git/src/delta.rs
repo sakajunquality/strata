@@ -20,6 +20,13 @@ fn read_size(delta: &[u8], pos: &mut usize) -> Result<usize> {
 }
 
 /// Applies a git delta to `base`, returning the reconstructed object data.
+/// The size of what a delta produces, from the start of the delta alone.
+pub fn result_size(delta_start: &[u8]) -> Result<usize> {
+    let mut pos = 0;
+    read_size(delta_start, &mut pos)?;
+    read_size(delta_start, &mut pos)
+}
+
 pub fn apply(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     let mut pos = 0;
     let base_size = read_size(delta, &mut pos)?;

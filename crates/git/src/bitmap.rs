@@ -15,7 +15,7 @@ use bytes::Bytes;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use sha1::{Digest, Sha1};
+use crate::sha1::Sha1;
 
 use crate::bitset::BitSet;
 use crate::{corrupt, ObjectKind, Oid, Result};

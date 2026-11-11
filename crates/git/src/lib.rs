@@ -13,6 +13,7 @@ pub mod object;
 pub mod oid;
 pub mod pack;
 pub mod pktline;
+pub mod sha1;
 pub mod sparse;
 pub mod walk;
 
@@ -48,6 +49,12 @@ pub(crate) fn corrupt(msg: impl Into<String>) -> Error {
 pub trait ObjectSource {
     fn get(&self, oid: &Oid) -> Result<Option<Object>>;
     fn contains(&self, oid: &Oid) -> bool;
+
+    /// How large an object is, or `None` if it is not here. Implementations
+    /// that can tell without reading the object should.
+    fn size(&self, oid: &Oid) -> Result<Option<u64>> {
+        Ok(self.get(oid)?.map(|object| object.data.len() as u64))
+    }
 
     /// What graph walks need from a commit, or `None` if `oid` is not a
     /// commit in this source. Implementations with a commit-graph answer
