@@ -1,6 +1,6 @@
 //! Packfile reading, writing, and indexing of packs received from clients.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -798,61 +798,128 @@ struct RawEntry {
     header_len: u8,
     /// The object's kind, if the entry holds a whole object.
     whole: Option<ObjectKind>,
-    oid: Option<Oid>,
+    /// Known from the first pass for a whole object; for a delta, set by
+    /// the thread that works it out.
+    oid: OnceLock<Oid>,
 }
 
-/// What resolving deltas finds out, gathered apart by each thread at it.
-#[derive(Default)]
-struct Noted {
-    /// The ids worked out for entries, by entry number.
-    ids: Vec<(usize, Oid)>,
+/// Every object that some object of the pack points at: one set for all the
+/// threads at work. A set each would hold the same ids many times over, since
+/// trees resolved on different threads list mostly the same files.
+struct References {
+    shards: Vec<Mutex<crate::OidSet>>,
+}
+
+impl References {
+    /// Enough that threads rarely want the same one.
+    const SHARDS: usize = 64;
+
+    fn new() -> References {
+        References { shards: (0..Self::SHARDS).map(|_| Mutex::default()).collect() }
+    }
+
+    fn insert(&self, oid: Oid) {
+        // The last byte: the set's own hashing goes by the first ones.
+        let shard = usize::from(oid.as_bytes()[19]) % Self::SHARDS;
+        self.shards[shard].lock().expect("no panics while held").insert(oid);
+    }
+
+    /// The ones `index` does not hold, in order.
+    fn outside(self, index: &PackIndex) -> Vec<Oid> {
+        let mut outside = Vec::new();
+        for shard in self.shards {
+            outside.extend(shard.into_inner().expect("no panics while held").into_iter().filter(|oid| index.position(oid).is_none()));
+        }
+        outside.sort();
+        outside
+    }
+}
+
+/// What reading objects finds out, gathered by each thread at it.
+struct Noted<'a> {
     /// Every commit seen, for the pack's commit-graph.
     commits: Vec<(Oid, CommitInfo)>,
-    /// Every object some object of the pack points at.
-    references: HashSet<Oid>,
+    references: &'a References,
+    /// What was noted a moment ago, by its first bytes. The versions of a
+    /// tree list mostly the same entries: these need not be noted again.
+    recent: Vec<Option<Oid>>,
 }
 
-impl Noted {
+impl<'a> Noted<'a> {
+    const RECENT: usize = 1 << 12;
+
+    fn new(references: &'a References) -> Noted<'a> {
+        Noted { commits: Vec::new(), references, recent: vec![None; Self::RECENT] }
+    }
+
+    fn refer(&mut self, oid: Oid) {
+        let bytes = oid.as_bytes();
+        let slot = (usize::from(bytes[0]) << 8 | usize::from(bytes[1])) % Self::RECENT;
+        if self.recent[slot] != Some(oid) {
+            self.recent[slot] = Some(oid);
+            self.references.insert(oid);
+        }
+    }
+
     /// Notes what an object points at: a commit's tree and parents, a tag's
     /// target, a tree's entries.
     fn note(&mut self, oid: Oid, kind: ObjectKind, data: &[u8]) -> Result<()> {
         match kind {
             ObjectKind::Commit => {
                 let info = commit_info(data)?;
-                self.references.insert(info.tree);
-                self.references.extend(&info.parents);
+                self.refer(info.tree);
+                for parent in &info.parents {
+                    self.refer(*parent);
+                }
                 self.commits.push((oid, info));
             }
-            ObjectKind::Tag => {
-                self.references.insert(parse_tag(data)?);
-            }
+            ObjectKind::Tag => self.refer(parse_tag(data)?),
             ObjectKind::Tree => {
-                // A submodule's commit lives in another repository.
-                self.references.extend(parse_tree(data)?.iter().filter(|entry| !entry.is_gitlink()).map(|entry| entry.oid));
+                for entry in parse_tree(data)? {
+                    // A submodule's commit lives in another repository.
+                    if !entry.is_gitlink() {
+                        self.refer(entry.oid);
+                    }
+                }
             }
             ObjectKind::Blob => {}
         }
         Ok(())
     }
+}
 
-    fn merge(&mut self, other: Noted) {
-        self.ids.extend(other.ids);
-        self.commits.extend(other.commits);
-        self.references.extend(other.references);
-    }
+/// An object whose deltas are being resolved, and how far that has come.
+struct Family {
+    /// The entry holding the object, if it is part of the pack.
+    index: Option<usize>,
+    kind: ObjectKind,
+    /// Given up when the objects held grow too many, and read again from
+    /// the pack when the next delta against it is due.
+    data: Option<Bytes>,
+    /// Whether the pack alone can produce the object again: it is whole
+    /// there, or an ofs-delta against one that can be.
+    rereadable: bool,
+    /// The entries holding deltas against it, and whether each is an ofs-delta.
+    deltas: Vec<(usize, bool)>,
+    next: usize,
 }
 
 struct Resolver<'a> {
     data: &'a dyn PackData,
     raws: Vec<RawEntry>,
-    /// Ofs-deltas waiting on the entry at each index.
-    ofs_children: HashMap<usize, Vec<usize>>,
+    /// Ofs-deltas, as (entry built on, entry of the delta), in that order.
+    /// A pair of numbers per delta, where a table of lists would cost many
+    /// times that.
+    ofs_deltas: Vec<(u32, u32)>,
     /// Ref-deltas waiting on an object id. Whoever resolves that object
     /// takes them, whichever thread it is on.
     ref_waiting: Mutex<HashMap<Oid, Vec<usize>>>,
     /// How many ids are waited on. Packs that git pushes use ofs-deltas, so
     /// this is mostly zero, and then nobody has to take the lock to see.
     ref_left: AtomicUsize,
+    /// Bytes of objects each thread may hold on to while their deltas are
+    /// resolved. The object at hand and the one made from it come on top.
+    budget: usize,
 }
 
 impl Resolver<'_> {
@@ -878,31 +945,101 @@ impl Resolver<'_> {
         taken
     }
 
+    /// The ofs-deltas built on the entry at `index`.
+    fn ofs_deltas_on(&self, index: usize) -> &[(u32, u32)] {
+        let start = self.ofs_deltas.partition_point(|(base, _)| (*base as usize) < index);
+        let len = self.ofs_deltas[start..].partition_point(|(base, _)| *base as usize == index);
+        &self.ofs_deltas[start..start + len]
+    }
+
     fn has_dependants(&self, index: usize, oid: &Oid) -> bool {
-        self.ofs_children.contains_key(&index) || self.ref_waiting.lock().expect("no panics while held").contains_key(oid)
+        !self.ofs_deltas_on(index).is_empty() || self.ref_waiting.lock().expect("no panics while held").contains_key(oid)
+    }
+
+    /// Takes in an object (the entry at `index`, if it is part of the pack)
+    /// and finds the deltas built on it.
+    fn family(&self, index: Option<usize>, object: Object, rereadable: bool, noted: &mut Noted) -> Result<Family> {
+        let oid = object.oid();
+        let mut deltas = Vec::new();
+        if let Some(i) = index {
+            // A whole object of the pack was noted when it was first read.
+            if self.raws[i].whole.is_none() {
+                noted.note(oid, object.kind, &object.data)?;
+                // Deltas form trees, so nobody else is at this entry.
+                let _ = self.raws[i].oid.set(oid);
+            }
+            deltas.extend(self.ofs_deltas_on(i).iter().map(|(_, delta)| (*delta as usize, true)));
+        }
+        deltas.extend(self.take_waiting(&oid).into_iter().map(|delta| (delta, false)));
+        Ok(Family { index, kind: object.kind, data: Some(object.data), rereadable, deltas, next: 0 })
+    }
+
+    /// Reads the object of an entry again: up the ofs-deltas to a whole
+    /// object, then back down applying each.
+    fn reread(&self, index: usize) -> Result<Bytes> {
+        let mut deltas = Vec::new();
+        let mut at = index;
+        while self.raws[at].whole.is_none() {
+            let EntryKind::OfsDelta(base) = entry_header_at(self.data, self.raws[at].offset)?.0.kind else {
+                return Err(corrupt("delta base cannot be read again"));
+            };
+            deltas.push(at);
+            at = self.raws.binary_search_by_key(&base, |raw| raw.offset).map_err(|_| corrupt("delta base offset is not an entry"))?;
+        }
+        let mut data = self.payload(at)?;
+        for delta in deltas.into_iter().rev() {
+            data = delta::apply(&data, &self.payload(delta)?)?;
+        }
+        Ok(data.into())
     }
 
     /// Works out the id of every delta that transitively depends on `object`
     /// (the entry at `index`, if it is part of the pack). Deltas form trees,
     /// so two calls for different objects never meet.
+    ///
+    /// Held in memory are the objects on the way down to the delta at hand,
+    /// each only while deltas against it remain: a chain of versions costs
+    /// one object, not one per version. Where versions branch at every step
+    /// and the objects are large, that is still too much: beyond the budget,
+    /// the ones needed last are given up and read again when their turn comes.
     fn resolve_from(&self, index: Option<usize>, object: Object, noted: &mut Noted) -> Result<()> {
-        let mut stack = vec![(index, object)];
-        while let Some((index, object)) = stack.pop() {
-            let oid = object.oid();
-            let mut children = Vec::new();
-            if let Some(i) = index {
-                // A whole object of the pack was noted when it was first read.
-                if self.raws[i].whole.is_none() {
-                    noted.note(oid, object.kind, &object.data)?;
-                }
-                noted.ids.push((i, oid));
-                children = self.ofs_children.get(&i).cloned().unwrap_or_default();
+        let whole = index.is_some_and(|i| self.raws[i].whole.is_some());
+        let mut held = object.data.len();
+        let mut stack = vec![self.family(index, object, whole, noted)?];
+        // Below this, nothing is left that could be given up.
+        let mut shed_from = 0;
+        while let Some(top) = stack.last_mut() {
+            let Some(&(child, by_offset)) = top.deltas.get(top.next) else {
+                held -= top.data.as_ref().map_or(0, Bytes::len);
+                stack.pop();
+                continue;
+            };
+            top.next += 1;
+            let base = match &top.data {
+                Some(data) => data.clone(),
+                None => self.reread(top.index.expect("only entries of the pack are given up"))?,
+            };
+            let object = Object { kind: top.kind, data: delta::apply(&base, &self.payload(child)?)?.into() };
+            let rereadable = top.rereadable && by_offset;
+            if top.next == top.deltas.len() {
+                // The last delta against it: the base has served.
+                held -= top.data.as_ref().map_or(0, Bytes::len);
+                stack.pop();
+            } else if top.data.is_none() {
+                held += base.len();
+                top.data = Some(base);
+                shed_from = shed_from.min(stack.len() - 1);
             }
-            children.extend(self.take_waiting(&oid));
-            for child in children {
-                let delta = self.payload(child)?;
-                let data = delta::apply(&object.data, &delta)?;
-                stack.push((Some(child), Object { kind: object.kind, data: data.into() }));
+            held += object.data.len();
+            stack.push(self.family(Some(child), object, rereadable, noted)?);
+            shed_from = shed_from.min(stack.len() - 1);
+            // The one just pushed is needed next: it stays whatever it weighs.
+            while held > self.budget && shed_from < stack.len() - 1 {
+                let family = &mut stack[shed_from];
+                if family.rereadable {
+                    held -= family.data.take().map_or(0, |data| data.len());
+                }
+                shed_from += 1;
             }
         }
         Ok(())
@@ -910,17 +1047,18 @@ impl Resolver<'_> {
 
     /// Resolves everything that hangs off the whole objects of the pack, on
     /// several threads when there is enough of it: each takes the next whole
-    /// object and the deltas built on it, a family at a time.
-    fn resolve_all(&self) -> Result<Noted> {
+    /// object and the deltas built on it, a family at a time. Returns the
+    /// commits found on the way.
+    fn resolve_all(&self, references: &References) -> Result<Vec<(Oid, CommitInfo)>> {
         let roots: Vec<usize> =
-            (0..self.raws.len()).filter(|i| matches!((self.raws[*i].whole, self.raws[*i].oid), (Some(_), Some(oid)) if self.has_dependants(*i, &oid))).collect();
+            (0..self.raws.len()).filter(|i| matches!((self.raws[*i].whole, self.raws[*i].oid.get()), (Some(_), Some(oid)) if self.has_dependants(*i, oid))).collect();
         let threads = match roots.len() {
             0..RESOLVE_PARALLEL_FROM => 1,
             _ => std::thread::available_parallelism().map_or(1, usize::from).min(MAX_RESOLVE_THREADS),
         };
         let (next, failed) = (AtomicUsize::new(0), AtomicBool::new(false));
-        let work = || -> Result<Noted> {
-            let mut noted = Noted::default();
+        let work = || -> Result<Vec<(Oid, CommitInfo)>> {
+            let mut noted = Noted::new(references);
             while let Some(&i) = roots.get(next.fetch_add(1, Ordering::Relaxed)).filter(|_| !failed.load(Ordering::Relaxed)) {
                 let kind = self.raws[i].whole.expect("roots are whole objects");
                 let resolved = self.payload(i).and_then(|data| self.resolve_from(Some(i), Object { kind, data: data.into() }, &mut noted));
@@ -929,20 +1067,20 @@ impl Resolver<'_> {
                     return Err(e);
                 }
             }
-            Ok(noted)
+            Ok(noted.commits)
         };
-        let parts: Vec<Result<Noted>> = match threads {
+        let parts: Vec<Result<Vec<(Oid, CommitInfo)>>> = match threads {
             1 => vec![work()],
             _ => std::thread::scope(|scope| {
                 let workers: Vec<_> = (0..threads).map(|_| scope.spawn(work)).collect();
                 workers.into_iter().map(|worker| worker.join().expect("resolving does not panic")).collect()
             }),
         };
-        let mut all = Noted::default();
+        let mut commits = Vec::new();
         for part in parts {
-            all.merge(part?);
+            commits.extend(part?);
         }
-        Ok(all)
+        Ok(commits)
     }
 }
 
@@ -950,6 +1088,9 @@ impl Resolver<'_> {
 const RESOLVE_PARALLEL_FROM: usize = 256;
 /// Each thread holds a delta family in memory.
 const MAX_RESOLVE_THREADS: usize = 8;
+/// What each thread may hold on to of the objects it is resolving deltas
+/// against, before it gives some up to read them again later.
+const RESOLVE_BUDGET: usize = 64 << 20;
 
 /// Validates a pack received from a client and builds its index.
 ///
@@ -959,6 +1100,12 @@ const MAX_RESOLVE_THREADS: usize = 8;
 /// objects are checksummed as they stream past; only delta bases and the
 /// objects built from them are held in memory, one delta family at a time.
 pub fn index_pack(data: &dyn PackData, existing: &dyn ObjectSource) -> Result<IndexedPack> {
+    index_pack_within(data, existing, RESOLVE_BUDGET)
+}
+
+/// [`index_pack`], with each thread holding on to at most `budget` bytes of
+/// objects whose deltas it is resolving.
+fn index_pack_within(data: &dyn PackData, existing: &dyn ObjectSource, budget: usize) -> Result<IndexedPack> {
     if data.size() < HEADER_LEN + TRAILER_LEN {
         return Err(corrupt("not a packfile"));
     }
@@ -981,11 +1128,13 @@ pub fn index_pack(data: &dyn PackData, existing: &dyn ObjectSource) -> Result<In
     let mut resolver = Resolver {
         data,
         raws: Vec::with_capacity(count.min(1 << 20)),
-        ofs_children: HashMap::new(),
+        ofs_deltas: Vec::new(),
         ref_waiting: Mutex::new(HashMap::new()),
         ref_left: AtomicUsize::new(0),
+        budget,
     };
-    let mut noted = Noted::default();
+    let references = References::new();
+    let mut noted = Noted::new(&references);
     for i in 0..count {
         let offset = cursor.offset;
         cursor.crc = Some(crc32fast::Hasher::new());
@@ -1014,7 +1163,8 @@ pub fn index_pack(data: &dyn PackData, existing: &dyn ObjectSource) -> Result<In
                     .raws
                     .binary_search_by_key(&base, |raw| raw.offset)
                     .map_err(|_| corrupt("delta base offset is not an entry"))?;
-                resolver.ofs_children.entry(base).or_default().push(i);
+                // Both fit: the count of entries is a 32-bit number.
+                resolver.ofs_deltas.push((base as u32, i as u32));
                 inflate_to(&mut cursor, entry.size, &mut |_| {})?;
                 None
             }
@@ -1033,7 +1183,7 @@ pub fn index_pack(data: &dyn PackData, existing: &dyn ObjectSource) -> Result<In
             EntryKind::OfsDelta(_) | EntryKind::RefDelta(_) => None,
         };
         let header_len = u8::try_from(payload_at - offset).map_err(|_| corrupt("oversized pack entry header"))?;
-        resolver.raws.push(RawEntry { offset, size: entry.size as u64, crc32, header_len, whole, oid });
+        resolver.raws.push(RawEntry { offset, size: entry.size as u64, crc32, header_len, whole, oid: oid.map_or_else(OnceLock::new, OnceLock::from) });
     }
     if cursor.offset != body_end {
         return Err(corrupt("trailing data after last pack entry"));
@@ -1046,7 +1196,8 @@ pub fn index_pack(data: &dyn PackData, existing: &dyn ObjectSource) -> Result<In
     }
 
     // Pass 2: resolve deltas outward from every whole object something depends on.
-    noted.merge(resolver.resolve_all()?);
+    resolver.ofs_deltas.sort_unstable();
+    noted.commits.extend(resolver.resolve_all(&references)?);
 
     // Whatever is still waiting has its base outside the pack.
     let mut thin_bases = Vec::new();
@@ -1057,23 +1208,20 @@ pub fn index_pack(data: &dyn PackData, existing: &dyn ObjectSource) -> Result<In
         thin_bases.push((base, object.clone()));
         resolver.resolve_from(None, object, &mut noted)?;
     }
-    for (index, oid) in std::mem::take(&mut noted.ids) {
-        resolver.raws[index].oid = Some(oid);
-    }
 
     let mut entries = Vec::with_capacity(count + thin_bases.len());
     for raw in &resolver.raws {
-        let oid = raw.oid.ok_or_else(|| corrupt("unresolvable delta in pack"))?;
+        let oid = *raw.oid.get().ok_or_else(|| corrupt("unresolvable delta in pack"))?;
         entries.push(IdxEntry { oid, offset: raw.offset, crc32: raw.crc32 });
     }
+    drop(resolver);
 
     let graph = CommitGraph::build(std::mem::take(&mut noted.commits));
-    let own: HashSet<Oid> = entries.iter().map(|entry| entry.oid).collect();
-    let mut outside: Vec<Oid> = noted.references.iter().filter(|oid| !own.contains(oid)).copied().collect();
-    outside.sort();
+    drop(noted);
     if thin_bases.is_empty() {
-        let checksum = Oid::from_bytes(&trailer).expect("20 bytes");
-        return Ok(IndexedPack { index: PackIndex::new(entries, checksum), graph, outside, body_end, completion: None });
+        let index = PackIndex::new(entries, Oid::from_bytes(&trailer).expect("20 bytes"));
+        let outside = references.outside(&index);
+        return Ok(IndexedPack { index, graph, outside, body_end, completion: None });
     }
 
     // Appending keeps every existing entry offset (and thus every ofs-delta) valid.
@@ -1101,7 +1249,10 @@ pub fn index_pack(data: &dyn PackData, existing: &dyn ObjectSource) -> Result<In
 
     let checksum = Oid::from_bytes(&checksum).expect("sha1 is 20 bytes");
     let completion = Completion { header: Bytes::copy_from_slice(&header), tail: tail.into() };
-    Ok(IndexedPack { index: PackIndex::new(entries, checksum), graph, outside, body_end, completion: Some(completion) })
+    let index = PackIndex::new(entries, checksum);
+    // The bases added are objects the repository has: they are not outside any more.
+    let outside = references.outside(&index);
+    Ok(IndexedPack { index, graph, outside, body_end, completion: Some(completion) })
 }
 
 #[cfg(test)]
@@ -1344,6 +1495,34 @@ pub(crate) mod tests {
         let indexed = index_pack(&Bytes::from(finished.out), &PackSet::default()).unwrap();
         assert_eq!(indexed.index.len(), 1200);
         assert_eq!(written.encoded(), indexed.index.encoded());
+    }
+
+    #[test]
+    fn branching_deltas_are_resolved_within_a_budget() {
+        // Versions that branch: two deltas against the first, two against
+        // each of those, and so on, four levels down.
+        let text = |path: &str| -> Vec<u8> { (0..100).flat_map(|i| format!("line {i}\n").into_bytes()).chain(path.bytes()).collect() };
+        let mut paths = vec![String::new()];
+        for at in 0..15 {
+            paths.push(format!("{}a", paths[at]));
+            paths.push(format!("{}b", paths[at]));
+        }
+        let objects: Vec<Object> = paths.iter().map(|path| blob(&text(path))).collect();
+        let stored = set_of(&pack_of(&objects), &PackSet::default());
+        let mut w = PackWriter::recording(Vec::new(), objects.len() as u32).unwrap();
+        w.add(ObjectKind::Blob, &objects[0].data).unwrap();
+        for (at, object) in objects.iter().enumerate().skip(1) {
+            assert!(w.add_new_delta(&stored, &object.oid(), &objects[(at - 1) / 2].oid()).unwrap());
+        }
+        let finished = w.finish().unwrap();
+        let written = PackIndex::new(finished.entries, finished.checksum);
+        let pack = Bytes::from(finished.out);
+        // With room for everything, for two objects, and for none: the last
+        // reads every base again for each delta against it.
+        for budget in [usize::MAX, 2 * objects[0].data.len(), 0] {
+            let indexed = index_pack_within(&pack, &PackSet::default(), budget).unwrap();
+            assert_eq!(written.encoded(), indexed.index.encoded(), "budget {budget}");
+        }
     }
 
     #[test]
