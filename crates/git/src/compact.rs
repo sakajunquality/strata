@@ -420,6 +420,42 @@ mod tests {
     }
 
     #[test]
+    fn a_walk_towards_older_bitmaps_leaves_out_what_the_client_has() {
+        // A side commit on top of the middle commit, as a release tag off the
+        // main line would be. It gets no bitmap: only the tip and the root do.
+        let history = history();
+        let d = blob(b"file d");
+        let side_tree =
+            tree(&[("100644", "a", blob(b"file a").oid()), ("100644", "b", blob(b"file b, v2").oid()), ("100644", "d", d.oid())]);
+        let side = commit(side_tree.oid(), &[history.commits[1]], 250);
+        let packs = history.packs.with_pack(open(&pack_of(&[side.clone(), side_tree, d.clone()]), &PackSet::default()));
+
+        let request = BitmapRequest { tips: vec![history.commits[2], history.commits[0]], mainline: None };
+        let (merged, result) = merged(&packs, &CompactOptions { bitmaps: Some(&request), ..CompactOptions::default() });
+        let bitmaps = result.bitmaps.expect("history is complete");
+        assert!(bitmaps.get(&side.oid()).unwrap().is_none());
+        assert!(bitmaps.get(&history.commits[1]).unwrap().is_none());
+
+        // The client has the tip, and so the middle commit. The walk from the
+        // side commit passes the middle commit on its way to the root's
+        // bitmap: nothing of the middle commit may be sent again.
+        let plan = plan_fetch(&merged, &[side.oid()], &[history.commits[2]], &ShallowPlan::default(), &Filter::default()).unwrap();
+        assert_eq!(plan.count(), 3);
+        // The same when the client's commit has no bitmap of its own.
+        let plan = plan_fetch(&merged, &[side.oid()], &[history.commits[1]], &ShallowPlan::default(), &Filter::default()).unwrap();
+        assert_eq!(plan.count(), 3);
+
+        // A client at the middle commit that asks for the tip is answered
+        // from the tip's bitmap. Its own commit has none, and is passed on
+        // the way to the root's: what it brought is not sent again either.
+        let plan = plan_fetch(&merged, &[history.commits[2]], &[history.commits[1]], &ShallowPlan::default(), &Filter::default()).unwrap();
+        assert_eq!(plan.count(), 3);
+        // Asked for by name, an object is sent even to a client that has it.
+        let plan = plan_fetch(&merged, &[side.oid(), d.oid()], &[side.oid()], &ShallowPlan::default(), &Filter::default()).unwrap();
+        assert_eq!(plan.count(), 1);
+    }
+
+    #[test]
     fn incomplete_history_gets_no_bitmaps() {
         let history = history();
         // Only the newest pack: the tip's parents are not in it, and nothing else covers them.

@@ -577,6 +577,8 @@ struct CommitWalk<'a> {
     want_bits: PackBits,
     /// Union of the bitmaps of commits the client has.
     have_bits: PackBits,
+    /// Commits the client has that no bitmap stands for.
+    passed: Vec<Oid>,
 }
 
 impl CommitWalk<'_> {
@@ -629,12 +631,19 @@ impl CommitWalk<'_> {
         Some((oid, *flags & UNINTERESTING != 0))
     }
 
+    /// Whether a bitmap of a commit the client has includes this object.
+    fn client_has(&self, oid: &Oid) -> bool {
+        let Some(packs) = self.bitmaps else { return false };
+        self.have_bits.iter().any(|(number, bits)| packs.packs()[*number].index().position(oid).is_some_and(|at| bits.get(at)))
+    }
+
     /// Handles a commit the client has. Returns false if bitmaps covered it.
     fn visit_have(&mut self, oid: Oid, shallow: &ShallowPlan) -> Result<bool> {
         if let Some(bits) = self.bitmap(&oid)? {
             merge_bits(&mut self.have_bits, bits);
             return Ok(false);
         }
+        self.passed.push(oid);
         // The client has nothing beyond its own shallow boundary.
         if !shallow.client_shallow.contains(&oid) {
             for parent in self.info[&oid].parents.clone() {
@@ -654,6 +663,12 @@ impl CommitWalk<'_> {
                 continue;
             }
             self.pending -= 1;
+            if self.client_has(&oid) {
+                // Behind a bitmap of the client's: it has this commit and all
+                // beyond it, though no path from a commit of its own led here.
+                *self.flags.get_mut(&oid).expect("queued commits have flags") |= UNINTERESTING;
+                continue;
+            }
             if let Some(bits) = self.bitmap(&oid)? {
                 merge_bits(&mut self.want_bits, bits);
                 continue;
@@ -670,19 +685,18 @@ impl CommitWalk<'_> {
     }
 
     /// Follows the client's history down to bitmapped commits, so that
-    /// everything it has can be subtracted from `want_bits`. Returns the
-    /// commits passed on the way.
+    /// everything it has can be subtracted from `want_bits`: the commits
+    /// passed on the way are added to `passed`.
     ///
     /// Only needed when bitmaps are about to be sent: otherwise the walk has
     /// already stopped at exactly what the client lacks.
-    fn finish_haves(&mut self, shallow: &ShallowPlan) -> Result<Vec<Oid>> {
-        let mut passed = Vec::new();
+    fn finish_haves(&mut self, shallow: &ShallowPlan) -> Result<()> {
         while let Some((oid, uninteresting)) = self.pop() {
-            if uninteresting && self.visit_have(oid, shallow)? {
-                passed.push(oid);
+            if uninteresting {
+                self.visit_have(oid, shallow)?;
             }
         }
-        Ok(passed)
+        Ok(())
     }
 }
 
@@ -742,6 +756,7 @@ pub fn plan_fetch(packs: &PackSet, wants: &[Oid], haves: &[Oid], shallow: &Shall
         pending: 0,
         want_bits: HashMap::new(),
         have_bits: HashMap::new(),
+        passed: Vec::new(),
     };
     let have_tips = commit_tips(packs, haves)?;
     for oid in &have_tips {
@@ -814,8 +829,24 @@ pub fn plan_fetch(packs: &PackSet, wants: &[Oid], haves: &[Oid], shallow: &Shall
     objects.extend(wanted_blobs.into_iter().filter(|oid| sent.insert(*oid)).map(|oid| (oid, None)));
 
     let mut bitmaps = Vec::new();
+    // What the client has without a bitmap saying so: the commits passed on
+    // the way to its bitmaps, and what each of them brought.
+    let mut passed = OidSet::default();
     if !walk.want_bits.is_empty() {
-        let passed = walk.finish_haves(shallow)?;
+        walk.finish_haves(shallow)?;
+        let brought: Vec<TreeJob> = walk
+            .passed
+            .iter()
+            .map(|oid| {
+                let info = &walk.info[oid];
+                // A parent that was not loaded lies beyond the client's
+                // shallow boundary: the whole tree counts as brought then.
+                let known = info.parents.iter().filter_map(|p| walk.info.get(p)).map(|p| p.tree).collect();
+                TreeJob { tree: info.tree, known, depth: 0, path: Vec::new() }
+            })
+            .collect();
+        passed.extend(walk.passed.iter().copied());
+        passed.extend(introduced_by(packs, brought, &Filter::default())?.into_iter().flatten().map(|(oid, _)| oid));
         for (number, mut bits) in std::mem::take(&mut walk.want_bits) {
             let pack = &packs.packs()[number];
             if let Some(have) = walk.have_bits.get(&number) {
@@ -852,6 +883,14 @@ pub fn plan_fetch(packs: &PackSet, wants: &[Oid], haves: &[Oid], shallow: &Shall
     }
     let plan = FetchPlan { objects: Vec::new(), bitmaps };
     objects.retain(|(oid, _)| !plan.in_bitmaps(oid));
+    if !walk.have_bits.is_empty() || !passed.is_empty() {
+        // The walk compares each commit with its parents only, so it also
+        // finds what the client has by another way: history it reached on
+        // its way to an older bitmap, or a change made twice. What is asked
+        // for by name is sent all the same.
+        let named: OidSet = named.iter().copied().collect();
+        objects.retain(|(oid, _)| !(walk.client_has(oid) || passed.contains(oid)) || named.contains(oid));
+    }
     if filter.omitted_kinds.contains(&true) {
         // What was asked for by name comes whatever its kind, also where a
         // bitmap would have brought it and no longer does.
