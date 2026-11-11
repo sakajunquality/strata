@@ -1293,6 +1293,85 @@ async fn branches_can_be_compared_and_merged() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_repository_is_brought_in_from_a_bundle() {
+    let base = start(false).await;
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = format!("{base}/api/repos/in-1");
+        let path = |name: &str| tmp.path().join(name).to_str().unwrap().to_string();
+        let send = |bundle: &str, to: &str| api_with("POST", &format!("{to}/import?actor=mover"), None, Some(&format!("@{}", path(bundle))));
+
+        // Branches, a branch off the main line, and tags of both kinds.
+        let work = tmp.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "trunk"]);
+        std::fs::write(work.join("a.txt"), "one\n").unwrap();
+        commit_on(&work, 1, "first");
+        git(&work, &["tag", "-a", "-m", "release", "v1"]);
+        git(&work, &["checkout", "-q", "-b", "side"]);
+        std::fs::write(work.join("b.txt"), "side\n").unwrap();
+        commit_on(&work, 2, "on the side");
+        git(&work, &["checkout", "-q", "trunk"]);
+        std::fs::write(work.join("a.txt"), "two\n").unwrap();
+        let second = commit_on(&work, 3, "second");
+        git(&work, &["tag", "light"]);
+        git(&work, &["bundle", "create", "-q", &path("all.bundle"), "--all"]);
+        let local = git(&work, &["for-each-ref", "--format=%(objectname) %(refname)"]);
+
+        // Into a repository that exists: the import does not make one.
+        assert_eq!(send("all.bundle", &repo).0, 404);
+        assert_eq!(api("PUT", &repo, None).0, 201);
+        let (status, answer) = send("all.bundle", &repo);
+        assert_eq!(status, 200, "{answer}");
+        assert_eq!(json(&answer), serde_json::json!({ "refs": 4, "updated": 4, "objects": 10 }));
+
+        // Every ref is where it was, and HEAD names the branch it was on.
+        let remote = format!("{base}/in-1.git");
+        let listed = git(tmp.path(), &["ls-remote", "--refs", &remote]).replace('\t', " ");
+        assert_eq!(listed, local);
+        assert_eq!(json(&api("GET", &format!("{repo}/refs"), None).1)["head"], "refs/heads/trunk");
+        clone_and_check(tmp.path(), &remote, "clone", &second, "2");
+        git(&tmp.path().join("clone"), &["fsck", "--strict"]);
+
+        // Again: nothing to do, and nothing stored a second time.
+        assert_eq!(json(&send("all.bundle", &repo).1), serde_json::json!({ "refs": 4, "updated": 0, "objects": 0 }));
+        assert_eq!(json(&api("GET", &repo, None).1)["packs"], 1);
+
+        // A bundle of what came after builds on what is here, and moves refs whatever they were.
+        std::fs::write(work.join("a.txt"), "three\n").unwrap();
+        let third = commit_on(&work, 4, "third");
+        git(&work, &["branch", "-f", "side", &third]);
+        git(&work, &["bundle", "create", "-q", &path("more.bundle"), "trunk", "side", &format!("^{second}")]);
+        assert_eq!(json(&send("more.bundle", &repo).1), serde_json::json!({ "refs": 2, "updated": 2, "objects": 3 }));
+        let refs = json(&api("GET", &format!("{repo}/refs"), None).1);
+        let at = |name: &str| refs["refs"].as_array().unwrap().iter().find(|r| r["name"] == name).unwrap()["oid"].as_str().unwrap().to_string();
+        assert_eq!((at("refs/heads/trunk"), at("refs/heads/side")), (third.clone(), third.clone()));
+        // The tags it did not name are still there.
+        assert_eq!(refs["refs"].as_array().unwrap().len(), 4);
+
+        // The same bundle where its base is missing is refused, and leaves nothing behind.
+        let empty = format!("{base}/api/repos/in-2");
+        assert_eq!(api("PUT", &empty, None).0, 201);
+        let (status, reason) = send("more.bundle", &empty);
+        assert_eq!(status, 400);
+        assert!(reason.contains("not complete"), "{reason}");
+        assert_eq!(json(&api("GET", &format!("{empty}/refs"), None).1)["refs"], serde_json::json!([]));
+        assert_eq!(json(&api("GET", &empty, None).1)["packs"], 0);
+
+        // Not a bundle at all.
+        std::fs::write(tmp.path().join("junk"), "hello\n\nworld").unwrap();
+        assert_eq!(send("junk", &repo).0, 400);
+
+        // The feed tells of each import, without listing its refs.
+        let events = json(&api("GET", &format!("{base}/api/events"), None).1);
+        let told: Vec<&serde_json::Value> = events["events"].as_array().unwrap().iter().filter(|e| e["repo"] == "in-1").map(|e| &e["event"]).collect();
+        assert_eq!(told, [&serde_json::json!({ "type": "import", "actor": "mover", "refs": 4 }), &serde_json::json!({ "type": "import", "actor": "mover", "refs": 2 })]);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn older_protocol_versions_can_fetch() {
     let url = format!("{}/acme/legacy.git", start(true).await);
     tokio::task::spawn_blocking(move || {

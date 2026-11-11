@@ -4,7 +4,7 @@
 //! to one repository happen one at a time and changes to different
 //! repositories do not wait for each other.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -71,6 +71,61 @@ CREATE TABLE IF NOT EXISTS events (
     payload    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_feed ON events (xid, id);
+-- One change to a repository, checked and made in one call: its row stays
+-- locked for as long as the statements below take, not for as many trips
+-- between a node and the database as there are statements. Every check
+-- comes before the first write, so an answer other than 'ok' changed nothing.
+CREATE OR REPLACE FUNCTION strata_commit(
+    p_repo text, p_expect_epoch bigint, p_expect_refs_version bigint,
+    p_names text[], p_old text[], p_set_names text[], p_set_oids text[], p_deleted text[],
+    p_remove_packs text[], p_add_pack text, p_set_head text, p_bump_epoch boolean,
+    p_refs_changed boolean, p_event text, p_now bigint
+) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    v_pool text;
+    v_epoch bigint;
+    v_refs_version bigint;
+    v_name text;
+BEGIN
+    SELECT pool_id, epoch, refs_version INTO v_pool, v_epoch, v_refs_version FROM repos WHERE name = p_repo FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'missing';
+    END IF;
+    IF (p_expect_epoch IS NOT NULL AND p_expect_epoch <> v_epoch)
+        OR (p_expect_refs_version IS NOT NULL AND p_expect_refs_version <> v_refs_version) THEN
+        RETURN 'stale';
+    END IF;
+    SELECT u.name INTO v_name
+    FROM unnest(p_names, p_old) WITH ORDINALITY AS u(name, old, at)
+    LEFT JOIN refs r ON r.repo = p_repo AND r.name = u.name
+    WHERE r.oid IS DISTINCT FROM u.old
+    ORDER BY u.at LIMIT 1;
+    IF FOUND THEN
+        RETURN 'conflict ' || v_name;
+    END IF;
+    IF (SELECT count(*) FROM packs WHERE pool_id = v_pool AND pack_id = ANY(p_remove_packs)) <> cardinality(p_remove_packs) THEN
+        RETURN 'packs';
+    END IF;
+
+    INSERT INTO refs (repo, name, oid) SELECT p_repo, * FROM unnest(p_set_names, p_set_oids)
+        ON CONFLICT (repo, name) DO UPDATE SET oid = excluded.oid;
+    DELETE FROM refs WHERE repo = p_repo AND name = ANY(p_deleted);
+    DELETE FROM packs WHERE pool_id = v_pool AND pack_id = ANY(p_remove_packs);
+    INSERT INTO garbage (pool_id, pack_id, removed_at) SELECT v_pool, pack_id, p_now FROM unnest(p_remove_packs) AS pack_id
+        ON CONFLICT (pool_id, pack_id) DO UPDATE SET removed_at = excluded.removed_at;
+    IF p_add_pack IS NOT NULL THEN
+        -- The repository's row is locked, so nobody else is numbering packs of this pool.
+        INSERT INTO packs (pool_id, pack_id, seq)
+            SELECT v_pool, p_add_pack, COALESCE(MAX(seq), 0) + 1 FROM packs WHERE pool_id = v_pool
+            ON CONFLICT DO NOTHING;
+    END IF;
+    UPDATE repos SET head = COALESCE(p_set_head, head), epoch = epoch + p_bump_epoch::int, refs_version = refs_version + p_refs_changed::int
+        WHERE name = p_repo;
+    IF p_event IS NOT NULL THEN
+        INSERT INTO events (repo, created_at, payload) VALUES (p_repo, p_now, p_event);
+    END IF;
+    RETURN 'ok';
+END $$;
 COMMIT;
 "#;
 
@@ -172,57 +227,47 @@ impl MetaStore for PostgresMetaStore {
             .read_only(true)
             .start()
             .await?;
-        let Some(row) = tx
-            .query_opt(
-                "SELECT pool_id, head, epoch, refs_version FROM repos WHERE name = $1",
-                &[&name],
-            )
-            .await?
-        else {
-            return Ok(None);
-        };
-        let pool_id: String = row.get(0);
-        let head: String = row.get(1);
-        let mut found = Vec::new();
-        match scope {
-            RefScope::All => {
-                found.push(tx.query("SELECT name, oid FROM refs WHERE repo = $1", &[&name]).await?);
-            }
-            RefScope::Names(names) => {
-                let names: Vec<&str> = names.iter().chain([&head]).map(String::as_str).collect();
-                found.push(tx.query("SELECT name, oid FROM refs WHERE repo = $1 AND name = ANY($2)", &[&name, &names]).await?);
+        // The three are sent together and answered together. The ref HEAD
+        // points at comes whatever was asked for.
+        const HEAD: &str = "(SELECT head FROM repos WHERE name = $1)";
+        let (names, low, high);
+        let (sql, params): (String, Vec<&(dyn tokio_postgres::types::ToSql + Sync)>) = match scope {
+            RefScope::All => ("SELECT name, oid FROM refs WHERE repo = $1".into(), vec![&name]),
+            RefScope::Names(wanted) => {
+                names = wanted.iter().map(String::as_str).collect::<Vec<&str>>();
+                (format!("SELECT name, oid FROM refs WHERE repo = $1 AND (name = ANY($2) OR name = {HEAD})"), vec![&name, &names])
             }
             RefScope::Prefixes(prefixes) => {
-                found.push(tx.query("SELECT name, oid FROM refs WHERE repo = $1 AND name = $2", &[&name, &head]).await?);
-                for prefix in prefixes {
-                    found.push(match prefix_end(prefix) {
-                        Some(end) => {
-                            tx.query("SELECT name, oid FROM refs WHERE repo = $1 AND name >= $2 AND name < $3", &[&name, prefix, &end]).await?
-                        }
-                        None => tx.query("SELECT name, oid FROM refs WHERE repo = $1 AND name >= $2", &[&name, prefix]).await?,
-                    });
-                }
+                // Names are ordered byte by byte, so a prefix is a range of the primary key.
+                low = prefixes.iter().map(String::as_str).collect::<Vec<&str>>();
+                high = prefixes.iter().map(|prefix| prefix_end(prefix)).collect::<Vec<Option<String>>>();
+                let sql = format!(
+                    "SELECT r.name, r.oid FROM unnest($2::text[], $3::text[]) AS p(low, high)
+                     JOIN refs r ON r.repo = $1 AND r.name >= p.low AND (p.high IS NULL OR r.name < p.high)
+                     UNION ALL SELECT name, oid FROM refs WHERE repo = $1 AND name = {HEAD}"
+                );
+                (sql, vec![&name, &low, &high])
             }
-        }
-        let mut refs = BTreeMap::new();
-        for row in found.iter().flatten() {
+        };
+        let by_name: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&name];
+        let (row, refs, packs) = tokio::try_join!(
+            tx.query_opt("SELECT pool_id, head, epoch, refs_version FROM repos WHERE name = $1", &by_name),
+            tx.query(&sql, &params),
+            tx.query("SELECT pack_id FROM packs WHERE pool_id = (SELECT pool_id FROM repos WHERE name = $1) ORDER BY seq", &by_name),
+        )?;
+        let Some(row) = row else { return Ok(None) };
+        let mut found = BTreeMap::new();
+        for row in &refs {
             let (ref_name, hex): (String, &str) = (row.get(0), row.get(1));
-            let oid = Oid::from_hex(hex)
-                .ok_or_else(|| backend(format!("bad oid stored for {ref_name}")))?;
-            refs.insert(ref_name, oid);
+            let oid = Oid::from_hex(hex).ok_or_else(|| backend(format!("bad oid stored for {ref_name}")))?;
+            found.insert(ref_name, oid);
         }
-        let packs = tx
-            .query(
-                "SELECT pack_id FROM packs WHERE pool_id = $1 ORDER BY seq",
-                &[&pool_id],
-            )
-            .await?;
         tx.commit().await?;
         Ok(Some(RepoState {
             name: name.to_string(),
-            pool_id,
-            head,
-            refs,
+            pool_id: row.get(0),
+            head: row.get(1),
+            refs: found,
             packs: packs.iter().map(|r| r.get(0)).collect(),
             epoch: row.get::<_, i64>(2) as u64,
             refs_version: row.get::<_, i64>(3) as u64,
@@ -240,111 +285,57 @@ impl MetaStore for PostgresMetaStore {
     }
 
     async fn commit(&self, name: &str, txn: Txn) -> Result<(), MetaError> {
-        let mut client = self.pool.get().await?;
-        // Dropping `tx` on any early return rolls everything back.
-        let tx = client.transaction().await?;
-        let row = tx
-            .query_opt(
-                "SELECT pool_id, epoch, refs_version FROM repos WHERE name = $1 FOR UPDATE",
-                &[&name],
-            )
-            .await?
-            .ok_or(MetaError::NotFound)?;
-        let (pool_id, epoch, refs_version): (String, i64, i64) =
-            (row.get(0), row.get(1), row.get(2));
-        if txn.expect_epoch.is_some_and(|e| e != epoch as u64)
-            || txn
-                .expect_refs_version
-                .is_some_and(|v| v != refs_version as u64)
-        {
-            return Err(MetaError::Stale);
-        }
-
-        if !txn.ref_updates.is_empty() {
-            let names: Vec<&str> = txn.ref_updates.iter().map(|u| u.name.as_str()).collect();
-            let rows = tx
-                .query(
-                    "SELECT name, oid FROM refs WHERE repo = $1 AND name = ANY($2)",
-                    &[&name, &names],
-                )
-                .await?;
-            let current: HashMap<String, String> =
-                rows.iter().map(|r| (r.get(0), r.get(1))).collect();
-            for update in &txn.ref_updates {
-                if current.get(&update.name) != update.old.map(|oid| oid.to_string()).as_ref() {
-                    return Err(MetaError::Conflict {
-                        name: update.name.clone(),
-                    });
+        let names: Vec<&str> = txn.ref_updates.iter().map(|u| u.name.as_str()).collect();
+        let old: Vec<Option<String>> = txn.ref_updates.iter().map(|u| u.old.map(|oid| oid.to_string())).collect();
+        let (mut set_names, mut set_oids, mut deleted) = (Vec::new(), Vec::new(), Vec::new());
+        for (ref_name, new) in final_refs(&txn.ref_updates) {
+            match new {
+                Some(oid) => {
+                    set_names.push(ref_name);
+                    set_oids.push(oid.to_string());
                 }
-            }
-            let (mut set_names, mut set_oids, mut deleted) = (Vec::new(), Vec::new(), Vec::new());
-            for (ref_name, new) in final_refs(&txn.ref_updates) {
-                match new {
-                    Some(oid) => {
-                        set_names.push(ref_name);
-                        set_oids.push(oid.to_string());
-                    }
-                    None => deleted.push(ref_name),
-                }
-            }
-            if !set_names.is_empty() {
-                tx.execute(
-                    "INSERT INTO refs (repo, name, oid) SELECT $1, * FROM unnest($2::text[], $3::text[])
-                     ON CONFLICT (repo, name) DO UPDATE SET oid = excluded.oid",
-                    &[&name, &set_names, &set_oids],
-                )
-                .await?;
-            }
-            if !deleted.is_empty() {
-                tx.execute(
-                    "DELETE FROM refs WHERE repo = $1 AND name = ANY($2)",
-                    &[&name, &deleted],
-                )
-                .await?;
+                None => deleted.push(ref_name),
             }
         }
-
-        if !txn.remove_packs.is_empty() {
-            let mut removed = txn.remove_packs.clone();
-            removed.sort();
-            removed.dedup();
-            let gone = tx
-                .execute(
-                    "DELETE FROM packs WHERE pool_id = $1 AND pack_id = ANY($2)",
-                    &[&pool_id, &removed],
-                )
-                .await?;
-            if gone != removed.len() as u64 {
-                return Err(MetaError::PackConflict);
-            }
-            tx.execute(
-                "INSERT INTO garbage (pool_id, pack_id, removed_at) SELECT $1, pack_id, $3 FROM unnest($2::text[]) AS pack_id
-                 ON CONFLICT (pool_id, pack_id) DO UPDATE SET removed_at = excluded.removed_at",
-                &[&pool_id, &removed, &unix_now()],
-            )
-            .await?;
-        }
-        if let Some(pack) = &txn.add_pack {
-            // The repository's row is locked, so nobody else is numbering packs of this pool.
-            tx.execute(
-                "INSERT INTO packs (pool_id, pack_id, seq)
-                 SELECT $1, $2, COALESCE(MAX(seq), 0) + 1 FROM packs WHERE pool_id = $1
-                 ON CONFLICT DO NOTHING",
-                &[&pool_id, pack],
-            )
-            .await?;
-        }
+        let mut removed = txn.remove_packs.clone();
+        removed.sort();
+        removed.dedup();
         let refs_changed = !txn.ref_updates.is_empty() || txn.set_head.is_some();
-        tx.execute(
-            "UPDATE repos SET head = COALESCE($1, head), epoch = epoch + $2, refs_version = refs_version + $3 WHERE name = $4",
-            &[&txn.set_head, &i64::from(txn.bump_epoch), &i64::from(refs_changed), &name],
-        )
-        .await?;
-        if let Some(payload) = &txn.event {
-            tx.execute("INSERT INTO events (repo, created_at, payload) VALUES ($1, $2, $3)", &[&name, &unix_now(), payload]).await?;
+        let row = self
+            .pool
+            .get()
+            .await?
+            .query_one(
+                "SELECT strata_commit($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                &[
+                    &name,
+                    &txn.expect_epoch.map(|epoch| epoch as i64),
+                    &txn.expect_refs_version.map(|version| version as i64),
+                    &names,
+                    &old,
+                    &set_names,
+                    &set_oids,
+                    &deleted,
+                    &removed,
+                    &txn.add_pack,
+                    &txn.set_head,
+                    &txn.bump_epoch,
+                    &refs_changed,
+                    &txn.event,
+                    &unix_now(),
+                ],
+            )
+            .await?;
+        match row.get::<_, &str>(0) {
+            "ok" => Ok(()),
+            "missing" => Err(MetaError::NotFound),
+            "stale" => Err(MetaError::Stale),
+            "packs" => Err(MetaError::PackConflict),
+            other => match other.strip_prefix("conflict ") {
+                Some(name) => Err(MetaError::Conflict { name: name.to_string() }),
+                None => Err(backend(format!("unexpected answer to a commit: {other}"))),
+            },
         }
-        tx.commit().await?;
-        Ok(())
     }
 
     async fn delete_repo(&self, name: &str) -> Result<bool, MetaError> {

@@ -54,6 +54,13 @@ its pack is still in storage right before committing it, so a pack the orphan
 sweep removed is uploaded again rather than listed. The check and the commit
 are not atomic: keep the orphan grace far above the time a commit can take.
 
+Every push adds a pack, and every request costs as much as the repository
+has packs. Pushes that come faster than compaction merges their packs would
+pile them up without end, each making the next one slower, so a push that
+finds 64 packs or more (`--wait-at`) asks for a compaction and waits for it,
+up to ten seconds, before it goes on. Under a steady stream of pushes that
+keeps the pack count, and with it the time a push takes, level.
+
 Pruning is safe against concurrent pushes: a push commits only if no objects
 were removed since it checked its history, and re-checks otherwise; a pruning
 compaction commits only after verifying that refs which moved meanwhile do not
@@ -182,6 +189,7 @@ CI triggers and audit logs are built from this, with whatever retries they need.
 | `GET /api/repos/<id>/blob?rev=&path=` | A file's bytes (or `?oid=` for a blob by id). |
 | `GET /api/repos/<id>/compare?base=&head=` | What `head` has that `base` does not: the merge base, the commits, and the files changed since the two parted. |
 | `POST /api/repos/<id>/merge` | Merge a revision into a branch: as a merge commit, squashed into one commit, or rebased. |
+| `POST /api/repos/<id>/import` | Take in a bundle: its objects, and every ref in it. |
 | `GET /api/events` | The feed above. |
 | `GET /healthz` | Liveness, without credentials. |
 | `GET /readyz` | Readiness, without credentials: 503 while the metadata store cannot be reached. |
@@ -190,6 +198,27 @@ A `rev` is a ref (in full, or a branch or tag name) or a commit id, and
 defaults to HEAD. These read calls are what a code browser is built from;
 they do no access control of their own, which is the application's to do
 before it asks.
+
+An import brings in a repository that exists elsewhere, with the bundle git
+makes of it as the body:
+
+```sh
+git bundle create all.bundle --all
+curl -X POST -T all.bundle -H "Authorization: Bearer $TOKEN" "https://host/api/repos/<id>/import?actor=alice"
+<- {"refs": 150001, "updated": 150001, "objects": 58000}
+```
+
+The objects are stored as a push stores them, and every ref in the bundle is
+set to the value it has there, whatever it was before; refs the bundle does
+not name are left alone. A bundle of what came after an earlier one
+(`git bundle create more.bundle main ^<commit>`) is taken in the same way, as
+long as what it builds on is here. This is the way in for a repository with
+very many refs: git's own push over HTTP compares every ref it sends with
+every ref it has, and takes hours for a hundred thousand, where this takes a
+second. Refs are set five thousand at a time, so an import that fails half
+way leaves some of them set; sending the bundle again finishes it. The
+pre-receive hook is not asked, and the feed gets one event,
+`{"type": "import", "actor": "alice", "refs": 150001}`, without the list.
 
 A merge takes a JSON body:
 
@@ -234,6 +263,7 @@ cargo test --workspace   # includes end-to-end tests driving the real git client
 cargo build --release && FILES=50000 COMMITS=100 ./scripts/bench.sh   # timings and server memory on a synthetic repository
 ./scripts/bench-repo.sh /path/to/bare.git master   # the same against a real repository
 ./scripts/bench-refs.sh  # the requests git makes, against a repository with 150,000 refs
+./scripts/bench-push.py http://127.0.0.1:8080/bench/load.git --clients 32   # many clients pushing to one repository at once
 ```
 
 Against git's own repository (83k commits, 412k objects, a 301 MiB pack), on
@@ -273,19 +303,37 @@ in SQLite and in PostgreSQL 17 on the same machine:
 Before requests read only their own refs, each of these took at least 40 ms
 with SQLite and 90 ms with PostgreSQL.
 
+Many clients pushing to one repository at once, each to a branch of its own,
+one commit with one changed file a push (`./scripts/bench-push.py`, which
+speaks the push protocol directly). One node, packs on local disk, everything
+on the same laptop:
+
+| | Pushes a second | Median | 99% |
+|---|---|---|---|
+| SQLite, 1 client | 1,080 | 0.8 ms | 3 ms |
+| SQLite, 8 clients | 2,100 | 3 ms | 10 ms |
+| SQLite, 32 clients, 30 s | 1,540 | 18 ms | 69 ms |
+| PostgreSQL 17, 32 clients, 15 s | 1,110 | 25 ms | 75 ms |
+
+No push was refused, and a clone afterwards had every commit. Two things made
+these numbers: pushes waiting for compaction (without it the 30 s run fell to
+460 a second with 13,800 packs piled up, and kept falling), and PostgreSQL
+making each change in one call (with a statement at a time, the repository's
+row stayed locked for seven trips to the database: 240 a second).
+
 ## Not done
 
 - **The shared metadata stores are tested against local servers only.** PostgreSQL 17 in Docker and the Cloud Spanner emulator, each with two nodes on one database (`./scripts/meta-test.sh`). Not tested: Cloud Spanner itself (the emulator runs one transaction at a time, so real contention and Google credentials are unexercised), managed PostgreSQL services, and more than two nodes or any load.
 - **Real cloud buckets are untested.** The S3 API path is exercised against LocalStack (`./scripts/s3-smoke.sh`); AWS S3 itself, GCS and Azure are not.
 - **A push still opens with the list of every ref**, as the protocol has it: 11 MB for 150,000 refs, on every push. Hiding refs from that list is not done.
-- **Many refs cannot be brought in at once with git.** git's HTTP push compares every ref it sends with every ref it has: 150,000 in one push take it hours, all of it on the client. `scripts/bench-refs.sh` sends the same updates directly in a second; there is no supported way to do that.
 - **Listing refs reads each tag to find what it points at.** The peeled values are not stored next to the refs. Listing 50,000 annotated tags takes 50 ms.
 - **A fetch can send what the client has by another way.** A change picked onto a release branch brings the same files as the original, and a client that has the original is sent them again unless bitmaps say it has them. With etcd's repository (183k objects, 23 branches, 993 tags), a client holding the default branch that fetches every other branch is sent 3% it already had once the pool has bitmaps, 25% before (git itself, serving the same repository without bitmaps, sends 15%). What is pushed after the last compaction is not covered by bitmaps until the next. Measured on that one repository only.
+- **Pushes at a high rate are measured on one machine only**, with packs on local disk and the database next to the node. In object storage each push is three uploads and each compaction reads what it merges back, so both will be slower there, by how much is not known. Two nodes on the same laptop handled no more than one (840 against 1,110 a second): they share its processors, so this says nothing about adding nodes. Pushes to the same branch were not part of it.
 - **SSH.** Access is over HTTP(S) only.
 - **SHA-256 repositories.**
 - **Pruned objects are gone at once.** There is no window in which a force-pushed-away commit can still be fetched by id after the next full compaction.
 - **Indexing a push takes memory in proportion to its objects**: about 180 bytes for each (72 MiB for the 412k objects of git's repository, where the whole server peaked at 142 MiB over that push), for the table of entries, the ids they point at and the index being built. On top come the objects whose deltas are being resolved, up to 64 MiB on each of up to eight threads; beyond that they are dropped and read again when needed. A single object larger than that is still held whole, together with the version made from it. Not measured beyond 412k objects. The spool file needs local disk the size of the push, and is mapped into memory: it counts as the process's memory wherever mapped files do, though the kernel can drop its pages at any time.
 - **Compaction computes deltas only for files changed since the last full merge**, against their previous version. It does not search for better bases; with packs that come from git, which already hold good deltas, nothing was lost by that in the measurement above.
 - **The pre-receive hook sees the commits a push brings, but not their files.** Rules about file sizes or secrets need a way to read a push before it commits.
-- **The event feed covers pushes only.** Repositories created, deleted or compacted are the application's own actions and are not echoed back.
+- **The event feed covers pushes, merges and imports only.** Repositories created, deleted or compacted are the application's own actions and are not echoed back. An import is told as one event without its refs: the application reads them afterwards.
 - **TLS, rate limiting, and quotas.** `GET /api/repos/<id>` reports the bytes a repository holds; nothing enforces a limit.

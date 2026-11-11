@@ -254,12 +254,23 @@ impl SpannerMetaStore {
 }
 
 async fn read_refs(tx: &mut Transaction, repo: &str, scope: &RefScope) -> Result<BTreeMap<String, Oid>, TxError> {
+    let mut refs = BTreeMap::new();
+    let mut take = |row: gcloud_spanner::row::Row| -> Result<(), TxError> {
+        let (name, hex): (String, String) = (row.column(0)?, row.column(1)?);
+        let oid = Oid::from_hex(&hex).ok_or_else(|| backend(format!("bad oid stored for {name}")))?;
+        refs.insert(name, oid);
+        Ok(())
+    };
     let mut stmt = match scope {
         RefScope::All => Statement::new("SELECT name, oid FROM refs WHERE repo = @repo"),
         RefScope::Names(names) => {
-            let mut stmt = Statement::new("SELECT name, oid FROM refs WHERE repo = @repo AND name IN UNNEST(@names)");
-            stmt.add_param("names", names);
-            stmt
+            // Read by key: a query naming thousands of refs is far slower than looking each up.
+            let keys: Vec<Key> = names.iter().map(|name| Key::composite(&[&repo, name])).collect();
+            let mut rows = tx.read("refs", &["name", "oid"], keys).await?;
+            while let Some(row) = rows.next().await? {
+                take(row)?;
+            }
+            return Ok(refs);
         }
         RefScope::Prefixes(prefixes) => {
             // Each is a range of the primary key.
@@ -272,12 +283,8 @@ async fn read_refs(tx: &mut Transaction, repo: &str, scope: &RefScope) -> Result
     };
     stmt.add_param("repo", &repo);
     let mut rows = tx.query(stmt).await?;
-    let mut refs = BTreeMap::new();
     while let Some(row) = rows.next().await? {
-        let (name, hex): (String, String) = (row.column(0)?, row.column(1)?);
-        let oid =
-            Oid::from_hex(&hex).ok_or_else(|| backend(format!("bad oid stored for {name}")))?;
-        refs.insert(name, oid);
+        take(row)?;
     }
     Ok(refs)
 }

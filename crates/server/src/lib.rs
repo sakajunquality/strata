@@ -18,6 +18,7 @@ mod auth;
 mod compaction;
 mod content;
 mod hooks;
+mod import;
 mod merge;
 mod receive_pack;
 mod upload_pack;
@@ -36,6 +37,11 @@ pub struct Options {
     pub scratch_dir: PathBuf,
     /// Number of packs at which a push asks for the pool to be compacted.
     pub compact_at: usize,
+    /// Number of packs at which a push waits for compaction before it goes
+    /// on. Every request costs as much as the pool has packs; pushes that
+    /// come faster than compaction merges their packs would pile them up
+    /// without end, each making the next one slower. Zero: never wait.
+    pub wait_at: usize,
     /// A push bringing this many objects into a pool where nothing has
     /// bitmaps asks for the whole pool to be compacted, to get them. Without
     /// bitmaps a clone walks all of history, and a fetch cannot tell what
@@ -82,6 +88,7 @@ impl Default for Options {
             auto_create: false,
             scratch_dir: std::env::temp_dir(),
             compact_at: 8,
+            wait_at: 64,
             bitmaps_from: 20_000,
             prune: true,
             gc_grace: Duration::from_secs(3600),
@@ -292,6 +299,7 @@ fn json(status: StatusCode, value: serde_json::Value) -> Response {
 /// - `POST /api/repos/<id>/compact` rewrites its packs into one
 /// - `GET /api/repos/<id>/{refs,commits,commit,compare,tree,blob}` read its content, see [`content`]
 /// - `POST /api/repos/<id>/merge` merges a revision into a branch, see [`merge`]
+/// - `POST /api/repos/<id>/import` takes in a bundle: its objects and all its refs, see [`import`]
 async fn repos(app: &App, method: &Method, rest: &str, query: &str, body: Body) -> Result<Response, HttpError> {
     if let Some((name, view)) = rest.rsplit_once('/').filter(|(_, view)| content::VIEWS.contains(view)) {
         let name = repo_name(name)?;
@@ -306,6 +314,13 @@ async fn repos(app: &App, method: &Method, rest: &str, query: &str, body: Body) 
             return Err(method_not_allowed());
         }
         return merge::merge(app, name, body).await;
+    }
+    if let Some(name) = rest.strip_suffix("/import") {
+        let name = repo_name(name)?;
+        if !matches!(*method, Method::POST | Method::PUT) {
+            return Err(method_not_allowed());
+        }
+        return import::import(app, name, query, body).await;
     }
     if let Some(name) = rest.strip_suffix("/compact") {
         let name = repo_name(name)?;

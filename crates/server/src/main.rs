@@ -66,6 +66,9 @@ struct Args {
     /// Compact a repository once a push leaves it with this many packs.
     #[arg(long, default_value_t = 8)]
     compact_at: usize,
+    /// Hold a push back until compaction has caught up, once a repository has this many packs (0: never).
+    #[arg(long, default_value_t = 64)]
+    wait_at: usize,
     /// Compact a repository at once when a push brings this many objects and nothing in it has bitmaps yet (0: never).
     #[arg(long, default_value_t = 20000)]
     bitmaps_from: usize,
@@ -134,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
         scratch_dir: args.scratch_dir.unwrap_or_else(std::env::temp_dir),
         compact_at: args.compact_at,
         bitmaps_from: args.bitmaps_from,
+        wait_at: args.wait_at,
         prune: !args.no_prune,
         gc_grace: Duration::from_secs(args.gc_grace_secs),
         orphan_grace: Duration::from_secs(args.orphan_grace_secs),

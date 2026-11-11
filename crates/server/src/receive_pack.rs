@@ -1,6 +1,7 @@
 //! Push side. Every push is applied as one atomic metadata transaction.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::{Body, BodyDataStream};
 use bytes::{Bytes, BytesMut};
@@ -125,7 +126,7 @@ fn commands_end(buf: &[u8]) -> Result<Option<usize>, HttpError> {
 /// A pack spooled to a scratch file and mapped into memory: read wherever
 /// the indexer asks, without copying, and paged in and out by the kernel as
 /// memory allows.
-struct SpooledPack {
+pub(crate) struct SpooledPack {
     data: Bytes,
 }
 
@@ -152,7 +153,7 @@ impl PackData for SpooledPack {
 /// Writes the rest of the request to an anonymous scratch file, so that a
 /// push of any size costs disk rather than memory. Returns `None` if there
 /// was no pack data.
-async fn spool(app: &App, first: Bytes, mut body: BodyDataStream) -> Result<Option<SpooledPack>, HttpError> {
+pub(crate) async fn spool(app: &App, first: Bytes, mut body: BodyDataStream) -> Result<Option<SpooledPack>, HttpError> {
     let dir = app.options.scratch_dir.clone();
     let mut file = tokio::fs::File::from_std(blocking(move || tempfile::tempfile_in(dir)).await??);
     let mut size = first.len() as u64;
@@ -213,6 +214,8 @@ pub(crate) async fn handle(app: &App, granted: &Granted, body: Body) -> Result<V
         },
     };
 
+    hold_back(app, &scope, &mut repo).await?;
+
     // If objects were pruned from the pool while this push was being checked,
     // the checks are void: run them again against the pool as it is now.
     let mut uploaded = None;
@@ -251,6 +254,25 @@ pub(crate) async fn handle(app: &App, granted: &Granted, body: Body) -> Result<V
         pktline::flush(&mut out);
     }
     Ok(out)
+}
+
+/// The longest a push waits for compaction. After that it goes on anyway:
+/// slow is better than refused.
+const MAX_HOLD: Duration = Duration::from_secs(10);
+
+/// Waits while the pool has more packs than requests should have to go
+/// through, see [`crate::Options::wait_at`]. Leaves `repo` as it is then.
+async fn hold_back(app: &App, scope: &RefScope, repo: &mut RepoState) -> Result<(), HttpError> {
+    let limit = app.options.wait_at;
+    let deadline = tokio::time::Instant::now() + MAX_HOLD;
+    let mut pause = Duration::from_millis(5);
+    while limit > 0 && repo.packs.len() >= limit && tokio::time::Instant::now() < deadline {
+        app.request_compaction(&repo.name);
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(Duration::from_millis(100));
+        *repo = app.meta.get_repo(&repo.name, scope).await?.ok_or(MetaError::NotFound)?;
+    }
+    Ok(())
 }
 
 /// The application's answer to a pre-receive question.
