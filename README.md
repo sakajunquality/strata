@@ -124,12 +124,21 @@ anything is stored, which is where protected branches go:
 
 ```
 -> {"repo": "r-8f3a", "actor": "alice", "updates": [
-     {"ref": "refs/heads/main", "old": "1f3c...", "new": "9a0b...", "change": "forced"}]}
+     {"ref": "refs/heads/main", "old": "1f3c...", "new": "9a0b...", "change": "forced",
+      "commits": [{"oid": "9a0b...", "author": {...}, "message": "...", "signature": null}],
+      "commits_truncated": false}]}
 <- {"allow": false, "message": "main is protected"}      # shown to the person pushing
 ```
 
-`change` is `create`, `delete`, `fast-forward` or `forced`. The hook cannot
-fetch the pushed commits: they are not visible until the push commits.
+`change` is `create`, `delete`, `fast-forward` or `forced`. `commits` are the
+commits the update brings to its ref, newest first: for a ref that moves,
+those its old value lacks, and for a new one, those no ref has yet. Up to
+1000 are listed. Each is described as the content API describes a commit,
+which includes its `signature`: null, or the signature itself with its
+`format` (`openpgp`, `ssh` or `x509`) and the `payload` it signs, in base64.
+That is what a rule about signed commits needs; whose key made a signature
+is the application's to know. Files are not shown: the hook cannot fetch
+the pushed objects, which are not visible until the push commits.
 
 Both hooks receive `--hook-secret` as a Bearer token, to tell Strata from
 anyone else who finds the URL.
@@ -198,7 +207,7 @@ The server speaks plain HTTP: put TLS in front of it.
 
 [`examples/hub`](examples/hub) is such an application, small but whole:
 accounts, organizations, private repositories, a protected default branch,
-a code browser, pull requests and an activity feed, in Bun, Hono and React.
+signed commits, a code browser, pull requests and an activity feed, in Bun, Hono and React.
 
 ## Test
 
@@ -220,6 +229,6 @@ cargo build --release && FILES=50000 COMMITS=100 ./scripts/bench.sh   # timings 
 - **Pruned objects are gone at once.** There is no window in which a force-pushed-away commit can still be fetched by id after the next full compaction.
 - **Indexing a push keeps about 50 bytes per object in memory**, plus one delta family at a time; the spool file needs local disk the size of the push.
 - **Compaction computes deltas only for files changed since the last full merge**, against their previous version. It does not search for better bases.
-- **The pre-receive hook cannot inspect pushed content**, only which refs move and how. Rules about commit contents (signatures, file sizes, secrets) need a way to read a push before it commits.
+- **The pre-receive hook sees the commits a push brings, but not their files.** Rules about file sizes or secrets need a way to read a push before it commits.
 - **The event feed covers pushes only.** Repositories created, deleted or compacted are the application's own actions and are not echoed back.
 - **TLS, rate limiting, and quotas.** `GET /api/repos/<id>` reports the bytes a repository holds; nothing enforces a limit.

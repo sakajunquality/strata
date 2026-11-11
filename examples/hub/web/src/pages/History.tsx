@@ -1,11 +1,20 @@
-import { Alert, Button, Card, Space, Tag, Typography } from "antd";
+import { Alert, Button, Card, Space, Tag, Tooltip, Typography } from "antd";
 import { structuredPatch } from "diff";
 import { useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { api, query, useLoad, type Commit, type CommitDetail, type FileChange } from "../api";
+import { api, query, useLoad, type Commit, type CommitDetail, type FileChange, type Verification } from "../api";
 import { loadBlob } from "../blob";
 import { Loaded, shortOid, splitRev, subject, urlPath, When } from "../util";
 import { RevSelect, type RepoContext } from "./Repo";
+
+/** Says whether a commit's signature was made with a key registered here. Nothing for an unsigned commit. */
+export function Signed({ verification }: { verification?: Verification }) {
+  if (!verification) return null;
+  if (verification.state === "verified") {
+    return <Tooltip title={`Signed by ${verification.signer} with ${verification.key}`}><Tag color="green">Verified</Tag></Tooltip>;
+  }
+  return <Tooltip title={`This commit ${verification.reason}`}><Tag>Unverified</Tag></Tooltip>;
+}
 
 export function CommitRows({ root, commits }: { root: string; commits: Commit[] }) {
   return (
@@ -17,6 +26,7 @@ export function CommitRows({ root, commits }: { root: string; commits: Commit[] 
             <div className="muted small">{commit.author?.name} committed <When time={commit.committer?.time} /></div>
           </div>
           <Space>
+            <Signed verification={commit.verification} />
             <Link to={`${root}/commit/${commit.oid}`} className="mono">{shortOid(commit.oid)}</Link>
             <Link to={`${root}/tree/${commit.oid}`}>Browse</Link>
           </Space>
@@ -154,7 +164,7 @@ export function CommitPage({ root, base }: RepoContext) {
                 {data.committer && data.committer.name !== data.author?.name && <>, <strong>{data.committer.name}</strong> committed <When time={data.committer.time} /></>}
               </div>
               <div className="muted small">
-                Commit <span className="mono">{data.oid}</span>
+                Commit <span className="mono">{data.oid}</span> <Signed verification={data.verification} />
                 {data.parents.map((parent) => (
                   <span key={parent}> · parent <Link to={`${root}/commit/${parent}`} className="mono">{shortOid(parent)}</Link></span>
                 ))}

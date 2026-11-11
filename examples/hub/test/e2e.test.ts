@@ -1,7 +1,7 @@
 // Runs Strata and the hub as they run for real, and drives them with git and
 // the hub's API. Needs the Strata binary: `cargo build` in the repository root.
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -12,6 +12,9 @@ const hubPort = strataPort + 1000;
 const hub = `http://127.0.0.1:${hubPort}`;
 const tmp = mkdtempSync(join(tmpdir(), "strata-hub-"));
 const children: Bun.Subprocess[] = [];
+// gpg talks to its agent over a socket in here, and socket paths have to be short.
+const gnupg = mkdtempSync("/tmp/hub-gpg-");
+const gpgEnv = { PATH: process.env.PATH!, GNUPGHOME: gnupg };
 
 async function up(url: string) {
   for (let i = 0; i < 100; i++) {
@@ -46,7 +49,9 @@ beforeAll(async () => {
 
 afterAll(() => {
   for (const child of children) child.kill();
+  Bun.spawnSync(["gpgconf", "--kill", "all"], { env: gpgEnv });
   rmSync(tmp, { recursive: true, force: true });
+  rmSync(gnupg, { recursive: true, force: true });
 });
 
 /** A browser, as far as the API can tell: remembers its session cookie. */
@@ -76,6 +81,7 @@ function git(dir: string, ...args: string[]) {
     env: {
       PATH: process.env.PATH!,
       HOME: tmp,
+      GNUPGHOME: gnupg,
       GIT_CONFIG_GLOBAL: "/dev/null",
       GIT_CONFIG_NOSYSTEM: "1",
       GIT_TERMINAL_PROMPT: "0",
@@ -365,6 +371,85 @@ test("pull requests", async () => {
   git(work, "fetch", "-q", origin, "main");
   expect(git(work, "log", "-1", "--format=%s|%an|%cn|%p", "FETCH_HEAD").out).toBe(`Add f|Alice|Carol C|${third.slice(0, 7)}`);
   expect(await state(5)).toBe("merged");
+}, 60_000);
+
+test("signed commits", async () => {
+  const [erin, anyone] = [browser(), browser()];
+  await erin("POST", "/signup", { username: "erin", password: "erins password" });
+  expect((await erin("POST", "/repos", { name: "sealed" })).status).toBe(201);
+  const origin = remote("erin:erins%20password", "erin/sealed");
+  const work = join(tmp, "sealed");
+  git(tmp, "init", "-q", "-b", "main", work);
+  let n = 0;
+  /** Commits a change, signed as the extra git options say, and returns its id. */
+  const commit = (message: string, ...signing: string[]) => {
+    writeFileSync(join(work, "file.txt"), `${++n}\n`);
+    git(work, "add", ".");
+    const made = git(work, ...signing, "commit", "-q", "-m", message);
+    expect(made.err).toBe("");
+    return git(work, "rev-parse", "HEAD").out;
+  };
+  const sshKey = (name: string, ...kind: string[]) => {
+    const path = join(tmp, name);
+    expect(Bun.spawnSync(["ssh-keygen", "-q", "-N", "", "-C", name, "-f", path, ...kind]).exitCode).toBe(0);
+    return { public: readFileSync(`${path}.pub`, "utf8"), sign: ["-c", "gpg.format=ssh", "-c", `user.signingkey=${path}.pub`, "-c", "commit.gpgsign=true"] };
+  };
+  const verification = async (oid: string) => (await anyone("GET", `/repos/erin/sealed/commit?rev=${oid}`)).data.verification;
+
+  const plain = commit("Unsigned");
+  const laptop = sshKey("laptop", "-t", "ed25519");
+  const signed = commit("Signed", ...laptop.sign);
+  expect(git(work, "push", "-q", origin, "main").err).toBe("");
+  // A signature counts once someone here owns up to the key.
+  expect(await verification(plain)).toBeNull();
+  expect(await verification(signed)).toEqual({ state: "unverified", reason: "is signed with a key nobody has registered here" });
+  expect((await anyone("POST", "/keys", { key: laptop.public })).status).toBe(401);
+  expect((await erin("POST", "/keys", { key: "ssh-ed25519 not-a-key" })).status).toBe(400);
+  expect((await erin("POST", "/keys", { title: "Laptop", key: laptop.public })).status).toBe(201);
+  expect((await erin("POST", "/keys", { key: laptop.public })).status).toBe(400);
+  const keys = (await erin("GET", "/keys")).data.keys;
+  expect(keys).toMatchObject([{ kind: "ssh", title: "Laptop" }]);
+  expect(keys[0].fingerprint).toStartWith("SHA256:");
+  expect(await verification(signed)).toEqual({ state: "verified", signer: "erin", key: keys[0].fingerprint });
+  const listed = (await anyone("GET", "/repos/erin/sealed/commits")).data.commits;
+  expect(listed.map((c: any) => c.verification?.state ?? null)).toEqual(["verified", null]);
+  expect(listed[0].signature).toBeUndefined();
+
+  // Required: the default branch takes nothing else, anywhere in a push.
+  expect((await erin("PATCH", "/repos/erin/sealed", { requireSigned: true })).status).toBe(200);
+  expect((await anyone("GET", "/repos/erin/sealed")).data.requireSigned).toBe(true);
+  const unsigned = commit("Unsigned again");
+  let refused = git(work, "push", "-q", origin, "main");
+  expect(refused.err).toContain(`main takes signed commits only, and ${unsigned.slice(0, 7)} is not signed`);
+  commit("Signed on top of it", ...laptop.sign);
+  refused = git(work, "push", "-q", origin, "main");
+  expect(refused.err).toContain(`${unsigned.slice(0, 7)} is not signed`);
+  // Other branches are not held to it.
+  expect(git(work, "push", "-q", origin, "main:loose").err).toBe("");
+  git(work, "reset", "-q", "--hard", signed);
+  const stranger = sshKey("stranger", "-t", "ed25519");
+  commit("Signed by who knows", ...stranger.sign);
+  expect(git(work, "push", "-q", origin, "main").err).toContain("is signed with a key nobody has registered here");
+  git(work, "reset", "-q", "--hard", signed);
+
+  // The other kinds of SSH key, and OpenPGP.
+  const rsa = sshKey("rsa", "-t", "rsa", "-b", "2048");
+  const ecdsa = sshKey("ecdsa", "-t", "ecdsa", "-b", "256");
+  expect(Bun.spawnSync(["gpg", "--batch", "--quiet", "--pinentry-mode", "loopback", "--passphrase", "", "--quick-generate-key", "Erin <erin@example.com>", "ed25519", "sign", "never"], { env: gpgEnv }).exitCode).toBe(0);
+  const armored = Bun.spawnSync(["gpg", "--armor", "--export", "erin@example.com"], { env: gpgEnv }).stdout.toString();
+  for (const key of [rsa.public, ecdsa.public, armored]) expect((await erin("POST", "/keys", { key })).status).toBe(201);
+  expect((await erin("GET", "/keys")).data.keys.map((key: any) => key.kind)).toEqual(["gpg", "ssh", "ssh", "ssh"]);
+  const made = [
+    commit("Signed with RSA", ...rsa.sign),
+    commit("Signed with ECDSA", ...ecdsa.sign),
+    commit("Signed with OpenPGP", "-c", "gpg.format=openpgp", "-c", "user.signingkey=erin@example.com", "-c", "commit.gpgsign=true"),
+  ];
+  expect(git(work, "push", "-q", origin, "main").err).toBe("");
+  for (const oid of made) expect(await verification(oid)).toMatchObject({ state: "verified", signer: "erin" });
+
+  // A key taken back no longer vouches for anything.
+  await erin("DELETE", `/keys/${keys[0].id}`);
+  expect((await verification(signed)).state).toBe("unverified");
 }, 60_000);
 
 test("other sites cannot act for a signed-in user", async () => {

@@ -45,10 +45,10 @@ and Strata with `--authz-url http://<hub>/hooks/authz --pre-receive-url http://<
 | The hub does | through Strata's |
 |---|---|
 | Decides who may fetch and push, and maps `owner/name` to a repository id (`server/hooks.ts`) | authorization hook |
-| Protects the default branch from force pushes and deletion, or from any push that is not a merged pull request (`server/hooks.ts`) | pre-receive hook |
+| Protects the default branch: from force pushes and deletion, from pushes that are not a merged pull request, from commits not signed with a registered key (`server/hooks.ts`, `server/signing.ts`) | pre-receive hook |
 | Records pushes as activity; picks a default branch on a first push; closes pull requests whose branch went and marks those merged by a push (`server/events.ts`, `server/pulls.ts`) | event feed |
 | Creates and deletes repositories, sets the default branch (`server/api.ts`) | management API |
-| Shows files, history and what a commit changed (`server/api.ts`, `web/`) | content API |
+| Shows files, history, what a commit changed and whether its signature is from a key a user registered (`server/api.ts`, `server/signing.ts`, `web/`) | content API |
 | Shows what a pull request holds and whether it merges, and merges it (`server/pulls.ts`) | compare and merge |
 
 Strata knows a repository as `r-<uuid>`. Renaming one, or changing who may
@@ -65,6 +65,10 @@ It is an example, not a product:
   Merged branches are not deleted for you.
 - Permissions are per owner: a user's repositories are theirs alone, and an
   organization's members can push to all of its repositories.
+- Signatures are checked against the SSH and OpenPGP keys users register;
+  X.509 is not. A key's expiry or revocation is not looked at, and the signer
+  is not required to be the committer. Commits the hub makes when it merges
+  a pull request are not signed.
 - No sign-in rate limiting, password reset or two-factor authentication.
 - File history and blame are not there; diffs are
   computed in the browser and skip large and binary files.

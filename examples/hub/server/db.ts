@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS repos (
   private INTEGER NOT NULL DEFAULT 0,
   protect_default INTEGER NOT NULL DEFAULT 0,
   require_pulls INTEGER NOT NULL DEFAULT 0,
+  require_signed INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   pushed_at INTEGER,
   UNIQUE (owner_id, name)
@@ -84,10 +85,25 @@ CREATE TABLE IF NOT EXISTS comments (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS comments_by_pull ON comments (pull_id, id);
+CREATE TABLE IF NOT EXISTS signing_keys (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('ssh', 'gpg')),
+  title TEXT NOT NULL,
+  -- ssh: the key blob in base64. gpg: the armored key.
+  material TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  -- gpg: the ids of the key and its subkeys, which is what a signature names.
+  key_ids TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  UNIQUE (kind, fingerprint)
+);
 `);
-// Databases made before pull requests existed.
-if (!db.query<{ name: string }, []>("PRAGMA table_info(repos)").all().some((column) => column.name === "require_pulls")) {
-  db.exec("ALTER TABLE repos ADD COLUMN require_pulls INTEGER NOT NULL DEFAULT 0");
+// Databases made before these settings existed.
+for (const setting of ["require_pulls", "require_signed"]) {
+  if (!db.query<{ name: string }, []>("PRAGMA table_info(repos)").all().some((column) => column.name === setting)) {
+    db.exec(`ALTER TABLE repos ADD COLUMN ${setting} INTEGER NOT NULL DEFAULT 0`);
+  }
 }
 
 export const now = () => Math.floor(Date.now() / 1000);
@@ -101,6 +117,7 @@ export type Repo = {
   private: number;
   protect_default: number;
   require_pulls: number;
+  require_signed: number;
   created_at: number;
   pushed_at: number | null;
   owner_name: string;

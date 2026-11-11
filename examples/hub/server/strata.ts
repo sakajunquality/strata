@@ -42,7 +42,9 @@ export type StrataEvent = {
   event: { type?: string; actor?: string | null; updates?: { ref: string; old: string | null; new: string | null; change: string }[] } | null;
 };
 
-export type Compare = { base: string; head: string; merge_base: string | null; ahead: number; behind: number; commits: unknown[]; files: unknown[]; truncated: boolean };
+export type Compare = { base: string; head: string; merge_base: string | null; ahead: number; behind: number; commits: StrataCommit[]; files: unknown[]; truncated: boolean };
+/** A commit as Strata describes it. Only what the hub itself looks at is spelled out. */
+export type StrataCommit = { oid: string; signature?: { format: string; signature: string; payload: string } | null; [more: string]: unknown };
 export type MergeRequest = {
   base: string;
   head: string;
@@ -62,8 +64,8 @@ export const strata = {
   setHead: (id: string, ref: string) => call("PUT", `${repo(id)}/head`, ref),
   info: async (id: string) => (await call("GET", repo(id))).json() as Promise<{ packs: number; objects: number; bytes: number }>,
   refs: async (id: string) => (await call("GET", `${repo(id)}/refs`)).json() as Promise<Refs>,
-  commits: async (id: string, rev: string, skip: number, limit: number) => (await call("GET", `${repo(id)}/commits${query({ rev, skip, limit })}`)).json(),
-  commit: async (id: string, rev: string) => (await call("GET", `${repo(id)}/commit${query({ rev })}`)).json(),
+  commits: async (id: string, rev: string, skip: number, limit: number) => (await call("GET", `${repo(id)}/commits${query({ rev, skip, limit })}`)).json() as Promise<{ commits: StrataCommit[]; next: number | null }>,
+  commit: async (id: string, rev: string) => (await call("GET", `${repo(id)}/commit${query({ rev })}`)).json() as Promise<StrataCommit>,
   tree: async (id: string, rev: string, path: string) => (await call("GET", `${repo(id)}/tree${query({ rev, path })}`)).json(),
   blob: (id: string, params: { rev?: string; path?: string; oid?: string }) => call("GET", `${repo(id)}/blob${query(params)}`),
   compare: async (id: string, base: string, head: string) => (await call("GET", `${repo(id)}/compare${query({ base, head })}`)).json() as Promise<Compare>,

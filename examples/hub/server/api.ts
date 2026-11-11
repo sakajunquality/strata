@@ -8,6 +8,7 @@ import { fail, REPO, signedIn, text, type Env } from "./common";
 import { config } from "./config";
 import { canRead, db, now, ownerByName, permission, REPO_COLUMNS, repoByPath, roleIn, type Owner, type Repo } from "./db";
 import { addPullRoutes, openPullCount } from "./pulls";
+import { addKey, keysOf, removeKey, withVerification } from "./signing";
 import { strata, StrataError } from "./strata";
 
 export const api = new Hono<Env>();
@@ -98,6 +99,24 @@ api.post("/tokens", async (c) => {
 api.delete("/tokens/:id", (c) => {
   const user = signedIn(c);
   db.run("DELETE FROM tokens WHERE id = ? AND user_id = ?", [Number(c.req.param("id")), user.id]);
+  return c.json({});
+});
+
+api.get("/keys", (c) => c.json({ keys: keysOf(signedIn(c).id) }));
+
+api.post("/keys", async (c) => {
+  const user = signedIn(c);
+  const body = await c.req.json();
+  try {
+    await addKey(user.id, text(body.title, 100) || "Signing key", String(body.key ?? ""));
+  } catch (error) {
+    throw fail(400, (error as Error).message);
+  }
+  return c.json({}, 201);
+});
+
+api.delete("/keys/:id", (c) => {
+  removeKey(signedIn(c).id, Number(c.req.param("id")));
   return c.json({});
 });
 
@@ -233,6 +252,7 @@ api.get(REPO, async (c) => {
     ownerKind: found.owner_kind,
     protectDefault: !!found.protect_default,
     requirePulls: !!found.require_pulls,
+    requireSigned: !!found.require_signed,
     openPulls: openPullCount(found.id),
     permission: c.get("level"),
     cloneUrl: `${config.strataPublicUrl}/${found.owner_name}/${found.name}.git`,
@@ -257,12 +277,13 @@ api.patch(REPO, async (c) => {
     if (other && other.id !== found.id) throw fail(409, `${found.owner_name}/${name} already exists`);
   }
   // A rename happens here and nowhere else: Strata keeps serving the same id.
-  db.run("UPDATE repos SET name = ?, description = ?, private = ?, protect_default = ?, require_pulls = ? WHERE id = ?", [
+  db.run("UPDATE repos SET name = ?, description = ?, private = ?, protect_default = ?, require_pulls = ?, require_signed = ? WHERE id = ?", [
     name,
     body.description === undefined ? found.description : text(body.description, 300),
     body.private === undefined ? found.private : body.private ? 1 : 0,
     body.protectDefault === undefined ? found.protect_default : body.protectDefault ? 1 : 0,
     body.requirePulls === undefined ? found.require_pulls : body.requirePulls ? 1 : 0,
+    body.requireSigned === undefined ? found.require_signed : body.requireSigned ? 1 : 0,
     found.id,
   ]);
   return c.json({ owner: found.owner_name, name });
@@ -279,10 +300,11 @@ api.delete(REPO, async (c) => {
 
 api.get(`${REPO}/commits`, async (c) => {
   const skip = Math.max(0, Number(c.req.query("skip")) || 0);
-  return c.json(await strata.commits(c.get("repo").id, c.req.query("rev") ?? "", skip, 30));
+  const page = await strata.commits(c.get("repo").id, c.req.query("rev") ?? "", skip, 30);
+  return c.json({ ...page, commits: await withVerification(page.commits) });
 });
 
-api.get(`${REPO}/commit`, async (c) => c.json(await strata.commit(c.get("repo").id, c.req.query("rev") ?? "")));
+api.get(`${REPO}/commit`, async (c) => c.json((await withVerification([await strata.commit(c.get("repo").id, c.req.query("rev") ?? "")]))[0]));
 
 api.get(`${REPO}/tree`, async (c) => c.json(await strata.tree(c.get("repo").id, c.req.query("rev") ?? "", c.req.query("path") ?? "")));
 

@@ -729,6 +729,17 @@ async fn the_application_decides_who_may_do_what() {
         ("refs/heads/topic", "delete"),
     ];
     assert_eq!(asked, expected.map(|(name, change)| (name.to_string(), change.to_string())));
+    // Each question also showed the commits the update would bring to its ref, newest first.
+    {
+        let seen = seen.lock().unwrap();
+        let created = &seen.pushes[0]["updates"][0];
+        assert_eq!(created["commits"][0]["oid"], created["new"]);
+        assert_eq!(created["commits"][0]["author"]["name"], "Test");
+        assert_eq!(created["commits"][0]["signature"], serde_json::Value::Null);
+        assert_eq!(created["commits_truncated"], false);
+        let deleted = &seen.pushes[3]["updates"][0];
+        assert_eq!(deleted["commits"], serde_json::json!([]));
+    }
 
     // The feed has the pushes that did land, in order, and nothing else.
     let feed = tokio::task::spawn_blocking(move || {

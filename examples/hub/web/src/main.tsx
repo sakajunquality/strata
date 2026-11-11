@@ -10,6 +10,7 @@ import { Home } from "./pages/Home";
 import { Login } from "./pages/Login";
 import { NewOrg, NewRepo } from "./pages/New";
 import { OwnerPage } from "./pages/Owner";
+import { Keys } from "./pages/Keys";
 import { Tokens } from "./pages/Tokens";
 import { Repo } from "./pages/Repo";
 
@@ -31,6 +32,7 @@ createRoot(document.getElementById("root")!).render(
                 <Route path="new" element={<NewRepo />} />
                 <Route path="orgs/new" element={<NewOrg />} />
                 <Route path="settings/tokens" element={<Tokens />} />
+                <Route path="settings/keys" element={<Keys />} />
                 <Route path=":owner" element={<OwnerPage />} />
                 <Route path=":owner/:repo/*" element={<Repo />} />
               </Route>

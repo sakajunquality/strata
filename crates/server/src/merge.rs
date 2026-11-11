@@ -43,25 +43,27 @@ const TREE: u32 = 0o40000;
 type Entry = (u32, Oid);
 
 /// How two commits relate.
-struct Divergence {
+pub(crate) struct Divergence {
     /// The best common ancestors, newest first. Empty for unrelated histories.
     bases: Vec<Oid>,
     /// Commits only `head` has, newest first.
-    ahead: Vec<Oid>,
+    pub(crate) ahead: Vec<Oid>,
     /// Number of commits only `base` has.
     behind: usize,
 }
 
 /// Walks both histories newest first until everything left is common to
 /// both, so the cost is that of what differs, not of the whole history.
-fn diverge(src: &dyn ObjectSource, base: Oid, head: Oid) -> Result<Divergence, HttpError> {
+///
+/// With several `bases`, a commit counts as theirs if any of them has it.
+pub(crate) fn diverge(src: &dyn ObjectSource, bases: &[Oid], head: Oid) -> strata_git::Result<Divergence> {
     const BASE: u8 = 1;
     const HEAD: u8 = 2;
     const STALE: u8 = 4;
     let mut flags: HashMap<Oid, (u8, i64)> = HashMap::new();
     let mut queue: BinaryHeap<(i64, Oid)> = BinaryHeap::new();
-    for (oid, flag) in [(base, BASE), (head, HEAD)] {
-        let time = src.commit(&oid)?.ok_or_else(HttpError::not_found)?.time;
+    for (oid, flag) in bases.iter().map(|base| (*base, BASE)).chain([(head, HEAD)]) {
+        let time = src.commit(&oid)?.ok_or(strata_git::Error::Missing(oid))?.time;
         flags.entry(oid).or_insert((0, time)).0 |= flag;
         queue.push((time, oid));
     }
@@ -105,7 +107,7 @@ pub(crate) fn compare(repo: &RepoState, packs: &PackSet, params: &HashMap<String
     let param = |name: &str| params.get(name).map(String::as_str).unwrap_or("");
     let base = resolve(repo, packs, param("base"))?;
     let head = resolve(repo, packs, param("head"))?;
-    let divergence = diverge(packs, base, head)?;
+    let divergence = diverge(packs, &[base], head)?;
     let merge_base = divergence.bases.first().copied();
     let mut files = Vec::new();
     let from = tree_of(packs, &merge_base.unwrap_or(base))?;
@@ -328,7 +330,7 @@ fn plan(repo: &RepoState, packs: &PackSet, request: &Request) -> Result<Plan, Ht
         Some("rebase") => Method::Rebase,
         Some(_) => return Err(HttpError::bad_request("method must be merge, squash or rebase")),
     };
-    let divergence = diverge(packs, base, head)?;
+    let divergence = diverge(packs, &[base], head)?;
     let merge_base = divergence.bases.first().copied();
     let mut plan = Plan { name, base, head, merge_base, ahead: divergence.ahead.len(), conflicts: Vec::new(), objects: Vec::new(), commit: Oid::ZERO };
     if plan.ahead == 0 {

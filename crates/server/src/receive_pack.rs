@@ -6,7 +6,7 @@ use axum::body::{Body, BodyDataStream};
 use bytes::{Bytes, BytesMut};
 use strata_git::pack::index_pack;
 use strata_git::pktline::{self, Pkt, Reader};
-use strata_git::{walk, Oid, PackData, PackFile};
+use strata_git::{walk, Oid, PackData, PackFile, PackSet};
 use strata_store::{MetaError, PackStore, RefUpdate, RepoState, Txn};
 use tokio::io::AsyncWriteExt;
 use tokio_stream::StreamExt;
@@ -281,6 +281,20 @@ fn change(src: &dyn strata_git::ObjectSource, old: &Oid, new: &Oid) -> &'static 
     }
 }
 
+/// How many commits of one update the pre-receive hook is shown.
+const MAX_HOOK_COMMITS: usize = 1000;
+
+/// The commits an update adds to its ref, newest first, and whether there
+/// were more than are listed. For a ref that moves, these are the commits its
+/// old value lacks; for a new ref, those no existing ref has.
+fn new_commits(all: &PackSet, tips: &[Oid], old: &Oid, new: &Oid) -> Result<(Vec<serde_json::Value>, bool), HttpError> {
+    let Some(head) = walk::commit_tips(all, &[*new])?.first().copied().filter(|_| !new.is_zero()) else { return Ok((Vec::new(), false)) };
+    let bases = if old.is_zero() { walk::commit_tips(all, tips)? } else { walk::commit_tips(all, &[*old])? };
+    let ahead = crate::merge::diverge(all, &bases, head)?.ahead;
+    let commits = ahead.iter().take(MAX_HOOK_COMMITS).map(|oid| crate::content::commit_json(all, oid)).collect::<Result<Vec<_>, _>>()?;
+    Ok((commits, ahead.len() > MAX_HOOK_COMMITS))
+}
+
 fn one_line(s: &str) -> String {
     s.replace(['\n', '\r'], " ")
 }
@@ -333,6 +347,7 @@ async fn apply(
     // a bad push leaves nothing behind.
     let tips: Vec<Oid> = commands.iter().map(|c| c.new).filter(|oid| !oid.is_zero()).collect();
     let moves: Vec<(Oid, Oid)> = commands.iter().map(|c| (c.old, c.new)).collect();
+    let pushed = all.clone();
     let checked = blocking(move || {
         walk::check_connected(&all, &existing, &tips)?;
         Ok::<_, strata_git::Error>(moves.iter().map(|(old, new)| change(&all, old, new)).collect::<Vec<_>>())
@@ -354,7 +369,17 @@ async fn apply(
     // The application's rules (protected branches and the like), asked before
     // anything is stored. No answer means no.
     if let Some(url) = &app.options.pre_receive_url {
-        let question = serde_json::json!({ "repo": repo.name, "actor": actor, "updates": updates });
+        // The question also shows the commits each update brings, so that
+        // rules can be about them: who signed, who wrote, what they say.
+        let moves: Vec<(Oid, Oid)> = commands.iter().map(|c| (c.old, c.new)).collect();
+        let tips: Vec<Oid> = repo.refs.values().copied().collect();
+        let brought = blocking(move || moves.iter().map(|(old, new)| new_commits(&pushed, &tips, old, new)).collect::<Result<Vec<_>, HttpError>>()).await??;
+        let mut asked = updates.clone();
+        for (update, (commits, truncated)) in asked.iter_mut().zip(brought) {
+            update["commits"] = serde_json::Value::Array(commits);
+            update["commits_truncated"] = serde_json::Value::Bool(truncated);
+        }
+        let question = serde_json::json!({ "repo": repo.name, "actor": actor, "updates": asked });
         match app.hooks.ask::<_, Verdict>(url, &question).await {
             Ok(Verdict { allow: true, .. }) => {}
             Ok(Verdict { message, .. }) => {

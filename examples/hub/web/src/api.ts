@@ -54,6 +54,7 @@ export type RepoDetail = RepoSummary & {
   ownerKind: "user" | "org";
   protectDefault: boolean;
   requirePulls: boolean;
+  requireSigned: boolean;
   openPulls: number;
   permission: "read" | "write" | "admin";
   cloneUrl: string;
@@ -64,7 +65,9 @@ export type RepoDetail = RepoSummary & {
   size: number;
 };
 export type Person = { name: string; email: string; time: number; zone: string };
-export type Commit = { oid: string; parents: string[]; tree: string; message: string; author?: Person; committer?: Person };
+/** What a commit's signature is worth: null if it has none. */
+export type Verification = { state: "verified"; signer: string; key: string } | { state: "unverified"; reason: string } | null;
+export type Commit = { oid: string; parents: string[]; tree: string; message: string; author?: Person; committer?: Person; verification?: Verification };
 export type Side = { oid: string; mode: string } | null;
 export type FileChange = { path: string; status: "added" | "deleted" | "modified"; old: Side; new: Side };
 export type CommitDetail = Commit & { files: FileChange[]; truncated: boolean };

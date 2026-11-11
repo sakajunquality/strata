@@ -238,6 +238,43 @@ pub(crate) fn changes(packs: &PackSet, old: Option<Oid>, new: Option<Oid>, prefi
     Ok(true)
 }
 
+/// A commit's signature, and the bytes it signs: the commit without the
+/// signature's own header. Checking it takes the signer's key, which is the
+/// application's to know.
+fn signature(raw: &[u8]) -> Option<Value> {
+    use base64::Engine;
+    let end = raw.windows(2).position(|pair| pair == b"\n\n").map_or(raw.len(), |at| at + 1);
+    let (headers, message) = raw.split_at(end);
+    let (mut signed, mut text, mut inside) = (Vec::with_capacity(raw.len()), Vec::new(), false);
+    for line in headers.split_inclusive(|byte| *byte == b'\n') {
+        // A line starting with a space continues the header above it.
+        match line.strip_prefix(b" ") {
+            Some(more) if inside => text.extend_from_slice(more),
+            Some(_) => signed.extend_from_slice(line),
+            None => {
+                let first = line.strip_prefix(b"gpgsig ").or_else(|| line.strip_prefix(b"gpgsig-sha256 "));
+                inside = first.is_some();
+                match first {
+                    Some(first) => text.extend_from_slice(first),
+                    None => signed.extend_from_slice(line),
+                }
+            }
+        }
+    }
+    if text.is_empty() {
+        return None;
+    }
+    signed.extend_from_slice(message);
+    let text = String::from_utf8_lossy(&text).trim().to_string();
+    let format = match &text {
+        text if text.starts_with("-----BEGIN PGP SIGNATURE") => "openpgp",
+        text if text.starts_with("-----BEGIN SSH SIGNATURE") => "ssh",
+        text if text.starts_with("-----BEGIN SIGNED MESSAGE") => "x509",
+        _ => "unknown",
+    };
+    Some(json!({ "format": format, "signature": text, "payload": base64::engine::general_purpose::STANDARD.encode(signed) }))
+}
+
 /// `Name <email> seconds zone`, as it stands in a commit header.
 fn person(line: &str) -> Value {
     let (who, when) = match line.rfind('>') {
@@ -269,5 +306,25 @@ pub(crate) fn commit_json(packs: &PackSet, oid: &Oid) -> Result<Value, HttpError
         }
     }
     commit["parents"] = Value::Array(parents);
+    commit["signature"] = signature(&object.data).unwrap_or(Value::Null);
     Ok(commit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signature;
+    use base64::Engine;
+
+    #[test]
+    fn signatures_are_told_from_what_they_sign() {
+        let plain = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor A <a@example.com> 1 +0000\ncommitter A <a@example.com> 1 +0000\n\nmessage\n\n with a gap\n";
+        assert_eq!(signature(plain), None);
+        let signed = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor A <a@example.com> 1 +0000\ncommitter A <a@example.com> 1 +0000\ngpgsig -----BEGIN SSH SIGNATURE-----\n AAAA\n BBBB\n -----END SSH SIGNATURE-----\nencoding latin1\n\nmessage\n\n with a gap\n";
+        let found = signature(signed).unwrap();
+        assert_eq!(found["format"], "ssh");
+        assert_eq!(found["signature"], "-----BEGIN SSH SIGNATURE-----\nAAAA\nBBBB\n-----END SSH SIGNATURE-----");
+        let payload = base64::engine::general_purpose::STANDARD.decode(found["payload"].as_str().unwrap()).unwrap();
+        let expected = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor A <a@example.com> 1 +0000\ncommitter A <a@example.com> 1 +0000\nencoding latin1\n\nmessage\n\n with a gap\n";
+        assert_eq!(payload, expected);
+    }
 }

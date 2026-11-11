@@ -4,7 +4,8 @@ import { Hono } from "hono";
 import { gitUser, sha256 } from "./auth";
 import { config } from "./config";
 import { canRead, canWrite, permission, repoById, repoByPath } from "./db";
-import { strata } from "./strata";
+import { verify } from "./signing";
+import { strata, type StrataCommit } from "./strata";
 
 export const hooks = new Hono();
 
@@ -33,19 +34,31 @@ hooks.post("/authz", async (c) => {
 });
 
 hooks.post("/pre-receive", async (c) => {
-  const { repo: id, updates } = await c.req.json<{ repo: string; actor?: string; updates: { ref: string; change: string }[] }>();
+  const { repo: id, updates } = await c.req.json<{ repo: string; actor?: string; updates: { ref: string; change: string; commits?: StrataCommit[]; commits_truncated?: boolean }[] }>();
   const repo = repoById(id);
   if (!repo) return c.json({ allow: false, message: "repository not found" });
-  if (repo.protect_default || repo.require_pulls) {
+  if (repo.protect_default || repo.require_pulls || repo.require_signed) {
     const { head } = await strata.refs(id);
+    const branch = head.replace("refs/heads/", "");
+    if (repo.require_signed) {
+      // Every commit the push brings to the branch, not just its tip.
+      for (const update of updates.filter((update) => update.ref === head)) {
+        if (update.commits_truncated) return c.json({ allow: false, message: `too many commits to check the signatures of in one push to ${branch}` });
+        for (const commit of update.commits ?? []) {
+          const checked = await verify(commit.signature);
+          if (checked?.state === "verified") continue;
+          return c.json({ allow: false, message: `${branch} takes signed commits only, and ${commit.oid.slice(0, 7)} ${checked ? checked.reason : "is not signed"}` });
+        }
+      }
+    }
     // Merging a pull request is the hub's own doing and does not come through here.
     if (repo.require_pulls && updates.some((update) => update.ref === head && update.change !== "create")) {
-      return c.json({ allow: false, message: `${head.replace("refs/heads/", "")} only takes changes through pull requests` });
+      return c.json({ allow: false, message: `${branch} only takes changes through pull requests` });
     }
     const broken = repo.protect_default && updates.find((update) => update.ref === head && (update.change === "forced" || update.change === "delete"));
     if (broken) {
       const what = broken.change === "delete" ? "cannot be deleted" : "does not accept force pushes";
-      return c.json({ allow: false, message: `${head.replace("refs/heads/", "")} is protected and ${what}` });
+      return c.json({ allow: false, message: `${branch} is protected and ${what}` });
     }
   }
   return c.json({ allow: true });

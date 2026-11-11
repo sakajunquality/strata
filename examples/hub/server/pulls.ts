@@ -4,6 +4,7 @@
 import type { Hono } from "hono";
 import { fail, REPO, signedIn, text, type Env } from "./common";
 import { canWrite, db, now, type Owner, type Permission, type Repo } from "./db";
+import { withVerification } from "./signing";
 import { strata, StrataError, type Compare, type StrataEvent } from "./strata";
 
 type PullRow = {
@@ -133,7 +134,8 @@ export function addPullRoutes(api: Hono<Env>) {
   api.get(`${REPO}/compare`, async (c) => {
     const repo = c.get("repo");
     const { base, head } = await pair(repo, c.req.query("base"), c.req.query("head"));
-    return c.json({ ...(await strata.compare(repo.id, base, head)), existing: duplicate(repo, base, head) });
+    const compared = await strata.compare(repo.id, base, head);
+    return c.json({ ...compared, commits: await withVerification(compared.commits), existing: duplicate(repo, base, head) });
   });
 
   api.get(`${REPO}/pulls`, (c) => {
@@ -182,7 +184,7 @@ export function addPullRoutes(api: Hono<Env>) {
     return c.json({
       ...pullJson(pull),
       discussion: comments,
-      compare: compared,
+      compare: compared && { ...compared, commits: await withVerification(compared.commits) },
       mergeable: check?.mergeable ?? null,
       conflicts: check?.conflicts ?? [],
       can: { change: !!user && mayChange(pull, user, c.get("level")), merge: canWrite(c.get("level")) },
