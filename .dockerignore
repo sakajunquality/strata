@@ -1,0 +1,5 @@
+# Only the workspace is needed to build the server.
+*
+!Cargo.toml
+!Cargo.lock
+!crates

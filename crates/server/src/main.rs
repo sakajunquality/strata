@@ -104,7 +104,8 @@ fn open_object_store(args: &Args) -> anyhow::Result<Arc<dyn ObjectStore>> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    // Colours only where someone is looking: not in a file or a container's log.
+    tracing_subscriber::fmt().with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout())).init();
     // Two TLS backends are linked in (by different dependencies); the HTTP
     // and gRPC clients need to be told which one to use.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -150,6 +151,24 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!("listening on http://{}", listener.local_addr()?);
-    axum::serve(listener, router(app)).await?;
+    // On a signal to stop, no new connections are taken and requests in
+    // flight are let finish: what a rolling update needs of a node.
+    axum::serve(listener, router(app)).with_graceful_shutdown(stop_signal()).await?;
+    tracing::info!("stopped");
     Ok(())
+}
+
+async fn stop_signal() {
+    let interrupt = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("a signal handler can be installed");
+        tokio::select! {
+            _ = interrupt => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = interrupt.await;
+    tracing::info!("stopping: finishing the requests in flight");
 }

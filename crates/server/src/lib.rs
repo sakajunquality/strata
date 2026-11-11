@@ -182,6 +182,16 @@ async fn route(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body: 
     if path == "healthz" {
         return Ok("ok\n".into_response());
     }
+    if path == "readyz" {
+        // Alive is not enough to be sent requests: every one of them needs the metadata store.
+        return match app.meta.list_events(None, 1).await {
+            Ok(_) => Ok("ready\n".into_response()),
+            Err(e) => {
+                tracing::warn!("not ready: the metadata store cannot be reached: {e}");
+                Err(HttpError::new(StatusCode::SERVICE_UNAVAILABLE, "the metadata store cannot be reached"))
+            }
+        };
+    }
     if path == "api/events" {
         auth::authorize_admin(app, headers)?;
         if method != Method::GET {

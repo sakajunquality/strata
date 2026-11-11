@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: strata
+spec:
+  template:
+    spec:
+      containers:
+        - name: strata
+          args:
+            - --listen=0.0.0.0:8080
+            - --object-store=$(STRATA_OBJECT_STORE)
+            - --scratch-dir=/scratch
+            - --data-dir=/scratch/unused
+            - --block-cache-mb=32
+            - --object-cache-mb=16
+            - --index-cache-mb=32
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

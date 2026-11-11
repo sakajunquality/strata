@@ -1,0 +1,62 @@
+# An S3-compatible store to try things with (LocalStack). In production this
+# is S3, GCS or Azure Blob: packs are written once and never changed.
+#
+# This one keeps its objects in the pod: restart it and every pack is gone,
+# while the refs in PostgreSQL still point at them. Fine for a trial, and
+# the reason a real bucket is not optional.
+apiVersion: v1
+kind: Service
+metadata:
+  name: object-store
+spec:
+  selector:
+    app: object-store
+  ports:
+    - port: 4566
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: object-store-init
+data:
+  bucket.sh: |
+    #!/bin/sh
+    awslocal s3 mb s3://strata
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: object-store
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: object-store
+  template:
+    metadata:
+      labels:
+        app: object-store
+    spec:
+      containers:
+        - name: localstack
+          image: localstack/localstack:3.8
+          env:
+            - name: SERVICES
+              value: s3
+          ports:
+            - containerPort: 4566
+          readinessProbe:
+            httpGet:
+              path: /_localstack/health
+              port: 4566
+            periodSeconds: 3
+          volumeMounts:
+            - name: init
+              mountPath: /etc/localstack/init/ready.d
+      volumes:
+        - name: init
+          configMap:
+            name: object-store-init
+            defaultMode: 0755

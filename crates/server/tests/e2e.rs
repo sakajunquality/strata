@@ -1057,6 +1057,8 @@ async fn content_can_be_read_through_the_api() {
         assert!(shown["files"].as_array().unwrap().iter().all(|f| f["status"] == "added"));
 
         assert_eq!(api("POST", &format!("{repo}/refs"), None).0, 405);
+        // What an orchestrator asks before sending requests here.
+        assert_eq!(api("GET", &format!("{base}/readyz"), None), (200, "ready".to_string()));
         assert_eq!(api("GET", &format!("{base}/api/repos/r-8/refs"), None).0, 404);
     })
     .await

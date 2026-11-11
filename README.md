@@ -174,6 +174,7 @@ CI triggers and audit logs are built from this, with whatever retries they need.
 | `POST /api/repos/<id>/merge` | Merge a revision into a branch: as a merge commit, squashed into one commit, or rebased. |
 | `GET /api/events` | The feed above. |
 | `GET /healthz` | Liveness, without credentials. |
+| `GET /readyz` | Readiness, without credentials: 503 while the metadata store cannot be reached. |
 
 A `rev` is a ref (in full, or a branch or tag name) or a commit id, and
 defaults to HEAD. These read calls are what a code browser is built from;
@@ -204,6 +205,10 @@ merge appears in the event feed as a push by `actor`, with a `merge` field.
 The pre-receive hook is not asked: the application is the one calling.
 
 The server speaks plain HTTP: put TLS in front of it.
+
+[`examples/k8s`](examples/k8s) runs several nodes on Kubernetes, as a plain
+`Deployment` over one database and one bucket, with a script that tries it in
+a local kind cluster: pods are deleted, replaced and added while pushes go on.
 
 [`examples/hub`](examples/hub) is such an application, small but whole:
 accounts, organizations, private repositories, a protected default branch,

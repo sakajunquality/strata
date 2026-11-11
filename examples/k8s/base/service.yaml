@@ -1,0 +1,41 @@
+# What git clients and the application talk to. Any pod will do for any
+# request: a fetch's two requests may well land on two of them.
+apiVersion: v1
+kind: Service
+metadata:
+  name: strata
+  labels:
+    app: strata
+spec:
+  selector:
+    app: strata
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# Each pod by itself, for looking at one of them (and for the test).
+apiVersion: v1
+kind: Service
+metadata:
+  name: strata-pods
+  labels:
+    app: strata
+spec:
+  clusterIP: None
+  selector:
+    app: strata
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: strata
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: strata

@@ -1,0 +1,97 @@
+# The compute nodes. They hold nothing that matters: every one of them serves
+# every repository out of the same metadata store and the same bucket, so
+# this is an ordinary Deployment, scaled like any stateless service.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: strata
+  labels:
+    app: strata
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: strata
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: strata
+    spec:
+      # A node told to stop finishes the fetches and pushes it has; give the long ones time.
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+      # One node of the cluster going away should not take most of them.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: strata
+      containers:
+        - name: strata
+          image: strata
+          args:
+            - --listen=0.0.0.0:8080
+            - --object-store=$(STRATA_OBJECT_STORE)
+            - --scratch-dir=/scratch
+            - --data-dir=/scratch/unused
+            # The caches are the pod's memory: keep their sum under the limit below.
+            - --block-cache-mb=256
+            - --object-cache-mb=128
+            - --index-cache-mb=256
+          # STRATA_META, STRATA_ADMIN_TOKEN, STRATA_OBJECT_STORE and the
+          # object store's own settings (AWS_*, GOOGLE_* or AZURE_*). With an
+          # application in front: STRATA_AUTHZ_URL, STRATA_PRE_RECEIVE_URL
+          # and STRATA_HOOK_SECRET as well.
+          envFrom:
+            - secretRef:
+                name: strata-env
+          ports:
+            - name: http
+              containerPort: 8080
+          # Sent requests only while the metadata store answers.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 6
+          # A pod being removed is still sent new connections for a moment,
+          # until the rest of the cluster has heard. Keep serving through it.
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: scratch
+              mountPath: /scratch
+      volumes:
+        # Where a push is spooled while it is checked: as large as the largest
+        # push in flight, and gone with the pod. Nothing else is written locally.
+        - name: scratch
+          emptyDir:
+            sizeLimit: 4Gi

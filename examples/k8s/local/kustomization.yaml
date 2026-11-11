@@ -1,0 +1,30 @@
+# Everything needed to try the Deployment on a laptop: the compute nodes
+# from ../base, with a PostgreSQL and an S3-compatible store beside them.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: strata
+resources:
+  - namespace.yaml
+  - ../base
+  - postgres.yaml
+  - object-store.yaml
+images:
+  # Built from the repository's Dockerfile and loaded into the cluster.
+  - name: strata
+    newName: strata
+    newTag: local
+patches:
+  # Sized for a laptop that is doing other things too: small caches, and
+  # requests that fit three pods into a couple of hundred megabytes.
+  - path: small.yaml
+secretGenerator:
+  - name: strata-env
+    literals:
+      - STRATA_META=postgres://strata:strata-local@postgres:5432/strata
+      - STRATA_ADMIN_TOKEN=local-admin-token
+      - STRATA_OBJECT_STORE=s3://strata/packs
+      - AWS_ENDPOINT=http://object-store:4566
+      - AWS_ALLOW_HTTP=true
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=strata-local
+      - AWS_SECRET_ACCESS_KEY=strata-local-secret
