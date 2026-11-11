@@ -469,6 +469,52 @@ async fn compaction_preserves_the_repository() {
     assert!(work.exists());
 }
 
+/// Two directories trade contents, in commits that a merge and unordered
+/// dates make the server look at before the commit both contents come from.
+/// Each new tree then shares a file with a tree the server has yet to walk,
+/// and that file must not fall through the gap.
+#[tokio::test(flavor = "multi_thread")]
+async fn files_shared_by_swapped_directories_are_not_lost() {
+    let options = Options { auto_create: true, compact_at: usize::MAX, ..Options::default() };
+    let (base, app) = start_with(options).await;
+    let url = format!("{base}/acme/swap.git");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let (dir, remote) = (root.clone(), url.clone());
+    let head = tokio::task::spawn_blocking(move || {
+        let work = dir.join("work");
+        for (name, version) in [("q", "1"), ("b", "2")] {
+            std::fs::create_dir_all(work.join(name)).unwrap();
+            std::fs::write(work.join(name).join("keep.txt"), "in both\n").unwrap();
+            std::fs::write(work.join(name).join("v.txt"), version).unwrap();
+        }
+        git(&work, &["init", "-q", "-b", "main"]);
+        commit_on(&work, 20, "start");
+        git(&work, &["checkout", "-q", "-b", "side"]);
+        std::fs::write(work.join("z.txt"), "z\n").unwrap();
+        commit_on(&work, 10, "side work");
+        git(&work, &["checkout", "-q", "main"]);
+        std::fs::write(work.join("q/v.txt"), "2").unwrap();
+        commit_on(&work, 3, "q becomes what b is");
+        std::fs::write(work.join("b/v.txt"), "1").unwrap();
+        commit_on(&work, 4, "b becomes what q was");
+        let date = [("GIT_AUTHOR_DATE", "2020-01-11T12:00:00+00:00"), ("GIT_COMMITTER_DATE", "2020-01-11T12:00:00+00:00")];
+        assert!(git_with(&work, &["merge", "-q", "--no-ff", "-m", "merge side", "side"], &date).status.success());
+        git(&work, &["push", "-q", &remote, "main"]);
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        // Walked commit by commit.
+        clone_and_check(&dir, &remote, "walked", &head, "5");
+        head
+    })
+    .await
+    .unwrap();
+
+    compact(&app, "acme/swap", true).await.unwrap().expect("a pack to rewrite");
+    let (dir, remote) = (root.clone(), url.clone());
+    // Served from bitmaps, which were built by the same kind of walk.
+    tokio::task::spawn_blocking(move || clone_and_check(&dir, &remote, "from-bitmaps", &head, "5")).await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pushes_trigger_compaction_in_the_background() {
     let options = Options { auto_create: true, compact_at: 3, gc_grace: Duration::ZERO, ..Options::default() };

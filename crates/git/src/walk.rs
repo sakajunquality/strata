@@ -372,6 +372,13 @@ struct TreeJob {
 /// `mark` records an object as handled and reports whether it was new;
 /// `emit` receives each new object with, where one exists, the object it
 /// replaced at that path (a good delta base).
+///
+/// Jobs are taken from the end of `jobs`, and a known tree is trusted to be
+/// accounted for in full. That holds for trees of commits outside the walk,
+/// and for those of commits inside it only once their own jobs are done: so
+/// the jobs of a commit must come after (be taken before) those of its
+/// children. See [`parents_last`]. Otherwise a tree met first where most of
+/// it is known is marked as handled with entries that nobody has looked at.
 fn diff_trees(
     src: &dyn ObjectSource,
     mut jobs: Vec<TreeJob>,
@@ -432,6 +439,39 @@ fn diff_trees(
         }
     }
     Ok(())
+}
+
+/// Orders commits so that each comes before its parents among them: the
+/// order in which to hand their trees to [`diff_trees`], which works from
+/// the end. Dates do not give this order; they can be anything.
+fn parents_last<'a>(commits: &[Oid], parents: impl Fn(&Oid) -> &'a [Oid]) -> Vec<Oid> {
+    let among: HashSet<Oid> = commits.iter().copied().collect();
+    let mut placed = HashSet::with_capacity(commits.len());
+    let mut order = Vec::with_capacity(commits.len());
+    for start in commits {
+        // Depth first, a commit placed once all its parents are.
+        let mut stack = vec![(*start, 0)];
+        while let Some((oid, next)) = stack.pop() {
+            if next == 0 && placed.contains(&oid) {
+                continue;
+            }
+            match parents(&oid).get(next) {
+                Some(parent) => {
+                    stack.push((oid, next + 1));
+                    if among.contains(parent) && !placed.contains(parent) {
+                        stack.push((*parent, 0));
+                    }
+                }
+                None => {
+                    if placed.insert(oid) {
+                        order.push(oid);
+                    }
+                }
+            }
+        }
+    }
+    order.reverse();
+    order
 }
 
 const QUEUED: u8 = 1;
@@ -686,7 +726,7 @@ pub fn plan_fetch(packs: &PackSet, wants: &[Oid], haves: &[Oid], shallow: &Shall
     objects.extend(commits.iter().map(|oid| (*oid, None)));
 
     let have_trees: Vec<Oid> = have_tips.iter().take(MAX_HAVE_TREES).map(|oid| walk.info[oid].tree).collect();
-    for oid in &commits {
+    for oid in &parents_last(&commits, |oid| &walk.info[oid].parents) {
         let info = &walk.info[oid];
         let known = if shallow.boundary.contains(oid) {
             // The real parents are cut off, so the best guess at what the
@@ -805,8 +845,10 @@ pub fn reachability_bitmaps(src: &dyn ObjectSource, tips: &[Oid], context: &Bitm
         }
 
         let trees: HashMap<Oid, Oid> = fresh.iter().map(|(oid, _, commit)| (*oid, commit.tree)).collect();
+        let by_oid: HashMap<Oid, &(Oid, usize, CommitInfo)> = fresh.iter().map(|entry| (entry.0, entry)).collect();
+        let order = parents_last(&fresh.iter().map(|(oid, _, _)| *oid).collect::<Vec<_>>(), |oid| &by_oid[oid].2.parents);
         let mut jobs = Vec::new();
-        for (_, index, commit) in &fresh {
+        for (_, index, commit) in order.iter().map(|oid| by_oid[oid]) {
             if bits.get(*index) {
                 // Reachable from a commit that already has a bitmap.
                 continue;
