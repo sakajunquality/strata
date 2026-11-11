@@ -247,7 +247,7 @@ The same history pushed in 100 pieces and then compacted takes the same
 - **SHA-256 repositories.**
 - **`object:type` partial clone filters.** `blob:none`, `blob:limit=<n>`, `tree:<n>`, `sparse:oid=<blob>` and combinations of them work.
 - **Pruned objects are gone at once.** There is no window in which a force-pushed-away commit can still be fetched by id after the next full compaction.
-- **Indexing a push keeps about 70 bytes per object in memory**, plus one delta family at a time; the spool file needs local disk the size of the push, and is mapped into memory (the kernel pages it out as needed). Deltas are resolved on one thread.
+- **Indexing a push takes memory in proportion to its objects**: about 170 MiB at its peak for the 412k objects above, for the table of entries, the ids they point at and the delta family being resolved. The spool file needs local disk the size of the push, and is mapped into memory (the kernel pages it out as needed). Deltas are resolved on one thread.
 - **Compaction computes deltas only for files changed since the last full merge**, against their previous version. It does not search for better bases; with packs that come from git, which already hold good deltas, nothing was lost by that in the measurement above.
 - **Walks through all of history are on one thread** (a clone before compaction, a size-limited or sparse clone, compaction itself).
 - **The pre-receive hook sees the commits a push brings, but not their files.** Rules about file sizes or secrets need a way to read a push before it commits.
