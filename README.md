@@ -217,7 +217,27 @@ cargo test --workspace   # includes end-to-end tests driving the real git client
 ./scripts/s3-smoke.sh    # the same through the S3 API, against LocalStack in Docker
 ./scripts/meta-test.sh   # PostgreSQL and the Spanner emulator in Docker: backend tests, then two nodes sharing each
 cargo build --release && FILES=50000 COMMITS=100 ./scripts/bench.sh   # timings and server memory on a synthetic repository
+./scripts/bench-repo.sh /path/to/bare.git master   # the same against a real repository
 ```
+
+Against git's own repository (83k commits, 412k objects, a 301 MiB pack), on
+an Apple M-series laptop with everything on local disk:
+
+| | |
+|---|---|
+| Push of all history | 11 s, of which 9 s is the server's (`git index-pack` takes 15 s on one thread for the same pack) |
+| Full clone before compaction | 12 s (server 4.5 s; the rest is git indexing what it received) |
+| Compaction, with commit-graph and bitmaps | 9 s |
+| Full clone after compaction | 8 s (server 0.4 s) |
+| `clone --depth 1` | 0.6 s |
+| `clone --filter=blob:none` | 3.6 s |
+| `clone --filter=blob:limit=10k` | 8 s |
+| Fetch of 500 new commits | 0.2 s |
+
+The same history pushed in 100 pieces and then compacted takes the same
+271 MB as when pushed at once. Memory follows the caches, which default to
+1 GiB of pack blocks and 256 MiB of objects (`--block-cache-mb`,
+`--object-cache-mb`).
 
 ## Not done
 
@@ -227,8 +247,9 @@ cargo build --release && FILES=50000 COMMITS=100 ./scripts/bench.sh   # timings 
 - **SHA-256 repositories.**
 - **`object:type` partial clone filters.** `blob:none`, `blob:limit=<n>`, `tree:<n>`, `sparse:oid=<blob>` and combinations of them work.
 - **Pruned objects are gone at once.** There is no window in which a force-pushed-away commit can still be fetched by id after the next full compaction.
-- **Indexing a push keeps about 50 bytes per object in memory**, plus one delta family at a time; the spool file needs local disk the size of the push.
-- **Compaction computes deltas only for files changed since the last full merge**, against their previous version. It does not search for better bases.
+- **Indexing a push keeps about 70 bytes per object in memory**, plus one delta family at a time; the spool file needs local disk the size of the push, and is mapped into memory (the kernel pages it out as needed). Deltas are resolved on one thread.
+- **Compaction computes deltas only for files changed since the last full merge**, against their previous version. It does not search for better bases; with packs that come from git, which already hold good deltas, nothing was lost by that in the measurement above.
+- **Walks through all of history are on one thread** (a clone before compaction, a size-limited or sparse clone, compaction itself).
 - **The pre-receive hook sees the commits a push brings, but not their files.** Rules about file sizes or secrets need a way to read a push before it commits.
 - **The event feed covers pushes only.** Repositories created, deleted or compacted are the application's own actions and are not echoed back.
 - **TLS, rate limiting, and quotas.** `GET /api/repos/<id>` reports the bytes a repository holds; nothing enforces a limit.
