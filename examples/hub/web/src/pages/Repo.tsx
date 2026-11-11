@@ -1,5 +1,5 @@
 import { LockOutlined } from "@ant-design/icons";
-import { Menu, Select, Table, Tag, Typography } from "antd";
+import { Badge, Menu, Select, Table, Tag, Typography } from "antd";
 import { Link, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
 import { api, useLoad, type Activity, type RepoDetail } from "../api";
 import { ActivityList } from "../RepoList";
@@ -7,6 +7,7 @@ import { useSession } from "../session";
 import { Loaded, shortOid, urlPath } from "../util";
 import { BlobPage, CodePage } from "./Code";
 import { CommitPage, CommitsPage } from "./History";
+import { NewPullPage, PullPage, PullsPage } from "./Pulls";
 import { RepoSettings } from "./RepoSettings";
 
 /** What the pages of one repository share. */
@@ -55,6 +56,11 @@ function Branches({ repo, root }: RepoContext) {
           ),
         },
         { dataIndex: "oid", align: "right", render: (oid: string) => <Link to={`${root}/commit/${oid}`} className="mono">{shortOid(oid)}</Link> },
+        {
+          key: "pull",
+          align: "right",
+          render: (_, named) => names === repo.branches && named.name !== repo.defaultBranch && !repo.empty && <Link to={`${root}/pulls/new?head=${encodeURIComponent(named.name)}`}>New pull request</Link>,
+        },
         { key: "history", align: "right", width: 100, render: (_, named) => <Link to={`${root}/commits/${urlPath(named.name)}`}>History</Link> },
       ]}
     />
@@ -83,7 +89,7 @@ export function Repo() {
   const detail = useLoad(() => api<RepoDetail>(base), `repo:${base}:${me?.user?.name}`);
   const root = `/${owner}/${name}`;
   const section = location.pathname.slice(root.length + 1).split("/")[0];
-  const tab = { "": "code", tree: "code", blob: "code", commits: "commits", commit: "commits", branches: "branches", activity: "activity", settings: "settings" }[section] ?? "code";
+  const tab = { "": "code", tree: "code", blob: "code", commits: "commits", commit: "commits", branches: "branches", pulls: "pulls", activity: "activity", settings: "settings" }[section] ?? "code";
 
   return (
     <Loaded from={detail}>
@@ -105,6 +111,7 @@ export function Repo() {
               items={[
                 { key: "code", label: <Link to={root}>Code</Link> },
                 { key: "commits", label: <Link to={`${root}/commits`}>Commits</Link> },
+                { key: "pulls", label: <Link to={`${root}/pulls`}>Pull requests{repo.openPulls > 0 && <Badge count={repo.openPulls} color="#8c8c8c" className="tab-count" />}</Link> },
                 { key: "branches", label: <Link to={`${root}/branches`}>Branches</Link> },
                 { key: "activity", label: <Link to={`${root}/activity`}>Activity</Link> },
                 ...(repo.permission === "admin" ? [{ key: "settings", label: <Link to={`${root}/settings`}>Settings</Link> }] : []),
@@ -116,6 +123,9 @@ export function Repo() {
               <Route path="blob/*" element={<BlobPage {...context} />} />
               <Route path="commits/*" element={<CommitsPage {...context} />} />
               <Route path="commit/:oid" element={<CommitPage {...context} />} />
+              <Route path="pulls" element={<PullsPage {...context} />} />
+              <Route path="pulls/new" element={<NewPullPage {...context} />} />
+              <Route path="pulls/:number" element={<PullPage {...context} />} />
               <Route path="branches" element={<Branches {...context} />} />
               <Route path="activity" element={<RepoActivity {...context} />} />
               <Route path="settings" element={<RepoSettings {...context} />} />

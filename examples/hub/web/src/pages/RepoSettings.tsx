@@ -48,11 +48,14 @@ export function RepoSettings({ repo, base, reload }: RepoContext) {
       </Card>
 
       <Card title="Default branch" className="stack">
-        <Form layout="vertical" onFinish={save} initialValues={{ defaultBranch: repo.empty ? undefined : repo.defaultBranch, protectDefault: repo.protectDefault }}>
+        <Form layout="vertical" onFinish={save} initialValues={{ defaultBranch: repo.empty ? undefined : repo.defaultBranch, protectDefault: repo.protectDefault, requirePulls: repo.requirePulls }}>
           <Form.Item name="defaultBranch" label="Branch" extra="What a clone checks out, and what the Code tab shows first.">
             <Select disabled={repo.branches.length === 0} placeholder="No branches yet" options={repo.branches.map(({ name }) => ({ value: name, label: name }))} />
           </Form.Item>
           <Form.Item name="protectDefault" label="Protect it" valuePropName="checked" extra="Refuses force pushes to the default branch, and its deletion.">
+            <Switch />
+          </Form.Item>
+          <Form.Item name="requirePulls" label="Require pull requests" valuePropName="checked" extra="Refuses pushes straight to the default branch. Changes arrive by merging pull requests.">
             <Switch />
           </Form.Item>
           <Button type="primary" htmlType="submit">Save</Button>

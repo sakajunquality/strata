@@ -4,14 +4,13 @@ import { Hono, type Context } from "hono";
 import { csrf } from "hono/csrf";
 import { HTTPException } from "hono/http-exception";
 import { checkPassword, createToken, endSession, sessionUser, startSession } from "./auth";
+import { fail, REPO, signedIn, text, type Env } from "./common";
 import { config } from "./config";
-import { canRead, db, now, ownerByName, permission, REPO_COLUMNS, repoByPath, roleIn, type Owner, type Permission, type Repo } from "./db";
+import { canRead, db, now, ownerByName, permission, REPO_COLUMNS, repoByPath, roleIn, type Owner, type Repo } from "./db";
+import { addPullRoutes, openPullCount } from "./pulls";
 import { strata, StrataError } from "./strata";
 
-type Env = { Variables: { user: Owner | null; repo: Repo; level: Permission } };
 export const api = new Hono<Env>();
-
-const fail = (status: 400 | 401 | 403 | 404 | 409, message: string) => new HTTPException(status, { message });
 
 // Names that would collide with the UI's own routes.
 const RESERVED = new Set(["api", "hooks", "assets", "login", "signup", "new", "settings", "explore", "orgs"]);
@@ -31,8 +30,6 @@ function repoName(raw: unknown): string {
   return name;
 }
 
-const text = (raw: unknown, max: number) => String(raw ?? "").trim().slice(0, max);
-
 api.use("*", csrf());
 api.use("*", async (c, next) => {
   c.set("user", sessionUser(c));
@@ -45,12 +42,6 @@ api.onError((error, c) => {
   console.error(error);
   return c.json({ error: "something went wrong" }, 500);
 });
-
-function signedIn(c: Context<Env>): Owner {
-  const user = c.get("user");
-  if (!user) throw fail(401, "sign in to continue");
-  return user;
-}
 
 const orgsOf = (userId: number) =>
   db
@@ -220,8 +211,6 @@ api.post("/repos", async (c) => {
   return c.json({ owner: owner.name, name }, 201);
 });
 
-const REPO = "/repos/:owner/:name";
-
 api.use(`${REPO}/*`, async (c, next) => {
   const found = repoByPath(c.req.param("owner") ?? "", c.req.param("name") ?? "");
   const level = found ? permission(found, c.get("user")?.id ?? null) : "none";
@@ -243,6 +232,8 @@ api.get(REPO, async (c) => {
     ...repoSummary(found),
     ownerKind: found.owner_kind,
     protectDefault: !!found.protect_default,
+    requirePulls: !!found.require_pulls,
+    openPulls: openPullCount(found.id),
     permission: c.get("level"),
     cloneUrl: `${config.strataPublicUrl}/${found.owner_name}/${found.name}.git`,
     defaultBranch: short(head),
@@ -266,11 +257,12 @@ api.patch(REPO, async (c) => {
     if (other && other.id !== found.id) throw fail(409, `${found.owner_name}/${name} already exists`);
   }
   // A rename happens here and nowhere else: Strata keeps serving the same id.
-  db.run("UPDATE repos SET name = ?, description = ?, private = ?, protect_default = ? WHERE id = ?", [
+  db.run("UPDATE repos SET name = ?, description = ?, private = ?, protect_default = ?, require_pulls = ? WHERE id = ?", [
     name,
     body.description === undefined ? found.description : text(body.description, 300),
     body.private === undefined ? found.private : body.private ? 1 : 0,
     body.protectDefault === undefined ? found.protect_default : body.protectDefault ? 1 : 0,
+    body.requirePulls === undefined ? found.require_pulls : body.requirePulls ? 1 : 0,
     found.id,
   ]);
   return c.json({ owner: found.owner_name, name });
@@ -317,4 +309,4 @@ api.get(`${REPO}/activity`, (c) => {
   return c.json({ activity: rows.map(activityJson) });
 });
 
-
+addPullRoutes(api);

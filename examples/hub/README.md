@@ -45,10 +45,11 @@ and Strata with `--authz-url http://<hub>/hooks/authz --pre-receive-url http://<
 | The hub does | through Strata's |
 |---|---|
 | Decides who may fetch and push, and maps `owner/name` to a repository id (`server/hooks.ts`) | authorization hook |
-| Protects the default branch from force pushes and deletion (`server/hooks.ts`) | pre-receive hook |
-| Records pushes as activity; picks a default branch on a first push (`server/events.ts`) | event feed |
+| Protects the default branch from force pushes and deletion, or from any push that is not a merged pull request (`server/hooks.ts`) | pre-receive hook |
+| Records pushes as activity; picks a default branch on a first push; closes pull requests whose branch went and marks those merged by a push (`server/events.ts`, `server/pulls.ts`) | event feed |
 | Creates and deletes repositories, sets the default branch (`server/api.ts`) | management API |
 | Shows files, history and what a commit changed (`server/api.ts`, `web/`) | content API |
+| Shows what a pull request holds and whether it merges, and merges it (`server/pulls.ts`) | compare and merge |
 
 Strata knows a repository as `r-<uuid>`. Renaming one, or changing who may
 see it, is a row updated in the hub's database and nothing else.
@@ -57,10 +58,14 @@ see it, is a row updated in the hub's database and nothing else.
 
 It is an example, not a product:
 
-- No issues, pull requests, forks, search, webhooks or email.
+- No issues, forks, search, webhooks or email.
+- Pull requests are between branches of one repository, with a conversation
+  and a merge button (merge commit or squash). No reviews or approvals, no
+  comments on lines, no rebase, and conflicts are settled on your machine.
+  Merged branches are not deleted for you.
 - Permissions are per owner: a user's repositories are theirs alone, and an
   organization's members can push to all of its repositories.
 - No sign-in rate limiting, password reset or two-factor authentication.
-- File history, blame and comparing branches are not there; diffs are
+- File history and blame are not there; diffs are
   computed in the browser and skip large and binary files.
 - The directory listing shows the branch's latest commit, not each entry's.

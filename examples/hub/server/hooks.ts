@@ -36,9 +36,13 @@ hooks.post("/pre-receive", async (c) => {
   const { repo: id, updates } = await c.req.json<{ repo: string; actor?: string; updates: { ref: string; change: string }[] }>();
   const repo = repoById(id);
   if (!repo) return c.json({ allow: false, message: "repository not found" });
-  if (repo.protect_default) {
+  if (repo.protect_default || repo.require_pulls) {
     const { head } = await strata.refs(id);
-    const broken = updates.find((update) => update.ref === head && (update.change === "forced" || update.change === "delete"));
+    // Merging a pull request is the hub's own doing and does not come through here.
+    if (repo.require_pulls && updates.some((update) => update.ref === head && update.change !== "create")) {
+      return c.json({ allow: false, message: `${head.replace("refs/heads/", "")} only takes changes through pull requests` });
+    }
+    const broken = repo.protect_default && updates.find((update) => update.ref === head && (update.change === "forced" || update.change === "delete"));
     if (broken) {
       const what = broken.change === "delete" ? "cannot be deleted" : "does not accept force pushes";
       return c.json({ allow: false, message: `${head.replace("refs/heads/", "")} is protected and ${what}` });

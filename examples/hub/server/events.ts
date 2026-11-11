@@ -1,6 +1,8 @@
-// Follows Strata's event feed: records pushes as activity and gives a
-// repository a default branch when its first branch arrives.
+// Follows Strata's event feed: records pushes as activity, keeps pull
+// requests in step with their branches and gives a repository a default
+// branch when its first branch arrives.
 import { db, repoById } from "./db";
+import { followPush } from "./pulls";
 import { strata, type StrataEvent } from "./strata";
 
 const CURSOR = "events_cursor";
@@ -12,6 +14,7 @@ async function record(event: StrataEvent) {
   const updates = event.event.updates ?? [];
   db.run("INSERT INTO activity (repo_id, actor, time, updates) VALUES (?, ?, ?, ?)", [repo.id, event.event.actor ?? null, event.time, JSON.stringify(updates)]);
   db.run("UPDATE repos SET pushed_at = ? WHERE id = ?", [event.time, repo.id]);
+  await followPush(repo, updates);
 
   // HEAD names "main" until told otherwise. If that branch is not there but
   // another is (a first push of "master", say), make the other the default.

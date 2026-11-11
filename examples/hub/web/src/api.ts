@@ -53,6 +53,8 @@ export type Named = { name: string; oid: string };
 export type RepoDetail = RepoSummary & {
   ownerKind: "user" | "org";
   protectDefault: boolean;
+  requirePulls: boolean;
+  openPulls: number;
   permission: "read" | "write" | "admin";
   cloneUrl: string;
   defaultBranch: string;
@@ -66,6 +68,30 @@ export type Commit = { oid: string; parents: string[]; tree: string; message: st
 export type Side = { oid: string; mode: string } | null;
 export type FileChange = { path: string; status: "added" | "deleted" | "modified"; old: Side; new: Side };
 export type CommitDetail = Commit & { files: FileChange[]; truncated: boolean };
+export type Compare = { base: string; head: string; merge_base: string | null; ahead: number; behind: number; commits: Commit[]; files: FileChange[]; truncated: boolean };
+export type Pull = {
+  number: number;
+  title: string;
+  body: string;
+  author: string;
+  base: string;
+  head: string;
+  state: "open" | "closed" | "merged";
+  createdAt: number;
+  closedAt: number | null;
+  closedBy: string | null;
+  mergeOid: string | null;
+  comments: number;
+};
+export type PullDetail = Pull & {
+  discussion: { id: number; body: string; createdAt: number; author: string }[];
+  /** What it holds; null if its branches or commits are gone. */
+  compare: Compare | null;
+  /** Null when there is nothing to ask: it is not open, or has nothing to merge. */
+  mergeable: boolean | null;
+  conflicts: string[];
+  can: { change: boolean; merge: boolean };
+};
 export type TreeEntry = { name: string; mode: string; type: "tree" | "blob" | "commit"; oid: string };
 export type Tree = { commit: string; path: string; entries: TreeEntry[] };
 export type Update = { ref: string; old: string | null; new: string | null; change: string };

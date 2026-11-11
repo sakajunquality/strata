@@ -42,6 +42,18 @@ export type StrataEvent = {
   event: { type?: string; actor?: string | null; updates?: { ref: string; old: string | null; new: string | null; change: string }[] } | null;
 };
 
+export type Compare = { base: string; head: string; merge_base: string | null; ahead: number; behind: number; commits: unknown[]; files: unknown[]; truncated: boolean };
+export type MergeRequest = {
+  base: string;
+  head: string;
+  expect_head?: string;
+  method?: "merge" | "squash";
+  message?: string;
+  author?: { name: string; email: string };
+  actor?: string;
+};
+type Merged = { base: string; head: string; merge_base: string | null; ahead: number };
+
 const repo = (id: string) => `/api/repos/${id}`;
 
 export const strata = {
@@ -54,6 +66,11 @@ export const strata = {
   commit: async (id: string, rev: string) => (await call("GET", `${repo(id)}/commit${query({ rev })}`)).json(),
   tree: async (id: string, rev: string, path: string) => (await call("GET", `${repo(id)}/tree${query({ rev, path })}`)).json(),
   blob: (id: string, params: { rev?: string; path?: string; oid?: string }) => call("GET", `${repo(id)}/blob${query(params)}`),
+  compare: async (id: string, base: string, head: string) => (await call("GET", `${repo(id)}/compare${query({ base, head })}`)).json() as Promise<Compare>,
+  /** Whether a merge would work, without doing it. */
+  mergeable: async (id: string, base: string, head: string) =>
+    (await call("POST", `${repo(id)}/merge`, JSON.stringify({ base, head, dry_run: true }))).json() as Promise<Merged & { mergeable: boolean; conflicts: string[] }>,
+  merge: async (id: string, request: MergeRequest) => (await call("POST", `${repo(id)}/merge`, JSON.stringify(request))).json() as Promise<Merged & { oid: string }>,
   events: async (after: string | null) =>
     (await call("GET", `/api/events${query({ after: after ?? undefined, limit: 200 })}`)).json() as Promise<{ events: StrataEvent[]; next: string | null }>,
 };

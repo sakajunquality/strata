@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS repos (
   description TEXT NOT NULL DEFAULT '',
   private INTEGER NOT NULL DEFAULT 0,
   protect_default INTEGER NOT NULL DEFAULT 0,
+  require_pulls INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   pushed_at INTEGER,
   UNIQUE (owner_id, name)
@@ -56,7 +57,38 @@ CREATE TABLE IF NOT EXISTS activity (
 );
 CREATE INDEX IF NOT EXISTS activity_by_repo ON activity (repo_id, id);
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS pulls (
+  id INTEGER PRIMARY KEY,
+  repo_id TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+  number INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL DEFAULT '',
+  author_id INTEGER NOT NULL REFERENCES owners(id),
+  base TEXT NOT NULL,
+  head TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'closed', 'merged')),
+  created_at INTEGER NOT NULL,
+  closed_at INTEGER,
+  closed_by INTEGER REFERENCES owners(id),
+  -- Set when it stops being open: what it was comparing then, since the branches move on or go.
+  base_oid TEXT,
+  head_oid TEXT,
+  merge_oid TEXT,
+  UNIQUE (repo_id, number)
+);
+CREATE TABLE IF NOT EXISTS comments (
+  id INTEGER PRIMARY KEY,
+  pull_id INTEGER NOT NULL REFERENCES pulls(id) ON DELETE CASCADE,
+  author_id INTEGER NOT NULL REFERENCES owners(id),
+  body TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS comments_by_pull ON comments (pull_id, id);
 `);
+// Databases made before pull requests existed.
+if (!db.query<{ name: string }, []>("PRAGMA table_info(repos)").all().some((column) => column.name === "require_pulls")) {
+  db.exec("ALTER TABLE repos ADD COLUMN require_pulls INTEGER NOT NULL DEFAULT 0");
+}
 
 export const now = () => Math.floor(Date.now() / 1000);
 
@@ -68,6 +100,7 @@ export type Repo = {
   description: string;
   private: number;
   protect_default: number;
+  require_pulls: number;
   created_at: number;
   pushed_at: number | null;
   owner_name: string;

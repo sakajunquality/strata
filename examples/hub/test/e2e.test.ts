@@ -229,6 +229,133 @@ test("a small code host, end to end", async () => {
   expect((await alice("GET", "/me")).data.user).toBeNull();
 }, 60_000);
 
+test("pull requests", async () => {
+  const [carol, dave, anyone] = [browser(), browser(), browser()];
+  await carol("POST", "/signup", { username: "carol", password: "carols password", displayName: "Carol C" });
+  await dave("POST", "/signup", { username: "dave", password: "daves password" });
+  expect((await carol("POST", "/repos", { name: "site" })).status).toBe(201);
+  const origin = remote("carol:carols%20password", "carol/site");
+  const lines = (changed: Record<number, string>) => Array.from({ length: 10 }, (_, i) => changed[i + 1] ?? String(i + 1)).join("\n") + "\n";
+  const work = join(tmp, "site");
+  git(tmp, "init", "-q", "-b", "main", work);
+  const commit = (file: string, content: string, message: string) => {
+    writeFileSync(join(work, file), content);
+    git(work, "add", ".");
+    git(work, "commit", "-q", "-m", message);
+    return git(work, "rev-parse", "HEAD").out;
+  };
+  commit("a.txt", lines({}), "Start");
+  git(work, "checkout", "-q", "-b", "feature");
+  const feature = commit("a.txt", lines({ 2: "two" }), "Spell out two");
+  expect(git(work, "push", "-q", origin, "main", "feature").err).toBe("");
+  const pulls = "/repos/carol/site/pulls";
+  const state = async (number: number) => (await carol("GET", `${pulls}/${number}`)).data.state;
+
+  // Proposing: anyone signed in who can see the repository.
+  const compared = (await anyone("GET", "/repos/carol/site/compare?base=main&head=feature")).data;
+  expect(compared).toMatchObject({ ahead: 1, behind: 0, existing: null, head: feature });
+  expect(compared.files.map((file: any) => file.path)).toEqual(["a.txt"]);
+  expect((await anyone("POST", pulls, { title: "Feature", base: "main", head: "feature" })).status).toBe(401);
+  expect((await dave("POST", pulls, { title: "", base: "main", head: "feature" })).status).toBe(400);
+  expect((await dave("POST", pulls, { title: "Same", base: "main", head: "main" })).status).toBe(400);
+  expect((await dave("POST", pulls, { title: "Missing", base: "main", head: "nope" })).status).toBe(404);
+  expect((await dave("POST", pulls, { title: "Backwards", base: "feature", head: "main" })).status).toBe(409);
+  expect((await dave("POST", pulls, { title: "Feature", body: "Please **merge**.", base: "main", head: "feature" })).data).toEqual({ number: 1 });
+  expect((await carol("POST", pulls, { title: "Again", base: "main", head: "feature" })).status).toBe(409);
+  expect((await anyone("GET", pulls)).data).toMatchObject({ open: 1, closed: 0, pulls: [{ number: 1, title: "Feature", author: "dave", state: "open" }] });
+  expect((await anyone("GET", "/repos/carol/site")).data.openPulls).toBe(1);
+
+  let pull = (await dave("GET", `${pulls}/1`)).data;
+  expect(pull).toMatchObject({ mergeable: true, conflicts: [], can: { change: true, merge: false }, compare: { ahead: 1 } });
+  expect((await anyone("GET", `${pulls}/1`)).data.can).toEqual({ change: false, merge: false });
+  expect((await anyone("POST", `${pulls}/1/comments`, { body: "hello" })).status).toBe(401);
+  expect((await dave("POST", `${pulls}/1/comments`, { body: "  " })).status).toBe(400);
+  expect((await dave("POST", `${pulls}/1/comments`, { body: "Ready when you are." })).status).toBe(201);
+  expect((await dave("PATCH", `${pulls}/1`, { title: "Spell out two" })).status).toBe(200);
+  expect((await dave("POST", `${pulls}/1/merge`, {})).status).toBe(403);
+
+  // The base moves under it, onto the same line.
+  git(work, "checkout", "-q", "main");
+  commit("a.txt", lines({ 2: "zwei" }), "Zwei");
+  git(work, "push", "-q", origin, "main");
+  pull = (await carol("GET", `${pulls}/1`)).data;
+  expect(pull).toMatchObject({ title: "Spell out two", mergeable: false, conflicts: ["a.txt"], compare: { ahead: 1, behind: 1 } });
+  expect(pull.discussion).toMatchObject([{ author: "dave", body: "Ready when you are." }]);
+  const refused = await carol("POST", `${pulls}/1/merge`, {});
+  expect(refused.status).toBe(409);
+  expect(refused.data.error).toBe("conflicting changes in a.txt");
+  // Settled the usual way: merge the base into the branch, and push.
+  git(work, "checkout", "-q", "feature");
+  git(work, "merge", "-q", "main");
+  const settled = commit("a.txt", lines({ 2: "two (zwei)" }), "Settle it");
+  git(work, "push", "-q", origin, "feature");
+  expect((await carol("GET", `${pulls}/1`)).data).toMatchObject({ mergeable: true, compare: { head: settled, behind: 0 } });
+
+  // With pull requests required, the default branch takes nothing else.
+  expect((await carol("PATCH", "/repos/carol/site", { requirePulls: true })).status).toBe(200);
+  git(work, "checkout", "-q", "main");
+  commit("direct.txt", "direct\n", "Straight to main");
+  expect(git(work, "push", "-q", origin, "main").err).toContain("main only takes changes through pull requests");
+  git(work, "reset", "-q", "--hard", "HEAD~1");
+  expect((await carol("POST", `${pulls}/1/merge`, { head: feature })).status).toBe(409);
+  const merged = await carol("POST", `${pulls}/1/merge`, { head: settled });
+  expect(merged.status).toBe(200);
+  git(work, "pull", "-q", origin, "main");
+  expect(git(work, "rev-parse", "HEAD").out).toBe(merged.data.oid);
+  expect(git(work, "log", "-1", "--format=%an|%s|%p").out).toMatch(/^Carol C\|Merge pull request #1 from feature\|\w+ \w+$/);
+  expect(await Bun.file(join(work, "a.txt")).text()).toBe(lines({ 2: "two (zwei)" }));
+  pull = (await anyone("GET", `${pulls}/1`)).data;
+  expect(pull).toMatchObject({ state: "merged", closedBy: "carol", mergeOid: merged.data.oid, mergeable: null });
+  // Still shown as it was: against where it left the base, not the base as it is now.
+  expect(pull.compare.files.map((file: any) => file.path)).toEqual(["a.txt"]);
+  expect((await carol("POST", `${pulls}/1/merge`, {})).status).toBe(409);
+  expect((await carol("PATCH", `${pulls}/1`, { state: "open" })).status).toBe(409);
+  const activity = await eventually(async () => {
+    const { data } = await carol("GET", "/repos/carol/site/activity");
+    return data.activity[0]?.updates[0].new === merged.data.oid && data.activity;
+  });
+  expect(activity[0]).toMatchObject({ actor: "carol", updates: [{ ref: "refs/heads/main", change: "fast-forward" }] });
+
+  // Closing, reopening, and squashing.
+  git(work, "checkout", "-q", "-b", "second");
+  commit("b.txt", "b\n", "Add b");
+  commit("c.txt", "c\n", "Add c");
+  git(work, "push", "-q", origin, "second");
+  expect((await carol("POST", pulls, { title: "Second", body: "Two files.", base: "main", head: "second" })).data).toEqual({ number: 2 });
+  expect((await dave("PATCH", `${pulls}/2`, { state: "closed" })).status).toBe(403);
+  expect((await carol("PATCH", `${pulls}/2`, { state: "closed" })).status).toBe(200);
+  expect((await carol("GET", `${pulls}/2`)).data).toMatchObject({ state: "closed", closedBy: "carol", compare: { ahead: 2 } });
+  expect((await anyone("GET", `${pulls}?state=closed`)).data.pulls.map((p: any) => [p.number, p.state])).toEqual([[2, "closed"], [1, "merged"]]);
+  expect((await carol("PATCH", `${pulls}/2`, { state: "open" })).status).toBe(200);
+  expect((await carol("POST", `${pulls}/2/merge`, { method: "squash" })).status).toBe(200);
+  git(work, "fetch", "-q", origin, "main");
+  expect(git(work, "log", "-1", "--format=%s|%p|%b", "FETCH_HEAD").out).toMatch(/^Second \(#2\)\|\w+\|Two files\.$/);
+  expect(git(work, "diff", "--stat", "FETCH_HEAD", "second").out).toBe("");
+
+  // Merged by hand and pushed: the hub notices.
+  expect((await carol("PATCH", "/repos/carol/site", { requirePulls: false })).status).toBe(200);
+  git(work, "checkout", "-q", "-B", "main", "FETCH_HEAD");
+  git(work, "checkout", "-q", "-b", "third");
+  const third = commit("d.txt", "d\n", "Add d");
+  git(work, "checkout", "-q", "-b", "fourth", "main");
+  commit("e.txt", "e\n", "Add e");
+  git(work, "push", "-q", origin, "third", "fourth");
+  expect((await dave("POST", pulls, { title: "Third", base: "main", head: "third" })).data).toEqual({ number: 3 });
+  expect((await dave("POST", pulls, { title: "Fourth", base: "main", head: "fourth" })).data).toEqual({ number: 4 });
+  git(work, "checkout", "-q", "main");
+  git(work, "merge", "-q", "--ff-only", "third");
+  expect(git(work, "push", "-q", origin, "main").err).toBe("");
+  await eventually(async () => (await state(3)) === "merged");
+  expect((await carol("GET", `${pulls}/3`)).data).toMatchObject({ closedBy: null, mergeOid: third, compare: { ahead: 1, head: third } });
+  // A branch deleted takes its pull request with it.
+  expect(git(work, "push", "-q", origin, ":fourth").err).toBe("");
+  await eventually(async () => (await state(4)) === "closed");
+  expect((await carol("GET", `${pulls}/4`)).data.compare).toMatchObject({ ahead: 1 });
+  expect((await carol("PATCH", `${pulls}/4`, { state: "open" })).status).toBe(404);
+  expect((await anyone("GET", pulls)).data).toMatchObject({ open: 0, closed: 4 });
+  expect((await anyone("GET", `${pulls}/9`)).status).toBe(404);
+}, 60_000);
+
 test("other sites cannot act for a signed-in user", async () => {
   const response = await fetch(`${hub}/api/logout`, { method: "POST", headers: { origin: "https://evil.example", "content-type": "text/plain" }, body: "x" });
   expect(response.status).toBe(403);

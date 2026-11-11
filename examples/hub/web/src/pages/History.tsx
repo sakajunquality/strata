@@ -7,6 +7,26 @@ import { loadBlob } from "../blob";
 import { Loaded, shortOid, splitRev, subject, urlPath, When } from "../util";
 import { RevSelect, type RepoContext } from "./Repo";
 
+export function CommitRows({ root, commits }: { root: string; commits: Commit[] }) {
+  return (
+    <ul className="rows boxed">
+      {commits.map((commit) => (
+        <li key={commit.oid} className="commit-row">
+          <div className="ellipsis">
+            <Link to={`${root}/commit/${commit.oid}`} className="plain"><strong>{subject(commit.message)}</strong></Link>
+            <div className="muted small">{commit.author?.name} committed <When time={commit.committer?.time} /></div>
+          </div>
+          <Space>
+            <Link to={`${root}/commit/${commit.oid}`} className="mono">{shortOid(commit.oid)}</Link>
+            <Link to={`${root}/tree/${commit.oid}`}>Browse</Link>
+          </Space>
+        </li>
+      ))}
+      {commits.length === 0 && <li className="muted">No commits</li>}
+    </ul>
+  );
+}
+
 export function CommitsPage({ repo, root, base }: RepoContext) {
   const rest = useParams()["*"] ?? "";
   const [params] = useSearchParams();
@@ -25,21 +45,7 @@ export function CommitsPage({ repo, root, base }: RepoContext) {
       <Loaded from={page}>
         {(data) => (
           <>
-            <ul className="rows boxed">
-              {data.commits.map((commit) => (
-                <li key={commit.oid} className="commit-row">
-                  <div className="ellipsis">
-                    <Link to={`${root}/commit/${commit.oid}`} className="plain"><strong>{subject(commit.message)}</strong></Link>
-                    <div className="muted small">{commit.author?.name} committed <When time={commit.committer?.time} /></div>
-                  </div>
-                  <Space>
-                    <Link to={`${root}/commit/${commit.oid}`} className="mono">{shortOid(commit.oid)}</Link>
-                    <Link to={`${root}/tree/${commit.oid}`}>Browse</Link>
-                  </Space>
-                </li>
-              ))}
-              {data.commits.length === 0 && <li className="muted">No commits</li>}
-            </ul>
+            <CommitRows root={root} commits={data.commits} />
             <Space className="stack">
               {skip > 0 && <Link to={`${here}${query({ skip: Math.max(0, skip - 30) || undefined })}`}><Button>Newer</Button></Link>}
               {data.next !== null && <Link to={`${here}?skip=${data.next}`}><Button>Older</Button></Link>}
@@ -106,7 +112,7 @@ function Diff({ base, file }: { base: string; file: FileChange }) {
 
 const COLORS = { added: "green", deleted: "red", modified: "gold" } as const;
 
-function FileCard({ base, root, commit, file, open }: { base: string; root: string; commit: string; file: FileChange; open: boolean }) {
+export function FileCard({ base, root, commit, file, open }: { base: string; root: string; commit: string; file: FileChange; open: boolean }) {
   const [shown, setShown] = useState(open);
   const submodule = (file.new ?? file.old)!.mode === "160000";
   return (
