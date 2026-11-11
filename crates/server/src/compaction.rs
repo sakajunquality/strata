@@ -107,7 +107,7 @@ async fn compact_leased(app: &App, name: &str, full: bool) -> anyhow::Result<Opt
     let (compacted, pruned) = tokio::task::spawn_blocking(move || -> anyhow::Result<(Compacted, bool)> {
         // What the refs reach, found the same way a clone of every ref would be.
         let reachable = if try_prune {
-            match walk::plan_fetch(&sources, &tips, &[], &ShallowPlan::default(), &Filter::None) {
+            match walk::plan_fetch(&sources, &tips, &[], &ShallowPlan::default(), &Filter::default()) {
                 Ok(plan) => Some(plan),
                 Err(e) => {
                     // A ref without its history: nothing safe to conclude, so keep everything.

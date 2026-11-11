@@ -189,6 +189,10 @@ async fn fetch(app: &App, repo: &RepoState, args: &[&[u8]]) -> Result<Body, Http
 
     let packs = app.packs.open(&repo.pool_id, &repo.packs).await?;
     let repo_name = repo.name.clone();
+    let (fetch, packs) = match load_sparse(repo, packs, fetch).await? {
+        Ok(loaded) => loaded,
+        Err(name) => return Ok(error_response(&format!("filter 'sparse:oid={name}' does not name a file of patterns")).into()),
+    };
 
     // The response is produced on a blocking thread and streamed through a
     // bounded channel, so a slow client holds back the producer instead of
@@ -230,6 +234,37 @@ impl Write for ChannelWriter {
         let chunk = Bytes::from(std::mem::replace(&mut self.buf, Vec::with_capacity(CHANNEL_CHUNK)));
         self.tx.blocking_send(Ok(chunk)).map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client disconnected"))
     }
+}
+
+/// A file of sparse-checkout patterns larger than this is refused.
+const MAX_SPARSE_FILE: usize = 1 << 20;
+
+/// Reads the pattern files a `sparse:oid=` filter names: a blob by id, or
+/// `<revision>:<path>`. Hands back the name that could not be read, if any.
+async fn load_sparse(repo: &RepoState, packs: PackSet, mut fetch: Fetch) -> Result<Result<(Fetch, PackSet), String>, HttpError> {
+    if fetch.filter.sparse_names().is_empty() {
+        return Ok(Ok((fetch, packs)));
+    }
+    let repo = repo.clone();
+    crate::blocking(move || {
+        let mut contents = Vec::new();
+        for name in fetch.filter.sparse_names() {
+            let oid = match name.split_once(':') {
+                None => Oid::from_hex(name).filter(|_| name.len() == 40),
+                Some((rev, path)) => (|| {
+                    let commit = packs.commit(&crate::content::resolve(&repo, &packs, rev).ok()?).ok()??;
+                    Some(crate::content::find(&packs, &commit, path).ok()??.1)
+                })(),
+            };
+            match oid.and_then(|oid| packs.get(&oid).ok().flatten()) {
+                Some(object) if object.kind == strata_git::ObjectKind::Blob && object.data.len() <= MAX_SPARSE_FILE => contents.push(object.data),
+                _ => return Err(name.clone()),
+            }
+        }
+        fetch.filter.load_sparse(&contents);
+        Ok((fetch, packs))
+    })
+    .await
 }
 
 fn io_error(e: std::io::Error) -> Error {
@@ -322,7 +357,7 @@ fn write_pack(packs: &PackSet, fetch: &Fetch, common: &[Oid], shallow: &ShallowP
     let walked: HashSet<Oid> = plan.objects.iter().map(|(oid, _)| *oid).collect();
     let in_pack = |oid: &Oid| walked.contains(oid) || plan.in_bitmaps(oid);
     // A partial clone may have left out the very object a delta would build on.
-    let thin = fetch.thin && fetch.filter == Filter::None;
+    let thin = fetch.thin && fetch.filter.is_none();
 
     let mut writer = PackWriter::new(out, count)?;
     for (oid, delta_base) in &plan.objects {
@@ -456,6 +491,7 @@ pub(crate) async fn handle_v0(app: &App, repo: RepoState, body: Bytes) -> Result
 
     let packs = app.packs.open(&repo.pool_id, &repo.packs).await?;
     let repo_name = repo.name.clone();
+    let (fetch, packs) = load_sparse(&repo, packs, fetch).await?.map_err(|_| HttpError::bad_request("the sparse filter does not name a file of patterns"))?;
     let (tx, rx) = mpsc::channel(4);
     tokio::task::spawn_blocking(move || {
         let mut out = ChannelWriter { tx, buf: Vec::with_capacity(CHANNEL_CHUNK) };

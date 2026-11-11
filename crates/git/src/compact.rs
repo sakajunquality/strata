@@ -392,25 +392,25 @@ mod tests {
         let fetch = |wants: &[Oid], haves: &[Oid], filter: Filter| plan_fetch(&merged, wants, haves, &none, &filter).unwrap();
 
         // A clone is answered entirely from the tip's bitmap.
-        let clone = fetch(&[history.commits[2]], &[], Filter::None);
+        let clone = fetch(&[history.commits[2]], &[], Filter::default());
         assert!(clone.objects.is_empty());
         assert_eq!(clone.count(), history.all.len());
 
         // A client at the root commit gets everything but the root's objects.
-        let update = fetch(&[history.commits[2]], &[history.commits[0]], Filter::None);
+        let update = fetch(&[history.commits[2]], &[history.commits[0]], Filter::default());
         assert_eq!(update.count(), history.all.len() - 4);
 
         // A blobless clone leaves out the four blobs.
-        let blobless = fetch(&[history.commits[2]], &[], Filter::BlobNone);
+        let blobless = fetch(&[history.commits[2]], &[], Filter::parse("blob:none").unwrap());
         assert_eq!(blobless.count(), history.all.len() - 4);
         // Commits only.
-        assert_eq!(fetch(&[history.commits[2]], &[], Filter::TreeDepth(0)).count(), 3);
+        assert_eq!(fetch(&[history.commits[2]], &[], Filter::parse("tree:0").unwrap()).count(), 3);
         // Depth-limited filters cannot use bitmaps, and must still be right:
         // three commits and their three root trees.
-        assert_eq!(fetch(&[history.commits[2]], &[], Filter::TreeDepth(1)).count(), 6);
+        assert_eq!(fetch(&[history.commits[2]], &[], Filter::parse("tree:1").unwrap()).count(), 6);
 
         // A commit without a bitmap is walked until a bitmap takes over.
-        let middle = fetch(&[history.commits[1]], &[], Filter::None);
+        let middle = fetch(&[history.commits[1]], &[], Filter::default());
         assert_eq!(middle.count(), 4 + 3);
         assert_eq!(middle.objects.len(), 3);
     }
@@ -445,13 +445,13 @@ mod tests {
 
         let pool = base.merged_with(&layer);
         let none = ShallowPlan::default();
-        let clone = plan_fetch(&pool, &[history.commits[2]], &[], &none, &Filter::None).unwrap();
+        let clone = plan_fetch(&pool, &[history.commits[2]], &[], &none, &Filter::default()).unwrap();
         assert!(clone.objects.is_empty());
         assert_eq!((clone.bitmaps.len(), clone.count()), (2, history.all.len()));
 
         // Without the older pack's bitmaps the layer is unusable, and the walk takes over.
         let stripped = PackSet::new(vec![files[2].clone(), files[1].clone()]).merged_with(&layer);
-        let walked = plan_fetch(&stripped, &[history.commits[2]], &[], &none, &Filter::None).unwrap();
+        let walked = plan_fetch(&stripped, &[history.commits[2]], &[], &none, &Filter::default()).unwrap();
         assert!(walked.bitmaps.is_empty());
         assert_eq!(walked.count(), history.all.len());
     }
@@ -461,7 +461,7 @@ mod tests {
         let history = history();
         // Keep only what the first commit reaches.
         let none = ShallowPlan::default();
-        let reachable = plan_fetch(&history.packs, &[history.commits[0]], &[], &none, &Filter::None).unwrap();
+        let reachable = plan_fetch(&history.packs, &[history.commits[0]], &[], &none, &Filter::default()).unwrap();
         let keep: std::collections::HashSet<Oid> = reachable.objects.iter().map(|(oid, _)| *oid).collect();
         assert_eq!(keep.len(), 4);
         let keep_fn = |oid: &Oid| keep.contains(oid);

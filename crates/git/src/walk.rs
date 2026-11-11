@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::bitmap::Reachable;
 use crate::bitset::BitSet;
 use crate::object::{parse_tag, parse_tree, CommitInfo};
+use crate::sparse::Patterns;
 use crate::{Error, ObjectKind, ObjectSource, Oid, PackFile, PackSet, Result};
 
 /// Follows annotated tags from `oid`. Returns the first non-tag object, or
@@ -89,55 +90,135 @@ fn reachable_commits(src: &dyn ObjectSource, tips: &[Oid]) -> Result<HashSet<Oid
     Ok(commits)
 }
 
-/// Which objects a partial clone asked the server to leave out.
+/// Which objects a partial clone asked the server to leave out. Conditions
+/// add up: an object is sent only if every one of them lets it through,
+/// which is what `combine:` asks for.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum Filter {
-    #[default]
-    None,
+pub struct Filter {
     /// `blob:none`
-    BlobNone,
+    blob_none: bool,
     /// `blob:limit=<n>`: omit blobs of at least `n` bytes.
-    BlobLimit(u64),
+    blob_limit: Option<u64>,
     /// `tree:<n>`: omit trees and blobs `n` or more levels below a commit's
     /// root tree, which is level 0. `tree:0` omits all of them.
-    TreeDepth(u32),
+    tree_depth: Option<u32>,
+    /// `sparse:oid=<blob>`: the blobs named, to be read with [`Filter::load_sparse`].
+    sparse_names: Vec<String>,
+    /// Their patterns: only files they include are sent. Trees always are.
+    sparse: Vec<Arc<Patterns>>,
 }
+
+/// More sub-filters than anyone has a use for.
+const MAX_COMBINED: usize = 16;
 
 impl Filter {
     /// Parses a filter spec. Returns `None` for specs this server cannot honour.
     pub fn parse(spec: &str) -> Option<Filter> {
-        match spec {
-            "blob:none" => Some(Filter::BlobNone),
-            _ if spec.starts_with("tree:") => Some(Filter::TreeDepth(spec["tree:".len()..].parse().ok()?)),
-            _ => {
-                let limit = spec.strip_prefix("blob:limit=")?;
-                let (digits, unit) = match limit.as_bytes().last()? {
-                    b'k' | b'K' => (&limit[..limit.len() - 1], 1 << 10),
-                    b'm' | b'M' => (&limit[..limit.len() - 1], 1 << 20),
-                    b'g' | b'G' => (&limit[..limit.len() - 1], 1 << 30),
-                    _ => (limit, 1),
-                };
-                Some(Filter::BlobLimit(digits.parse::<u64>().ok()?.checked_mul(unit)?))
+        let mut filter = Filter::default();
+        filter.add(spec, 0)?;
+        (filter.sparse_names.len() <= MAX_COMBINED).then_some(filter)
+    }
+
+    fn add(&mut self, spec: &str, nesting: usize) -> Option<()> {
+        if let Some(parts) = spec.strip_prefix("combine:") {
+            if nesting > 2 {
+                return None;
             }
+            // Each part is URL-encoded, so that a part can itself be a combination.
+            for part in parts.split('+') {
+                self.add(&percent_decode(part)?, nesting + 1)?;
+            }
+        } else if spec == "blob:none" {
+            self.blob_none = true;
+        } else if let Some(depth) = spec.strip_prefix("tree:") {
+            let depth = depth.parse().ok()?;
+            self.tree_depth = Some(self.tree_depth.map_or(depth, |other| other.min(depth)));
+        } else if let Some(name) = spec.strip_prefix("sparse:oid=") {
+            if name.is_empty() {
+                return None;
+            }
+            self.sparse_names.push(name.to_string());
+        } else {
+            let limit = spec.strip_prefix("blob:limit=")?;
+            let (digits, unit) = match limit.as_bytes().last()? {
+                b'k' | b'K' => (&limit[..limit.len() - 1], 1 << 10),
+                b'm' | b'M' => (&limit[..limit.len() - 1], 1 << 20),
+                b'g' | b'G' => (&limit[..limit.len() - 1], 1 << 30),
+                _ => (limit, 1),
+            };
+            let limit = digits.parse::<u64>().ok()?.checked_mul(unit)?;
+            self.blob_limit = Some(self.blob_limit.map_or(limit, |other| other.min(limit)));
         }
+        Some(())
+    }
+
+    /// Whether everything is sent.
+    pub fn is_none(&self) -> bool {
+        *self == Filter::default()
+    }
+
+    /// The blobs `sparse:oid=` named, as the client wrote them.
+    pub fn sparse_names(&self) -> &[String] {
+        &self.sparse_names
+    }
+
+    /// Gives the filter the contents of the blobs in [`Filter::sparse_names`], in that order.
+    pub fn load_sparse(&mut self, contents: &[impl AsRef<[u8]>]) {
+        self.sparse = contents.iter().map(|text| Arc::new(Patterns::parse(text.as_ref()))).collect();
     }
 
     /// Whether objects `depth` levels below a root tree are kept.
     fn keeps_depth(&self, depth: u32) -> bool {
-        !matches!(self, Filter::TreeDepth(max) if depth >= *max)
+        self.tree_depth.is_none_or(|max| depth < max)
     }
 
-    fn keeps_blob(&self, src: &dyn ObjectSource, oid: &Oid) -> Result<bool> {
-        Ok(match self {
-            Filter::None | Filter::TreeDepth(_) => true,
-            Filter::BlobNone => false,
+    /// Whether the blob `oid`, found at `path`, is kept.
+    fn keeps_blob(&self, src: &dyn ObjectSource, oid: &Oid, path: &[u8]) -> Result<bool> {
+        if self.blob_none || !self.sparse.iter().all(|patterns| patterns.includes(path)) {
+            return Ok(false);
+        }
+        match self.blob_limit {
+            None => Ok(true),
             // TODO: read the size from the pack entry header instead of inflating the blob.
-            Filter::BlobLimit(limit) => {
+            Some(limit) => {
                 let blob = src.get(oid)?.ok_or(Error::Missing(*oid))?;
-                (blob.data.len() as u64) < *limit
+                Ok((blob.data.len() as u64) < limit)
             }
-        })
+        }
     }
+
+    /// Whether where a blob is decides if it is sent. Then a tree seen at one
+    /// path has to be looked into again at another.
+    fn by_path(&self) -> bool {
+        !self.sparse.is_empty()
+    }
+
+    /// Whether the filter says nothing that bitmaps cannot answer: they
+    /// record what kind an object is, but not its size, depth or path.
+    fn fits_bitmaps(&self) -> bool {
+        self.blob_limit.is_none() && self.sparse_names.is_empty() && self.tree_depth.is_none_or(|depth| depth == 0)
+    }
+
+    fn omits_all_blobs(&self) -> bool {
+        self.blob_none || self.tree_depth == Some(0)
+    }
+}
+
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(at + 1..at + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// The shallow part of a fetch request.
@@ -279,6 +360,9 @@ struct TreeJob {
     known: Vec<Oid>,
     /// Levels below the root tree.
     depth: u32,
+    /// Where the tree is, with a trailing slash unless it is the root. Only
+    /// kept track of for filters that go by path.
+    path: Vec<u8>,
 }
 
 /// Descends into the trees of `jobs`, visiting only what differs from the
@@ -295,11 +379,24 @@ fn diff_trees(
     mark: &mut dyn FnMut(&Oid) -> Result<bool>,
     emit: &mut dyn FnMut(Oid, Option<Oid>),
 ) -> Result<()> {
-    while let Some(TreeJob { tree: oid, known, depth }) = jobs.pop() {
-        if !filter.keeps_depth(depth) || known.contains(&oid) || !mark(&oid)? {
+    let by_path = filter.by_path();
+    // With a filter that goes by path, the same tree can hold wanted files
+    // in one place and none in another: each place is looked into once.
+    let mut places: HashSet<(Oid, Vec<u8>)> = HashSet::new();
+    while let Some(TreeJob { tree: oid, known, depth, path }) = jobs.pop() {
+        if !filter.keeps_depth(depth) || known.contains(&oid) {
             continue;
         }
-        emit(oid, known.first().copied());
+        let new = mark(&oid)?;
+        if !new && !(by_path && places.insert((oid, path.clone()))) {
+            continue;
+        }
+        if new {
+            if by_path {
+                places.insert((oid, path.clone()));
+            }
+            emit(oid, known.first().copied());
+        }
         let tree = src.get(&oid)?.ok_or(Error::Missing(oid))?;
         let mut known_trees = Vec::with_capacity(known.len());
         for known_oid in &known {
@@ -322,9 +419,14 @@ fn diff_trees(
                 continue;
             }
             let same_kind = same_path.iter().filter(|(_, is_tree)| *is_tree == entry.is_tree()).map(|(oid, _)| *oid);
+            let mut entry_path = Vec::new();
+            if by_path {
+                entry_path = [&path[..], entry.name].concat();
+            }
             if entry.is_tree() {
-                jobs.push(TreeJob { tree: entry.oid, known: same_kind.collect(), depth: depth + 1 });
-            } else if filter.keeps_depth(depth + 1) && filter.keeps_blob(src, &entry.oid)? && mark(&entry.oid)? {
+                entry_path.push(b'/');
+                jobs.push(TreeJob { tree: entry.oid, known: same_kind.collect(), depth: depth + 1, path: entry_path });
+            } else if filter.keeps_depth(depth + 1) && filter.keeps_blob(src, &entry.oid, &entry_path)? && mark(&entry.oid)? {
                 emit(entry.oid, same_kind.into_iter().next());
             }
         }
@@ -525,7 +627,7 @@ const MAX_HAVE_TREES: usize = 4;
 /// restored to an old version); it never omits one it lacks.
 pub fn plan_fetch(packs: &PackSet, wants: &[Oid], haves: &[Oid], shallow: &ShallowPlan, filter: &Filter) -> Result<FetchPlan> {
     // Bitmaps describe complete history, and record kinds but neither sizes nor depths.
-    let use_bitmaps = !shallow.active && matches!(filter, Filter::None | Filter::BlobNone | Filter::TreeDepth(0));
+    let use_bitmaps = !shallow.active && filter.fits_bitmaps();
     let mut walk = CommitWalk {
         src: packs,
         bitmaps: use_bitmaps.then_some(packs),
@@ -559,9 +661,10 @@ pub fn plan_fetch(packs: &PackSet, wants: &[Oid], haves: &[Oid], shallow: &Shall
                         objects.push((current, None));
                     }
                     for entry in parse_tree(&object.data)? {
+                        // Where a tree asked for by name sits is not known: it is taken for the root.
                         if entry.is_tree() {
-                            jobs.push(TreeJob { tree: entry.oid, known: Vec::new(), depth: 0 });
-                        } else if !entry.is_gitlink() && filter.keeps_depth(0) && filter.keeps_blob(packs, &entry.oid)? {
+                            jobs.push(TreeJob { tree: entry.oid, known: Vec::new(), depth: 0, path: [entry.name, b"/"].concat() });
+                        } else if !entry.is_gitlink() && filter.keeps_depth(0) && filter.keeps_blob(packs, &entry.oid, entry.name)? {
                             wanted_blobs.push(entry.oid);
                         }
                     }
@@ -594,7 +697,7 @@ pub fn plan_fetch(packs: &PackSet, wants: &[Oid], haves: &[Oid], shallow: &Shall
             // or covered by a bitmap: its tree is accounted for.
             info.parents.iter().filter_map(|p| walk.info.get(p)).map(|p| p.tree).collect()
         };
-        jobs.push(TreeJob { tree: info.tree, known, depth: 0 });
+        jobs.push(TreeJob { tree: info.tree, known, depth: 0, path: Vec::new() });
     }
     let mut found = Vec::new();
     diff_trees(packs, jobs, filter, &mut |oid| Ok(sent.insert(*oid)), &mut |oid, base| found.push((oid, base)))?;
@@ -615,10 +718,10 @@ pub fn plan_fetch(packs: &PackSet, wants: &[Oid], haves: &[Oid], shallow: &Shall
                 }
             }
             let kinds = pack.bitmaps().expect("bits come from this pack's bitmaps");
-            if matches!(filter, Filter::BlobNone | Filter::TreeDepth(0)) {
+            if filter.omits_all_blobs() {
                 bits.subtract(&kinds.of_kind(ObjectKind::Blob)?);
             }
-            if matches!(filter, Filter::TreeDepth(0)) {
+            if filter.tree_depth == Some(0) {
                 bits.subtract(&kinds.of_kind(ObjectKind::Tree)?);
             }
             bitmaps.push(BitmapSelection { pack: pack.clone(), bits });
@@ -716,7 +819,7 @@ pub fn reachability_bitmaps(src: &dyn ObjectSource, tips: &[Oid], context: &Bitm
                     None => known.extend(src.commit(parent)?.map(|p| p.tree)),
                 }
             }
-            jobs.push(TreeJob { tree: commit.tree, known, depth: 0 });
+            jobs.push(TreeJob { tree: commit.tree, known, depth: 0, path: Vec::new() });
         }
 
         let mut mark = |oid: &Oid| -> Result<bool> {
@@ -729,7 +832,7 @@ pub fn reachability_bitmaps(src: &dyn ObjectSource, tips: &[Oid], context: &Bitm
             bits.set(index);
             Ok(new)
         };
-        diff_trees(src, jobs, &Filter::None, &mut mark, &mut |_, _| {})?;
+        diff_trees(src, jobs, &Filter::default(), &mut mark, &mut |_, _| {})?;
 
         bases.sort();
         bases.dedup();
@@ -798,13 +901,21 @@ mod tests {
 
     #[test]
     fn filter_specs() {
-        assert_eq!(Filter::parse("blob:none"), Some(Filter::BlobNone));
-        assert_eq!(Filter::parse("tree:0"), Some(Filter::TreeDepth(0)));
-        assert_eq!(Filter::parse("tree:3"), Some(Filter::TreeDepth(3)));
-        assert_eq!(Filter::parse("blob:limit=1024"), Some(Filter::BlobLimit(1024)));
-        assert_eq!(Filter::parse("blob:limit=2k"), Some(Filter::BlobLimit(2048)));
-        assert_eq!(Filter::parse("blob:limit=1m"), Some(Filter::BlobLimit(1 << 20)));
-        for unsupported in ["tree:x", "sparse:oid=abc", "blob:limit=", "blob:limit=x", "object:type=blob"] {
+        let parsed = |spec: &str| Filter::parse(spec).unwrap_or_else(|| panic!("{spec} should parse"));
+        assert!(parsed("blob:none").blob_none);
+        assert_eq!(parsed("tree:0").tree_depth, Some(0));
+        assert_eq!(parsed("tree:3").tree_depth, Some(3));
+        assert_eq!(parsed("blob:limit=1024").blob_limit, Some(1024));
+        assert_eq!(parsed("blob:limit=2k").blob_limit, Some(2048));
+        assert_eq!(parsed("blob:limit=1m").blob_limit, Some(1 << 20));
+        assert_eq!(parsed("sparse:oid=main:.sparse").sparse_names(), ["main:.sparse"]);
+        // Parts are URL-encoded, so one can be a combination itself; the strictest of each kind holds.
+        let combined = parsed("combine:blob:limit=1k+tree:5+combine:tree:2%2Bblob:limit=4k+sparse:oid=abc%2Bdef");
+        assert_eq!((combined.blob_limit, combined.tree_depth), (Some(1024), Some(2)));
+        assert_eq!(combined.sparse_names(), ["abc+def"]);
+        assert!(!combined.fits_bitmaps());
+        assert!(parsed("combine:blob:none+tree:0").fits_bitmaps());
+        for unsupported in ["tree:x", "sparse:oid=", "sparse:path=x", "blob:limit=", "blob:limit=x", "object:type=blob", "combine:blob:none+nonsense", "combine:%zz"] {
             assert_eq!(Filter::parse(unsupported), None, "{unsupported}");
         }
     }

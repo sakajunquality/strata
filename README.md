@@ -216,7 +216,7 @@ cargo build --release && FILES=50000 COMMITS=100 ./scripts/bench.sh   # timings 
 - **Real cloud buckets are untested.** The S3 API path is exercised against LocalStack (`./scripts/s3-smoke.sh`); AWS S3 itself, GCS and Azure are not.
 - **SSH.** Access is over HTTP(S) only.
 - **SHA-256 repositories.**
-- **`sparse:oid` and combined partial clone filters.** `blob:none`, `blob:limit=<n>` and `tree:<n>` work.
+- **`object:type` partial clone filters.** `blob:none`, `blob:limit=<n>`, `tree:<n>`, `sparse:oid=<blob>` and combinations of them work.
 - **Pruned objects are gone at once.** There is no window in which a force-pushed-away commit can still be fetched by id after the next full compaction.
 - **Indexing a push keeps about 50 bytes per object in memory**, plus one delta family at a time; the spool file needs local disk the size of the push.
 - **Compaction computes deltas only for files changed since the last full merge**, against their previous version. It does not search for better bases.

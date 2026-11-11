@@ -314,6 +314,42 @@ fn shallow_scenario(url: &str) {
     git(&roots, &["checkout", "-q", "main"]);
     assert_eq!(std::fs::read_to_string(roots.join("src/code.txt")).unwrap(), body(6));
 
+    // Several filters at once: an object comes only if all of them let it through.
+    git(root, &["clone", "-q", "--filter=tree:3", "--filter=blob:limit=1k", "--no-checkout", url, "combined"]);
+    let combined = root.join("combined");
+    assert_eq!(commit_count(&combined), "7");
+    assert!(has_object(&combined, &git(&work, &["rev-parse", "HEAD:src"])));
+    assert!(has_object(&combined, &small_blob));
+    assert!(!has_object(&combined, &code_blob));
+    git(root, &["clone", "-q", "--filter=tree:1", "--filter=blob:limit=1k", "--no-checkout", url, "stricter"]);
+    assert!(!has_object(&root.join("stricter"), &small_blob));
+
+    // Sparse: only the files that a list of patterns kept in the repository
+    // names, in every revision. Trees all come, so the clone knows what it left out.
+    std::fs::write(work.join(".sparse"), "# the code, and one more file\n/src/\nfile2.*\n").unwrap();
+    git(&work, &["checkout", "-q", "-b", "patterns"]);
+    commit_on(&work, 8, "patterns");
+    git(&work, &["push", "-q", "origin", "patterns"]);
+    git(&work, &["checkout", "-q", "main"]);
+    git(root, &["clone", "-q", "--filter=sparse:oid=patterns:.sparse", "--no-checkout", "--branch", "main", url, "sparse"]);
+    let sparse = root.join("sparse");
+    assert_eq!(commit_count(&sparse), "7");
+    assert!(has_object(&sparse, &code_blob));
+    assert!(has_object(&sparse, &git(&work, &["rev-parse", &format!("{}:src/code.txt", commits[0])])));
+    assert!(has_object(&sparse, &git(&work, &["rev-parse", "HEAD:file2.txt"])));
+    assert!(has_object(&sparse, &git(&work, &["rev-parse", "HEAD^{tree}"])));
+    assert!(!has_object(&sparse, &small_blob));
+    assert!(!has_object(&sparse, &git(&s2, &["rev-parse", "HEAD:from-shallow.txt"])));
+    // What was left out still comes when asked for.
+    git(&sparse, &["checkout", "-q", "main"]);
+    assert_eq!(std::fs::read_to_string(sparse.join("file1.txt")).unwrap(), "file 1\n");
+    // The patterns can be named by the blob's id too, and combined with other filters.
+    let list = git(&work, &["rev-parse", "patterns:.sparse"]);
+    git(root, &["clone", "-q", &format!("--filter=sparse:oid={list}"), "--filter=blob:limit=1k", "--no-checkout", url, "both"]);
+    assert!(has_object(&root.join("both"), &git(&work, &["rev-parse", "HEAD:file2.txt"])));
+    assert!(!has_object(&root.join("both"), &code_blob) && !has_object(&root.join("both"), &small_blob));
+    assert!(!git_in(root, &["clone", "-q", "--filter=sparse:oid=patterns:nope", url, "nolist"]).status.success());
+
     // Filters the server cannot honour are refused rather than silently ignored.
     assert!(!git_in(root, &["clone", "-q", "--filter=object:type=blob", url, "unsupported"]).status.success());
 }

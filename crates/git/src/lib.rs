@@ -13,6 +13,7 @@ pub mod object;
 pub mod oid;
 pub mod pack;
 pub mod pktline;
+pub mod sparse;
 pub mod walk;
 
 use bytes::Bytes;

@@ -179,7 +179,7 @@ fn history(packs: &PackSet, tip: Oid, skip: usize, limit: usize) -> Result<(Vec<
 }
 
 /// The entry at `path` below a commit's root: its mode and id.
-fn find(packs: &PackSet, commit: &CommitInfo, path: &str) -> Result<Option<(u32, Oid)>, HttpError> {
+pub(crate) fn find(packs: &PackSet, commit: &CommitInfo, path: &str) -> Result<Option<(u32, Oid)>, HttpError> {
     let mut at = (0o40000, commit.tree);
     for segment in path.split('/').filter(|segment| !segment.is_empty()) {
         if at.0 != 0o40000 {
