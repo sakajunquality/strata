@@ -225,13 +225,13 @@ an Apple M-series laptop with everything on local disk:
 
 | | |
 |---|---|
-| Push of all history | 11 s, of which 9 s is the server's (`git index-pack` takes 15 s on one thread for the same pack) |
-| Full clone before compaction | 12 s (server 4.5 s; the rest is git indexing what it received) |
-| Compaction, with commit-graph and bitmaps | 9 s |
-| Full clone after compaction | 8 s (server 0.4 s) |
+| Push of all history | 6 s (`git index-pack` takes 6 s for the same pack, on as many threads) |
+| Full clone before compaction | 9 s (much of it git indexing what it received) |
+| Compaction, with commit-graph and bitmaps | 4 s |
+| Full clone after compaction | 7.5 s (server 0.4 s) |
 | `clone --depth 1` | 0.6 s |
-| `clone --filter=blob:none` | 3.6 s |
-| `clone --filter=blob:limit=10k` | 8 s |
+| `clone --filter=blob:none` | 3.3 s |
+| `clone --filter=blob:limit=10k` | 5 s |
 | Fetch of 500 new commits | 0.2 s |
 
 The same history pushed in 100 pieces and then compacted takes the same
@@ -239,17 +239,17 @@ The same history pushed in 100 pieces and then compacted takes the same
 1 GiB of pack blocks and 256 MiB of objects (`--block-cache-mb`,
 `--object-cache-mb`).
 
+Pushes and walks through history use up to eight threads each.
+
 ## Not done
 
 - **The shared metadata stores are tested against local servers only.** PostgreSQL 17 in Docker and the Cloud Spanner emulator, each with two nodes on one database (`./scripts/meta-test.sh`). Not tested: Cloud Spanner itself (the emulator runs one transaction at a time, so real contention and Google credentials are unexercised), managed PostgreSQL services, and more than two nodes or any load.
 - **Real cloud buckets are untested.** The S3 API path is exercised against LocalStack (`./scripts/s3-smoke.sh`); AWS S3 itself, GCS and Azure are not.
 - **SSH.** Access is over HTTP(S) only.
 - **SHA-256 repositories.**
-- **`object:type` partial clone filters.** `blob:none`, `blob:limit=<n>`, `tree:<n>`, `sparse:oid=<blob>` and combinations of them work.
 - **Pruned objects are gone at once.** There is no window in which a force-pushed-away commit can still be fetched by id after the next full compaction.
-- **Indexing a push takes memory in proportion to its objects**: about 170 MiB at its peak for the 412k objects above, for the table of entries, the ids they point at and the delta family being resolved. The spool file needs local disk the size of the push, and is mapped into memory (the kernel pages it out as needed). Deltas are resolved on one thread.
+- **Indexing a push takes memory in proportion to its objects**: for the table of entries, the ids they point at, and one delta family per thread (up to eight) being resolved. The spool file needs local disk the size of the push, and is mapped into memory (the kernel pages it out as needed).
 - **Compaction computes deltas only for files changed since the last full merge**, against their previous version. It does not search for better bases; with packs that come from git, which already hold good deltas, nothing was lost by that in the measurement above.
-- **Walks through all of history are on one thread** (a clone before compaction, a size-limited or sparse clone, compaction itself).
 - **The pre-receive hook sees the commits a push brings, but not their files.** Rules about file sizes or secrets need a way to read a push before it commits.
 - **The event feed covers pushes only.** Repositories created, deleted or compacted are the application's own actions and are not echoed back.
 - **TLS, rate limiting, and quotas.** `GET /api/repos/<id>` reports the bytes a repository holds; nothing enforces a limit.

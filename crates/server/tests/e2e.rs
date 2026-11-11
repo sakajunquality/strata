@@ -350,8 +350,18 @@ fn shallow_scenario(url: &str) {
     assert!(!has_object(&root.join("both"), &code_blob) && !has_object(&root.join("both"), &small_blob));
     assert!(!git_in(root, &["clone", "-q", "--filter=sparse:oid=patterns:nope", url, "nolist"]).status.success());
 
-    // Filters the server cannot honour are refused rather than silently ignored.
-    assert!(!git_in(root, &["clone", "-q", "--filter=object:type=blob", url, "unsupported"]).status.success());
+    // By kind of object: all the commits and nothing else, or the files alone
+    // (with the commit that was asked for, which comes whatever the filter says).
+    git(root, &["clone", "-q", "--filter=object:type=commit", "--no-checkout", url, "commits-only"]);
+    let only = root.join("commits-only");
+    assert_eq!(commit_count(&only), "7");
+    assert!(has_object(&only, &commits[0]));
+    assert!(!has_object(&only, &git(&s2, &["rev-parse", "HEAD^{tree}"])) && !has_object(&only, &small_blob));
+    git(root, &["clone", "-q", "--filter=object:type=blob", "--no-checkout", url, "blobs-only"]);
+    let only = root.join("blobs-only");
+    assert!(has_object(&only, &git(&s2, &["rev-parse", "HEAD"])));
+    assert!(has_object(&only, &small_blob) && has_object(&only, &code_blob));
+    assert!(!has_object(&only, &commits[0]) && !has_object(&only, &git(&s2, &["rev-parse", "HEAD^{tree}"])));
 }
 
 async fn pack_count(app: &App, repo: &str) -> usize {

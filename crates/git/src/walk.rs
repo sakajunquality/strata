@@ -4,9 +4,10 @@
 //! commit-graph when the pack has one.
 
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use crate::bitmap::Reachable;
+use crate::bitmap::{kind_slot, Reachable};
 use crate::bitset::BitSet;
 use crate::object::{parse_tag, parse_tree, CommitInfo};
 use crate::sparse::Patterns;
@@ -106,6 +107,9 @@ pub struct Filter {
     sparse_names: Vec<String>,
     /// Their patterns: only files they include are sent. Trees always are.
     sparse: Vec<Arc<Patterns>>,
+    /// `object:type=<kind>`: the kinds that are not sent, by [`kind_slot`].
+    /// What a fetch asks for by name is sent whatever its kind.
+    omitted_kinds: [bool; 4],
 }
 
 /// More sub-filters than anyone has a use for.
@@ -133,6 +137,17 @@ impl Filter {
         } else if let Some(depth) = spec.strip_prefix("tree:") {
             let depth = depth.parse().ok()?;
             self.tree_depth = Some(self.tree_depth.map_or(depth, |other| other.min(depth)));
+        } else if let Some(kind) = spec.strip_prefix("object:type=") {
+            let kind = match kind {
+                "commit" => ObjectKind::Commit,
+                "tree" => ObjectKind::Tree,
+                "blob" => ObjectKind::Blob,
+                "tag" => ObjectKind::Tag,
+                _ => return None,
+            };
+            for slot in 0..4 {
+                self.omitted_kinds[slot] |= slot != kind_slot(kind);
+            }
         } else if let Some(name) = spec.strip_prefix("sparse:oid=") {
             if name.is_empty() {
                 return None;
@@ -167,6 +182,11 @@ impl Filter {
         self.sparse = contents.iter().map(|text| Arc::new(Patterns::parse(text.as_ref()))).collect();
     }
 
+    /// Whether objects of this kind are sent at all.
+    fn keeps_kind(&self, kind: ObjectKind) -> bool {
+        !self.omitted_kinds[kind_slot(kind)]
+    }
+
     /// Whether objects `depth` levels below a root tree are kept.
     fn keeps_depth(&self, depth: u32) -> bool {
         self.tree_depth.is_none_or(|max| depth < max)
@@ -174,7 +194,7 @@ impl Filter {
 
     /// Whether the blob `oid`, found at `path`, is kept.
     fn keeps_blob(&self, src: &dyn ObjectSource, oid: &Oid, path: &[u8]) -> Result<bool> {
-        if self.blob_none || !self.sparse.iter().all(|patterns| patterns.includes(path)) {
+        if self.blob_none || !self.keeps_kind(ObjectKind::Blob) || !self.sparse.iter().all(|patterns| patterns.includes(path)) {
             return Ok(false);
         }
         match self.blob_limit {
@@ -183,8 +203,7 @@ impl Filter {
         }
     }
 
-    /// Whether where a blob is decides if it is sent. Then a tree seen at one
-    /// path has to be looked into again at another.
+    /// Whether where a blob is decides if it is sent.
     fn by_path(&self) -> bool {
         !self.sparse.is_empty()
     }
@@ -195,8 +214,15 @@ impl Filter {
         self.blob_limit.is_none() && self.sparse_names.is_empty() && self.tree_depth.is_none_or(|depth| depth == 0)
     }
 
-    fn omits_all_blobs(&self) -> bool {
-        self.blob_none || self.tree_depth == Some(0)
+    /// Whether nothing of this kind is sent, wherever it is: what is taken
+    /// out of a bitmap, which knows kinds and nothing else.
+    fn omits_all(&self, kind: ObjectKind) -> bool {
+        !self.keeps_kind(kind)
+            || match kind {
+                ObjectKind::Blob => self.blob_none || self.tree_depth == Some(0),
+                ObjectKind::Tree => self.tree_depth == Some(0),
+                ObjectKind::Commit | ObjectKind::Tag => false,
+            }
     }
 }
 
@@ -361,44 +387,60 @@ struct TreeJob {
     path: Vec<u8>,
 }
 
-/// Descends into the trees of `jobs`, visiting only what differs from the
-/// known trees at the same path. A commit that touches three files costs three
-/// paths, however large the repository is.
-///
-/// `mark` records an object as handled and reports whether it was new;
-/// `emit` receives each new object with, where one exists, the object it
+/// An object a commit brought, with, where one exists, the object it
 /// replaced at that path (a good delta base).
+type Found = (Oid, Option<Oid>);
+/// What some of the jobs handed to [`introduced_by`] found, each with its number.
+type Numbered = Vec<(usize, Vec<Found>)>;
+
+/// Trees that have been gone through from top to bottom with nothing known
+/// at their path. Wherever one of them turns up again with nothing known, it
+/// has nothing more to give: this is what keeps a directory that moves from
+/// being read in full each time.
+struct Walked {
+    whole: Mutex<OidSet>,
+    /// Not with filters that go by depth or by path: what a tree gives then
+    /// depends on where it is.
+    usable: bool,
+}
+
+/// Collects what a commit's tree holds that the known trees do not: only
+/// paths that differ are visited, so a commit that touches three files costs
+/// three paths, however large the repository is.
 ///
-/// Jobs are taken from the end of `jobs`, and a known tree is trusted to be
-/// accounted for in full. That holds for trees of commits outside the walk,
-/// and for those of commits inside it only once their own jobs are done: so
-/// the jobs of a commit must come after (be taken before) those of its
-/// children. See [`parents_last`]. Otherwise a tree met first where most of
-/// it is known is marked as handled with entries that nobody has looked at.
-fn diff_trees(
-    src: &dyn ObjectSource,
-    mut jobs: Vec<TreeJob>,
-    filter: &Filter,
-    mark: &mut dyn FnMut(&Oid) -> Result<bool>,
-    emit: &mut dyn FnMut(Oid, Option<Oid>),
-) -> Result<()> {
+/// Nothing is remembered from one commit to the next, apart from [`Walked`].
+/// An object reached from several commits is found several times, and
+/// commits can be looked at in any order, and at the same time. (An earlier
+/// version remembered every tree it had seen. That made the order matter,
+/// and lost objects when it was wrong.)
+fn introduced(src: &dyn ObjectSource, job: TreeJob, filter: &Filter, walked: &Walked, out: &mut Vec<Found>) -> Result<()> {
+    enum Step {
+        Enter(TreeJob),
+        /// Everything below this tree has been collected.
+        Whole(Oid),
+    }
     let by_path = filter.by_path();
-    // With a filter that goes by path, the same tree can hold wanted files
-    // in one place and none in another: each place is looked into once.
-    let mut places: HashSet<(Oid, Vec<u8>)> = HashSet::new();
-    while let Some(TreeJob { tree: oid, known, depth, path }) = jobs.pop() {
+    let mut steps = vec![Step::Enter(job)];
+    while let Some(step) = steps.pop() {
+        let TreeJob { tree: oid, known, depth, path } = match step {
+            Step::Enter(job) => job,
+            Step::Whole(oid) => {
+                walked.whole.lock().expect("no panics while held").insert(oid);
+                continue;
+            }
+        };
         if !filter.keeps_depth(depth) || known.contains(&oid) {
             continue;
         }
-        let new = mark(&oid)?;
-        if !new && !(by_path && places.insert((oid, path.clone()))) {
-            continue;
-        }
-        if new {
-            if by_path {
-                places.insert((oid, path.clone()));
+        if known.is_empty() && walked.usable {
+            if walked.whole.lock().expect("no panics while held").contains(&oid) {
+                continue;
             }
-            emit(oid, known.first().copied());
+            // Taken once everything pushed after it has been.
+            steps.push(Step::Whole(oid));
+        }
+        if filter.keeps_kind(ObjectKind::Tree) {
+            out.push((oid, known.first().copied()));
         }
         let tree = src.get(&oid)?.ok_or(Error::Missing(oid))?;
         let mut known_trees = Vec::with_capacity(known.len());
@@ -443,46 +485,58 @@ fn diff_trees(
             }
             if entry.is_tree() {
                 entry_path.push(b'/');
-                jobs.push(TreeJob { tree: entry.oid, known: same_kind, depth: depth + 1, path: entry_path });
-            } else if filter.keeps_depth(depth + 1) && filter.keeps_blob(src, &entry.oid, &entry_path)? && mark(&entry.oid)? {
-                emit(entry.oid, same_kind.into_iter().next());
+                steps.push(Step::Enter(TreeJob { tree: entry.oid, known: same_kind, depth: depth + 1, path: entry_path }));
+            } else if filter.keeps_depth(depth + 1) && filter.keeps_blob(src, &entry.oid, &entry_path)? {
+                out.push((entry.oid, same_kind.into_iter().next()));
             }
         }
     }
     Ok(())
 }
 
-/// Orders commits so that each comes before its parents among them: the
-/// order in which to hand their trees to [`diff_trees`], which works from
-/// the end. Dates do not give this order; they can be anything.
-fn parents_last<'a>(commits: &[Oid], parents: impl Fn(&Oid) -> &'a [Oid]) -> Vec<Oid> {
-    let among: HashSet<Oid> = commits.iter().copied().collect();
-    let mut placed = HashSet::with_capacity(commits.len());
-    let mut order = Vec::with_capacity(commits.len());
-    for start in commits {
-        // Depth first, a commit placed once all its parents are.
-        let mut stack = vec![(*start, 0)];
-        while let Some((oid, next)) = stack.pop() {
-            if next == 0 && placed.contains(&oid) {
-                continue;
+/// Below this many trees to look into, threads cost more than they save.
+const PARALLEL_FROM: usize = 64;
+/// More threads than this mostly wait for one another's cache entries.
+const MAX_WALK_THREADS: usize = 8;
+
+/// Runs [`introduced`] for each job, on several threads when there are many,
+/// and returns what each found, in the order of the jobs.
+fn introduced_by(src: &(dyn ObjectSource + Sync), jobs: Vec<TreeJob>, filter: &Filter) -> Result<Vec<Vec<Found>>> {
+    let walked = Walked { whole: Mutex::new(OidSet::default()), usable: !filter.by_path() && filter.tree_depth.is_none() };
+    let count = jobs.len();
+    let threads = match count {
+        0..PARALLEL_FROM => 1,
+        _ => std::thread::available_parallelism().map_or(1, usize::from).min(MAX_WALK_THREADS),
+    };
+    let queue = Mutex::new(jobs.into_iter().enumerate());
+    let failed = AtomicBool::new(false);
+    let work = || -> Result<Numbered> {
+        let mut done = Vec::new();
+        loop {
+            let next = queue.lock().expect("no panics while held").next();
+            let Some((number, job)) = next.filter(|_| !failed.load(Ordering::Relaxed)) else { return Ok(done) };
+            let mut found = Vec::new();
+            if let Err(e) = introduced(src, job, filter, &walked, &mut found) {
+                failed.store(true, Ordering::Relaxed);
+                return Err(e);
             }
-            match parents(&oid).get(next) {
-                Some(parent) => {
-                    stack.push((oid, next + 1));
-                    if among.contains(parent) && !placed.contains(parent) {
-                        stack.push((*parent, 0));
-                    }
-                }
-                None => {
-                    if placed.insert(oid) {
-                        order.push(oid);
-                    }
-                }
-            }
+            done.push((number, found));
+        }
+    };
+    let parts: Vec<Result<Numbered>> = match threads {
+        1 => vec![work()],
+        _ => std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads).map(|_| scope.spawn(work)).collect();
+            workers.into_iter().map(|worker| worker.join().expect("a walk does not panic")).collect()
+        }),
+    };
+    let mut ordered: Vec<Vec<Found>> = (0..count).map(|_| Vec::new()).collect();
+    for part in parts {
+        for (number, found) in part? {
+            ordered[number] = found;
         }
     }
-    order.reverse();
-    order
+    Ok(ordered)
 }
 
 const QUEUED: u8 = 1;
@@ -698,9 +752,12 @@ pub fn plan_fetch(packs: &PackSet, wants: &[Oid], haves: &[Oid], shallow: &Shall
     let mut sent = OidSet::default();
     let mut jobs = Vec::new();
     let mut wanted_blobs = Vec::new();
+    // Everything the request names, down through tags to what they point at.
+    let mut named = Vec::new();
     for oid in wants.iter().chain(&shallow.extra_tips) {
         let mut current = *oid;
         loop {
+            named.push(current);
             let object = packs.get(&current)?.ok_or(Error::Missing(current))?;
             match object.kind {
                 ObjectKind::Commit => walk.enqueue(current, false)?,
@@ -734,10 +791,11 @@ pub fn plan_fetch(packs: &PackSet, wants: &[Oid], haves: &[Oid], shallow: &Shall
 
     let commits = walk.run(shallow)?;
     sent.extend(commits.iter().copied());
-    objects.extend(commits.iter().map(|oid| (*oid, None)));
+    objects.extend(commits.iter().filter(|oid| filter.keeps_kind(ObjectKind::Commit) || named.contains(*oid)).map(|oid| (*oid, None)));
 
     let have_trees: Vec<Oid> = have_tips.iter().take(MAX_HAVE_TREES).map(|oid| walk.info[oid].tree).collect();
-    for oid in &parents_last(&commits, |oid| &walk.info[oid].parents) {
+    // Oldest first, as the objects will stand in the pack.
+    for oid in commits.iter().rev() {
         let info = &walk.info[oid];
         let known = if shallow.boundary.contains(oid) {
             // The real parents are cut off, so the best guess at what the
@@ -750,9 +808,9 @@ pub fn plan_fetch(packs: &PackSet, wants: &[Oid], haves: &[Oid], shallow: &Shall
         };
         jobs.push(TreeJob { tree: info.tree, known, depth: 0, path: Vec::new() });
     }
-    let mut found = Vec::new();
-    diff_trees(packs, jobs, filter, &mut |oid| Ok(sent.insert(*oid)), &mut |oid, base| found.push((oid, base)))?;
-    objects.extend(found);
+    for found in introduced_by(packs, jobs, filter)? {
+        objects.extend(found.into_iter().filter(|(oid, _)| sent.insert(*oid)));
+    }
     objects.extend(wanted_blobs.into_iter().filter(|oid| sent.insert(*oid)).map(|oid| (oid, None)));
 
     let mut bitmaps = Vec::new();
@@ -769,11 +827,10 @@ pub fn plan_fetch(packs: &PackSet, wants: &[Oid], haves: &[Oid], shallow: &Shall
                 }
             }
             let kinds = pack.bitmaps().expect("bits come from this pack's bitmaps");
-            if filter.omits_all_blobs() {
-                bits.subtract(&kinds.of_kind(ObjectKind::Blob)?);
-            }
-            if filter.tree_depth == Some(0) {
-                bits.subtract(&kinds.of_kind(ObjectKind::Tree)?);
+            for kind in [ObjectKind::Commit, ObjectKind::Tree, ObjectKind::Blob, ObjectKind::Tag] {
+                if filter.omits_all(kind) {
+                    bits.subtract(&kinds.of_kind(kind)?);
+                }
             }
             bitmaps.push(BitmapSelection { pack: pack.clone(), bits });
         }
@@ -795,6 +852,12 @@ pub fn plan_fetch(packs: &PackSet, wants: &[Oid], haves: &[Oid], shallow: &Shall
     }
     let plan = FetchPlan { objects: Vec::new(), bitmaps };
     objects.retain(|(oid, _)| !plan.in_bitmaps(oid));
+    if filter.omitted_kinds.contains(&true) {
+        // What was asked for by name comes whatever its kind, also where a
+        // bitmap would have brought it and no longer does.
+        let listed: OidSet = objects.iter().map(|(oid, _)| *oid).collect();
+        objects.extend(named.iter().filter(|oid| !listed.contains(*oid) && !plan.in_bitmaps(oid)).map(|oid| (*oid, None)));
+    }
     Ok(FetchPlan { objects, ..plan })
 }
 
@@ -819,7 +882,7 @@ pub struct BitmapContext<'a> {
 ///
 /// A tip is left out when the pack and the available base bitmaps do not
 /// account for its whole history, or when it is fully covered elsewhere.
-pub fn reachability_bitmaps(src: &dyn ObjectSource, tips: &[Oid], context: &BitmapContext<'_>) -> Result<Vec<Reachable>> {
+pub fn reachability_bitmaps(src: &(dyn ObjectSource + Sync), tips: &[Oid], context: &BitmapContext<'_>) -> Result<Vec<Reachable>> {
     // Oldest first, so that each bitmap builds on those of its ancestors.
     let tips = dated_tips(src, tips)?;
 
@@ -856,10 +919,8 @@ pub fn reachability_bitmaps(src: &dyn ObjectSource, tips: &[Oid], context: &Bitm
         }
 
         let trees: HashMap<Oid, Oid> = fresh.iter().map(|(oid, _, commit)| (*oid, commit.tree)).collect();
-        let by_oid: HashMap<Oid, &(Oid, usize, CommitInfo)> = fresh.iter().map(|entry| (entry.0, entry)).collect();
-        let order = parents_last(&fresh.iter().map(|(oid, _, _)| *oid).collect::<Vec<_>>(), |oid| &by_oid[oid].2.parents);
         let mut jobs = Vec::new();
-        for (_, index, commit) in order.iter().map(|oid| by_oid[oid]) {
+        for (_, index, commit) in &fresh {
             if bits.get(*index) {
                 // Reachable from a commit that already has a bitmap.
                 continue;
@@ -875,17 +936,13 @@ pub fn reachability_bitmaps(src: &dyn ObjectSource, tips: &[Oid], context: &Bitm
             jobs.push(TreeJob { tree: commit.tree, known, depth: 0, path: Vec::new() });
         }
 
-        let mut mark = |oid: &Oid| -> Result<bool> {
-            let Some(index) = (context.position)(oid) else {
+        for (oid, _) in introduced_by(src, jobs, &Filter::default())?.into_iter().flatten() {
+            match (context.position)(&oid) {
+                Some(index) => bits.set(index),
                 // Not ours to describe; if a base covers it, it covers everything below it too.
-                outside.push(*oid);
-                return Ok(false);
-            };
-            let new = !bits.get(index);
-            bits.set(index);
-            Ok(new)
-        };
-        diff_trees(src, jobs, &Filter::default(), &mut mark, &mut |_, _| {})?;
+                None => outside.push(oid),
+            }
+        }
 
         bases.sort();
         bases.dedup();
@@ -968,7 +1025,11 @@ mod tests {
         assert_eq!(combined.sparse_names(), ["abc+def"]);
         assert!(!combined.fits_bitmaps());
         assert!(parsed("combine:blob:none+tree:0").fits_bitmaps());
-        for unsupported in ["tree:x", "sparse:oid=", "sparse:path=x", "blob:limit=", "blob:limit=x", "object:type=blob", "combine:blob:none+nonsense", "combine:%zz"] {
+        assert!(parsed("object:type=blob").keeps_kind(crate::ObjectKind::Blob));
+        assert!(!parsed("object:type=blob").keeps_kind(crate::ObjectKind::Tree));
+        // Two kinds at once leave nothing.
+        assert!(!parsed("combine:object:type=blob+object:type=tree").keeps_kind(crate::ObjectKind::Blob));
+        for unsupported in ["tree:x", "sparse:oid=", "sparse:path=x", "blob:limit=", "blob:limit=x", "object:type=file", "combine:blob:none+nonsense", "combine:%zz"] {
             assert_eq!(Filter::parse(unsupported), None, "{unsupported}");
         }
     }

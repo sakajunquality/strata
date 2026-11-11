@@ -2,8 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bytes::{Buf, Bytes};
 use flate2::write::ZlibEncoder;
@@ -801,26 +801,18 @@ struct RawEntry {
     oid: Option<Oid>,
 }
 
-struct Resolver<'a> {
-    data: &'a dyn PackData,
-    raws: Vec<RawEntry>,
+/// What resolving deltas finds out, gathered apart by each thread at it.
+#[derive(Default)]
+struct Noted {
+    /// The ids worked out for entries, by entry number.
+    ids: Vec<(usize, Oid)>,
     /// Every commit seen, for the pack's commit-graph.
     commits: Vec<(Oid, CommitInfo)>,
-    /// Ofs-deltas waiting on the entry at each index.
-    ofs_children: HashMap<usize, Vec<usize>>,
-    /// Ref-deltas waiting on an object id.
-    ref_waiting: HashMap<Oid, Vec<usize>>,
     /// Every object some object of the pack points at.
     references: HashSet<Oid>,
 }
 
-impl Resolver<'_> {
-    fn payload(&self, index: usize) -> Result<Vec<u8>> {
-        let raw = &self.raws[index];
-        let size = usize::try_from(raw.size).map_err(|_| corrupt("pack entry size overflow"))?;
-        inflate(&mut Cursor::new(self.data, raw.offset + u64::from(raw.header_len)), size)
-    }
-
+impl Noted {
     /// Notes what an object points at: a commit's tree and parents, a tag's
     /// target, a tree's entries.
     fn note(&mut self, oid: Oid, kind: ObjectKind, data: &[u8]) -> Result<()> {
@@ -843,26 +835,70 @@ impl Resolver<'_> {
         Ok(())
     }
 
-    fn has_dependants(&self, index: usize, oid: &Oid) -> bool {
-        self.ofs_children.contains_key(&index) || self.ref_waiting.contains_key(oid)
+    fn merge(&mut self, other: Noted) {
+        self.ids.extend(other.ids);
+        self.commits.extend(other.commits);
+        self.references.extend(other.references);
+    }
+}
+
+struct Resolver<'a> {
+    data: &'a dyn PackData,
+    raws: Vec<RawEntry>,
+    /// Ofs-deltas waiting on the entry at each index.
+    ofs_children: HashMap<usize, Vec<usize>>,
+    /// Ref-deltas waiting on an object id. Whoever resolves that object
+    /// takes them, whichever thread it is on.
+    ref_waiting: Mutex<HashMap<Oid, Vec<usize>>>,
+    /// How many ids are waited on. Packs that git pushes use ofs-deltas, so
+    /// this is mostly zero, and then nobody has to take the lock to see.
+    ref_left: AtomicUsize,
+}
+
+impl Resolver<'_> {
+    fn payload(&self, index: usize) -> Result<Vec<u8>> {
+        let raw = &self.raws[index];
+        let size = usize::try_from(raw.size).map_err(|_| corrupt("pack entry size overflow"))?;
+        inflate(&mut Cursor::new(self.data, raw.offset + u64::from(raw.header_len)), size)
     }
 
-    /// Assigns ids to every delta that transitively depends on `object` (the
-    /// entry at `index`, if it is part of the pack).
-    fn resolve_from(&mut self, index: Option<usize>, object: Object) -> Result<()> {
+    fn wait_on(&mut self, base: Oid, index: usize) {
+        let waiting = self.ref_waiting.get_mut().expect("no panics while held");
+        waiting.entry(base).or_default().push(index);
+        *self.ref_left.get_mut() = waiting.len();
+    }
+
+    fn take_waiting(&self, oid: &Oid) -> Vec<usize> {
+        if self.ref_left.load(Ordering::Relaxed) == 0 {
+            return Vec::new();
+        }
+        let mut waiting = self.ref_waiting.lock().expect("no panics while held");
+        let taken = waiting.remove(oid).unwrap_or_default();
+        self.ref_left.store(waiting.len(), Ordering::Relaxed);
+        taken
+    }
+
+    fn has_dependants(&self, index: usize, oid: &Oid) -> bool {
+        self.ofs_children.contains_key(&index) || self.ref_waiting.lock().expect("no panics while held").contains_key(oid)
+    }
+
+    /// Works out the id of every delta that transitively depends on `object`
+    /// (the entry at `index`, if it is part of the pack). Deltas form trees,
+    /// so two calls for different objects never meet.
+    fn resolve_from(&self, index: Option<usize>, object: Object, noted: &mut Noted) -> Result<()> {
         let mut stack = vec![(index, object)];
         while let Some((index, object)) = stack.pop() {
             let oid = object.oid();
-            // A whole object of the pack was noted when it was first read.
-            if index.is_none_or(|i| self.raws[i].whole.is_none()) && index.is_some() {
-                self.note(oid, object.kind, &object.data)?;
-            }
             let mut children = Vec::new();
             if let Some(i) = index {
-                self.raws[i].oid = Some(oid);
-                children = self.ofs_children.remove(&i).unwrap_or_default();
+                // A whole object of the pack was noted when it was first read.
+                if self.raws[i].whole.is_none() {
+                    noted.note(oid, object.kind, &object.data)?;
+                }
+                noted.ids.push((i, oid));
+                children = self.ofs_children.get(&i).cloned().unwrap_or_default();
             }
-            children.extend(self.ref_waiting.remove(&oid).unwrap_or_default());
+            children.extend(self.take_waiting(&oid));
             for child in children {
                 let delta = self.payload(child)?;
                 let data = delta::apply(&object.data, &delta)?;
@@ -871,7 +907,49 @@ impl Resolver<'_> {
         }
         Ok(())
     }
+
+    /// Resolves everything that hangs off the whole objects of the pack, on
+    /// several threads when there is enough of it: each takes the next whole
+    /// object and the deltas built on it, a family at a time.
+    fn resolve_all(&self) -> Result<Noted> {
+        let roots: Vec<usize> =
+            (0..self.raws.len()).filter(|i| matches!((self.raws[*i].whole, self.raws[*i].oid), (Some(_), Some(oid)) if self.has_dependants(*i, &oid))).collect();
+        let threads = match roots.len() {
+            0..RESOLVE_PARALLEL_FROM => 1,
+            _ => std::thread::available_parallelism().map_or(1, usize::from).min(MAX_RESOLVE_THREADS),
+        };
+        let (next, failed) = (AtomicUsize::new(0), AtomicBool::new(false));
+        let work = || -> Result<Noted> {
+            let mut noted = Noted::default();
+            while let Some(&i) = roots.get(next.fetch_add(1, Ordering::Relaxed)).filter(|_| !failed.load(Ordering::Relaxed)) {
+                let kind = self.raws[i].whole.expect("roots are whole objects");
+                let resolved = self.payload(i).and_then(|data| self.resolve_from(Some(i), Object { kind, data: data.into() }, &mut noted));
+                if let Err(e) = resolved {
+                    failed.store(true, Ordering::Relaxed);
+                    return Err(e);
+                }
+            }
+            Ok(noted)
+        };
+        let parts: Vec<Result<Noted>> = match threads {
+            1 => vec![work()],
+            _ => std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..threads).map(|_| scope.spawn(work)).collect();
+                workers.into_iter().map(|worker| worker.join().expect("resolving does not panic")).collect()
+            }),
+        };
+        let mut all = Noted::default();
+        for part in parts {
+            all.merge(part?);
+        }
+        Ok(all)
+    }
 }
+
+/// Below this many delta families, threads cost more than they save.
+const RESOLVE_PARALLEL_FROM: usize = 256;
+/// Each thread holds a delta family in memory.
+const MAX_RESOLVE_THREADS: usize = 8;
 
 /// Validates a pack received from a client and builds its index.
 ///
@@ -903,11 +981,11 @@ pub fn index_pack(data: &dyn PackData, existing: &dyn ObjectSource) -> Result<In
     let mut resolver = Resolver {
         data,
         raws: Vec::with_capacity(count.min(1 << 20)),
-        commits: Vec::new(),
         ofs_children: HashMap::new(),
-        ref_waiting: HashMap::new(),
-        references: HashSet::new(),
+        ref_waiting: Mutex::new(HashMap::new()),
+        ref_left: AtomicUsize::new(0),
     };
+    let mut noted = Noted::default();
     for i in 0..count {
         let offset = cursor.offset;
         cursor.crc = Some(crc32fast::Hasher::new());
@@ -927,7 +1005,7 @@ pub fn index_pack(data: &dyn PackData, existing: &dyn ObjectSource) -> Result<In
                     }
                 })?;
                 let oid = Oid::from_bytes(&hash.finalize()).expect("sha1 is 20 bytes");
-                resolver.note(oid, kind, &text)?;
+                noted.note(oid, kind, &text)?;
                 Some(oid)
             }
             EntryKind::OfsDelta(base) => {
@@ -941,7 +1019,7 @@ pub fn index_pack(data: &dyn PackData, existing: &dyn ObjectSource) -> Result<In
                 None
             }
             EntryKind::RefDelta(base) => {
-                resolver.ref_waiting.entry(base).or_default().push(i);
+                resolver.wait_on(base, i);
                 inflate_to(&mut cursor, entry.size, &mut |_| {})?;
                 None
             }
@@ -968,21 +1046,19 @@ pub fn index_pack(data: &dyn PackData, existing: &dyn ObjectSource) -> Result<In
     }
 
     // Pass 2: resolve deltas outward from every whole object something depends on.
-    for i in 0..count {
-        if let (Some(kind), Some(oid)) = (resolver.raws[i].whole, resolver.raws[i].oid) {
-            if resolver.has_dependants(i, &oid) {
-                let data = resolver.payload(i)?;
-                resolver.resolve_from(Some(i), Object { kind, data: data.into() })?;
-            }
-        }
-    }
+    noted.merge(resolver.resolve_all()?);
 
     // Whatever is still waiting has its base outside the pack.
     let mut thin_bases = Vec::new();
-    while let Some(base) = resolver.ref_waiting.keys().next().copied() {
+    loop {
+        let waited_on = resolver.ref_waiting.lock().expect("no panics while held").keys().next().copied();
+        let Some(base) = waited_on else { break };
         let object = existing.get(&base)?.ok_or(Error::Missing(base))?;
         thin_bases.push((base, object.clone()));
-        resolver.resolve_from(None, object)?;
+        resolver.resolve_from(None, object, &mut noted)?;
+    }
+    for (index, oid) in std::mem::take(&mut noted.ids) {
+        resolver.raws[index].oid = Some(oid);
     }
 
     let mut entries = Vec::with_capacity(count + thin_bases.len());
@@ -991,9 +1067,9 @@ pub fn index_pack(data: &dyn PackData, existing: &dyn ObjectSource) -> Result<In
         entries.push(IdxEntry { oid, offset: raw.offset, crc32: raw.crc32 });
     }
 
-    let graph = CommitGraph::build(std::mem::take(&mut resolver.commits));
+    let graph = CommitGraph::build(std::mem::take(&mut noted.commits));
     let own: HashSet<Oid> = entries.iter().map(|entry| entry.oid).collect();
-    let mut outside: Vec<Oid> = resolver.references.iter().filter(|oid| !own.contains(oid)).copied().collect();
+    let mut outside: Vec<Oid> = noted.references.iter().filter(|oid| !own.contains(oid)).copied().collect();
     outside.sort();
     if thin_bases.is_empty() {
         let checksum = Oid::from_bytes(&trailer).expect("20 bytes");
@@ -1244,6 +1320,30 @@ pub(crate) mod tests {
         let mut expected = vec![parent, absent.oid()];
         expected.sort();
         assert_eq!(index_pack(&pack_of(&[commit, tree, kept]), &PackSet::default()).unwrap().outside, expected);
+    }
+
+    #[test]
+    fn many_delta_families_are_resolved_side_by_side() {
+        // Enough families for several threads, each a whole object and a delta on it.
+        let families: Vec<(Object, Object)> = (0..600u32)
+            .map(|n| {
+                let old: Vec<u8> = (0..200).flat_map(|i| format!("family {n} line {i}\n").into_bytes()).collect();
+                let new = [&old[..], b"and one more\n"].concat();
+                (blob(&old), blob(&new))
+            })
+            .collect();
+        let all: Vec<Object> = families.iter().flat_map(|(old, new)| [old.clone(), new.clone()]).collect();
+        let stored = set_of(&pack_of(&all), &PackSet::default());
+        let mut w = PackWriter::recording(Vec::new(), 1200).unwrap();
+        for (old, new) in &families {
+            w.add(old.kind, &old.data).unwrap();
+            assert!(w.add_new_delta(&stored, &new.oid(), &old.oid()).unwrap());
+        }
+        let finished = w.finish().unwrap();
+        let written = PackIndex::new(finished.entries, finished.checksum);
+        let indexed = index_pack(&Bytes::from(finished.out), &PackSet::default()).unwrap();
+        assert_eq!(indexed.index.len(), 1200);
+        assert_eq!(written.encoded(), indexed.index.encoded());
     }
 
     #[test]
