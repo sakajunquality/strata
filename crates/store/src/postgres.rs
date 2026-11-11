@@ -13,11 +13,13 @@ use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use strata_git::Oid;
 use tokio_postgres::IsolationLevel;
 
-use crate::meta::{final_refs, new_repo, unix_now, Event, Garbage, MetaError, MetaStore, RepoState, Txn};
+use crate::meta::{
+    final_refs, new_repo, prefix_end, unix_now, Event, Garbage, MetaError, MetaStore, RefScope, RepoState, Txn,
+};
 
 /// Run under an advisory lock, so that nodes starting together do not trip
 /// over each other creating the same tables.
-const SCHEMA: &str = "
+const SCHEMA: &str = r#"
 BEGIN;
 SELECT pg_advisory_xact_lock(7305881);
 CREATE TABLE IF NOT EXISTS repos (
@@ -29,10 +31,21 @@ CREATE TABLE IF NOT EXISTS repos (
 );
 CREATE TABLE IF NOT EXISTS refs (
     repo TEXT NOT NULL REFERENCES repos (name) ON DELETE CASCADE,
-    name TEXT NOT NULL,
+    name TEXT COLLATE "C" NOT NULL,
     oid  TEXT NOT NULL,
     PRIMARY KEY (repo, name)
 );
+-- Ref names are ordered byte by byte, so that the refs under a prefix are a
+-- range of the primary key. Tables created before this are changed over once.
+DO $$ BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema() AND table_name = 'refs' AND column_name = 'name'
+            AND collation_name IS DISTINCT FROM 'C'
+    ) THEN
+        ALTER TABLE refs ALTER COLUMN name TYPE TEXT COLLATE "C";
+    END IF;
+END $$;
 CREATE TABLE IF NOT EXISTS packs (
     pool_id TEXT NOT NULL,
     pack_id TEXT NOT NULL,
@@ -59,7 +72,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_feed ON events (xid, id);
 COMMIT;
-";
+"#;
 
 /// Connections kept open per node.
 const POOL_SIZE: usize = 16;
@@ -150,7 +163,7 @@ impl MetaStore for PostgresMetaStore {
         Ok(repo)
     }
 
-    async fn get_repo(&self, name: &str) -> Result<Option<RepoState>, MetaError> {
+    async fn get_repo(&self, name: &str, scope: &RefScope) -> Result<Option<RepoState>, MetaError> {
         let mut client = self.pool.get().await?;
         // One snapshot, so that refs and packs belong together.
         let tx = client
@@ -169,11 +182,30 @@ impl MetaStore for PostgresMetaStore {
             return Ok(None);
         };
         let pool_id: String = row.get(0);
+        let head: String = row.get(1);
+        let mut found = Vec::new();
+        match scope {
+            RefScope::All => {
+                found.push(tx.query("SELECT name, oid FROM refs WHERE repo = $1", &[&name]).await?);
+            }
+            RefScope::Names(names) => {
+                let names: Vec<&str> = names.iter().chain([&head]).map(String::as_str).collect();
+                found.push(tx.query("SELECT name, oid FROM refs WHERE repo = $1 AND name = ANY($2)", &[&name, &names]).await?);
+            }
+            RefScope::Prefixes(prefixes) => {
+                found.push(tx.query("SELECT name, oid FROM refs WHERE repo = $1 AND name = $2", &[&name, &head]).await?);
+                for prefix in prefixes {
+                    found.push(match prefix_end(prefix) {
+                        Some(end) => {
+                            tx.query("SELECT name, oid FROM refs WHERE repo = $1 AND name >= $2 AND name < $3", &[&name, prefix, &end]).await?
+                        }
+                        None => tx.query("SELECT name, oid FROM refs WHERE repo = $1 AND name >= $2", &[&name, prefix]).await?,
+                    });
+                }
+            }
+        }
         let mut refs = BTreeMap::new();
-        for row in tx
-            .query("SELECT name, oid FROM refs WHERE repo = $1", &[&name])
-            .await?
-        {
+        for row in found.iter().flatten() {
             let (ref_name, hex): (String, &str) = (row.get(0), row.get(1));
             let oid = Oid::from_hex(hex)
                 .ok_or_else(|| backend(format!("bad oid stored for {ref_name}")))?;
@@ -189,7 +221,7 @@ impl MetaStore for PostgresMetaStore {
         Ok(Some(RepoState {
             name: name.to_string(),
             pool_id,
-            head: row.get(1),
+            head,
             refs,
             packs: packs.iter().map(|r| r.get(0)).collect(),
             epoch: row.get::<_, i64>(2) as u64,

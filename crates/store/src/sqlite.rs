@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use strata_git::Oid;
 
-use crate::meta::{new_repo, unix_now, Event, Garbage, MetaError, MetaStore, RepoState, Txn};
+use crate::meta::{new_repo, prefix_end, unix_now, Event, Garbage, MetaError, MetaStore, RefScope, RepoState, Txn};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS repos (
@@ -93,7 +93,7 @@ impl SqliteMetaStore {
     }
 }
 
-fn load_repo(conn: &Connection, name: &str) -> Result<Option<RepoState>, MetaError> {
+fn load_repo(conn: &Connection, name: &str, scope: &RefScope) -> Result<Option<RepoState>, MetaError> {
     let row = conn
         .query_row("SELECT pool_id, head, epoch, refs_version FROM repos WHERE name = ?1", [name], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
@@ -102,12 +102,33 @@ fn load_repo(conn: &Connection, name: &str) -> Result<Option<RepoState>, MetaErr
     let Some((pool_id, head, epoch, refs_version)) = row else { return Ok(None) };
 
     let mut refs = BTreeMap::new();
-    let mut stmt = conn.prepare("SELECT name, oid FROM refs WHERE repo = ?1")?;
-    let rows = stmt.query_map([name], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-    for row in rows {
-        let (ref_name, hex) = row?;
-        let oid = Oid::from_hex(&hex).ok_or_else(|| MetaError::Backend(format!("bad oid stored for {ref_name}")))?;
-        refs.insert(ref_name, oid);
+    let mut read = |condition: &str, values: &[&str]| -> Result<(), MetaError> {
+        let mut stmt = conn.prepare_cached(&format!("SELECT name, oid FROM refs WHERE repo = ?1{condition}"))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter([name].iter().chain(values)), |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (ref_name, hex) = row?;
+            let oid = Oid::from_hex(&hex).ok_or_else(|| MetaError::Backend(format!("bad oid stored for {ref_name}")))?;
+            refs.insert(ref_name, oid);
+        }
+        Ok(())
+    };
+    match scope {
+        RefScope::All => read("", &[])?,
+        RefScope::Names(names) => {
+            for wanted in names.iter().chain([&head]) {
+                read(" AND name = ?2", &[wanted.as_str()])?;
+            }
+        }
+        RefScope::Prefixes(prefixes) => {
+            read(" AND name = ?2", &[head.as_str()])?;
+            // Names compare byte by byte here, so a prefix is a range of the primary key.
+            for prefix in prefixes {
+                match prefix_end(prefix) {
+                    Some(end) => read(" AND name >= ?2 AND name < ?3", &[prefix.as_str(), end.as_str()])?,
+                    None => read(" AND name >= ?2", &[prefix.as_str()])?,
+                }
+            }
+        }
     }
 
     let mut stmt = conn.prepare("SELECT pack_id FROM packs WHERE pool_id = ?1 ORDER BY seq")?;
@@ -141,12 +162,12 @@ impl MetaStore for SqliteMetaStore {
         .await
     }
 
-    async fn get_repo(&self, name: &str) -> Result<Option<RepoState>, MetaError> {
-        let name = name.to_string();
+    async fn get_repo(&self, name: &str, refs: &RefScope) -> Result<Option<RepoState>, MetaError> {
+        let (name, refs) = (name.to_string(), refs.clone());
         self.run(move |conn| {
             // One read transaction so refs and packs come from the same snapshot.
             let tx = conn.transaction()?;
-            load_repo(&tx, &name)
+            load_repo(&tx, &name, &refs)
         })
         .await
     }

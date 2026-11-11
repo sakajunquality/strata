@@ -12,7 +12,7 @@ use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use bytes::Bytes;
-use strata_store::{MetaError, MetaStore, PackStore, Txn};
+use strata_store::{MetaError, MetaStore, PackStore, RefScope, Txn};
 
 mod auth;
 mod compaction;
@@ -36,6 +36,13 @@ pub struct Options {
     pub scratch_dir: PathBuf,
     /// Number of packs at which a push asks for the pool to be compacted.
     pub compact_at: usize,
+    /// A push bringing this many objects into a pool where nothing has
+    /// bitmaps asks for the whole pool to be compacted, to get them. Without
+    /// bitmaps a clone walks all of history, and a fetch cannot tell what
+    /// the client has beyond the commits it names: it then sends again what
+    /// the client got by another way, such as changes picked onto a release
+    /// branch. Below this size, walking is quick enough. Zero: never.
+    pub bitmaps_from: usize,
     /// Whether a compaction that rewrites a whole pool leaves out objects no
     /// ref reaches any more.
     pub prune: bool,
@@ -62,12 +69,20 @@ pub struct Options {
     pub event_retention: Duration,
 }
 
+impl Options {
+    /// Whether a pool of this many objects, none of them covered by bitmaps, should get them now.
+    pub(crate) fn wants_bitmaps(&self, objects: usize) -> bool {
+        self.bitmaps_from > 0 && objects >= self.bitmaps_from
+    }
+}
+
 impl Default for Options {
     fn default() -> Self {
         Options {
             auto_create: false,
             scratch_dir: std::env::temp_dir(),
             compact_at: 8,
+            bitmaps_from: 20_000,
             prune: true,
             gc_grace: Duration::from_secs(3600),
             orphan_grace: Duration::from_secs(24 * 3600),
@@ -213,14 +228,17 @@ async fn route(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body: 
         return match service {
             Some("git-upload-pack") => {
                 let granted = auth::authorize_git(app, headers, name, Access::Read).await?;
-                let repo = app.meta.get_repo(&granted.repo).await?.ok_or_else(HttpError::not_found)?;
+                // Version 2 lists refs only when asked, and then only those asked about.
+                let scope = if wants_v2(headers) { RefScope::none() } else { RefScope::All };
+                let repo = app.meta.get_repo(&granted.repo, &scope).await?.ok_or_else(HttpError::not_found)?;
                 let advertisement =
                     if wants_v2(headers) { upload_pack::advertise() } else { upload_pack::advertise_v0(app, &repo).await? };
                 Ok(git_response("upload-pack-advertisement", advertisement))
             }
             Some("git-receive-pack") => {
                 let granted = auth::authorize_git(app, headers, name, Access::Write).await?;
-                let repo = app.meta.get_repo(&granted.repo).await?;
+                // A push opens with every ref: the protocol has no way to ask for some.
+                let repo = app.meta.get_repo(&granted.repo, &RefScope::All).await?;
                 if repo.is_none() && !app.options.auto_create {
                     return Err(HttpError::not_found());
                 }
@@ -235,14 +253,14 @@ async fn route(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body: 
             return Err(method_not_allowed());
         }
         let granted = auth::authorize_git(app, headers, repo_name(name)?, Access::Read).await?;
-        let repo = app.meta.get_repo(&granted.repo).await?.ok_or_else(HttpError::not_found)?;
         let body = axum::body::to_bytes(body, MAX_FETCH_REQUEST)
             .await
             .map_err(|_| HttpError::new(StatusCode::PAYLOAD_TOO_LARGE, "fetch request too large"))?;
         let body = decode_body(headers, body)?;
         let response = if wants_v2(headers) {
-            upload_pack::handle(app, repo, body).await?
+            upload_pack::handle(app, &granted.repo, body).await?
         } else {
+            let repo = app.meta.get_repo(&granted.repo, &RefScope::none()).await?.ok_or_else(HttpError::not_found)?;
             upload_pack::handle_v0(app, repo, body).await?
         };
         return Ok(git_response("upload-pack-result", response));
@@ -253,14 +271,10 @@ async fn route(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body: 
             return Err(method_not_allowed());
         }
         let granted = auth::authorize_git(app, headers, repo_name(name)?, Access::Write).await?;
-        let repo = app.meta.get_repo(&granted.repo).await?;
-        if repo.is_none() && !app.options.auto_create {
-            return Err(HttpError::not_found());
-        }
         if headers.contains_key(header::CONTENT_ENCODING) {
             return Err(HttpError::new(StatusCode::UNSUPPORTED_MEDIA_TYPE, "compressed push bodies are not supported"));
         }
-        let result = receive_pack::handle(app, &granted, repo, body).await?;
+        let result = receive_pack::handle(app, &granted, body).await?;
         return Ok(git_response("receive-pack-result", result));
     }
 
@@ -284,8 +298,7 @@ async fn repos(app: &App, method: &Method, rest: &str, query: &str, body: Body) 
         if method != Method::GET {
             return Err(method_not_allowed());
         }
-        let repo = app.meta.get_repo(name).await?.ok_or_else(HttpError::not_found)?;
-        return content::handle(app, repo, view, query).await;
+        return content::handle(app, name, view, query).await;
     }
     if let Some(name) = rest.strip_suffix("/merge") {
         let name = repo_name(name)?;
@@ -299,7 +312,7 @@ async fn repos(app: &App, method: &Method, rest: &str, query: &str, body: Body) 
         if method != Method::POST {
             return Err(method_not_allowed());
         }
-        app.meta.get_repo(name).await?.ok_or_else(HttpError::not_found)?;
+        app.meta.get_repo(name, &RefScope::none()).await?.ok_or_else(HttpError::not_found)?;
         return Ok(match compact(app, name, true).await? {
             Some(report) => format!("merged {} packs into one holding {} objects\n", report.merged, report.objects).into_response(),
             None => "nothing to do\n".into_response(),
@@ -330,7 +343,7 @@ async fn repos(app: &App, method: &Method, rest: &str, query: &str, body: Body) 
             Err(e) => Err(e.into()),
         },
         Method::GET => {
-            let repo = app.meta.get_repo(name).await?.ok_or_else(HttpError::not_found)?;
+            let repo = app.meta.get_repo(name, &RefScope::All).await?.ok_or_else(HttpError::not_found)?;
             let packs = app.packs.open_each(&repo.pool_id, &repo.packs).await?;
             Ok(json(
                 StatusCode::OK,

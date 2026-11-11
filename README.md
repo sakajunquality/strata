@@ -31,12 +31,21 @@ comparing trees path by path, so the cost of an incremental fetch follows the
 size of the change rather than of the repository. Where the client has the
 previous version of a changed file, only a delta against it is sent.
 
+A request reads only the refs it is about: the ones a fetch asks to have
+listed, the ones a push updates, the one a revision names. A repository with
+hundreds of thousands of refs answers as fast as one with ten, except where
+every ref is asked for.
+
 Compaction runs behind pushes (`--compact-at`). It merges the smallest packs
 so that pack sizes stay in geometric progression, which keeps the pack count
 logarithmic while rewriting the bulk of a repository only rarely. Every merged
 pack gets reachability bitmaps: complete ones when the whole pool is merged,
 otherwise a layer that builds on the bitmaps of the packs left alone. With
-bitmaps a clone is a sequential copy of the packs. A merge of the whole pool
+bitmaps a clone is a sequential copy of the packs, and a fetch knows what the
+client has beyond the commits it names. A push that brings a lot of history
+into a repository where nothing has bitmaps yet (an import) has the whole
+pool merged right behind it (`--bitmaps-from`, 20,000 objects by default)
+rather than leaving that to the pushes that follow. A merge of the whole pool
 also drops objects no ref reaches (`--no-prune` keeps them) and stores changed
 files as deltas against their previous versions. Replaced packs are deleted
 after a grace period (`--gc-grace-secs`), as are packs left behind by pushes
@@ -132,7 +141,8 @@ anything is stored, which is where protected branches go:
 
 `change` is `create`, `delete`, `fast-forward` or `forced`. `commits` are the
 commits the update brings to its ref, newest first: for a ref that moves,
-those its old value lacks, and for a new one, those no ref has yet. Up to
+those its old value lacks, and for a new one, those the repository did not
+have before the push. Up to
 1000 are listed. Each is described as the content API describes a commit,
 which includes its `signature`: null, or the signature itself with its
 `format` (`openpgp`, `ssh` or `x509`) and the `payload` it signs, in base64.
@@ -165,7 +175,7 @@ CI triggers and audit logs are built from this, with whatever retries they need.
 | `PUT /api/repos/<id>/head` | Point HEAD (the default branch) at the ref named in the body. |
 | `DELETE /api/repos/<id>` | Remove it. It is gone at once; its packs are deleted after the grace period. |
 | `POST /api/repos/<id>/compact` | Rewrite its packs into one now. |
-| `GET /api/repos/<id>/refs` | HEAD and every ref with the id it points at. |
+| `GET /api/repos/<id>/refs` | HEAD and every ref with the id it points at. `prefix=refs/heads/` lists only the refs under a prefix. |
 | `GET /api/repos/<id>/commits?rev=&skip=&limit=` | History of a revision, newest first, up to 100 at a time. |
 | `GET /api/repos/<id>/commit?rev=` | One commit and the files it changed against its first parent. |
 | `GET /api/repos/<id>/tree?rev=&path=` | A directory listing. |
@@ -223,6 +233,7 @@ cargo test --workspace   # includes end-to-end tests driving the real git client
 ./scripts/meta-test.sh   # PostgreSQL and the Spanner emulator in Docker: backend tests, then two nodes sharing each
 cargo build --release && FILES=50000 COMMITS=100 ./scripts/bench.sh   # timings and server memory on a synthetic repository
 ./scripts/bench-repo.sh /path/to/bare.git master   # the same against a real repository
+./scripts/bench-refs.sh  # the requests git makes, against a repository with 150,000 refs
 ```
 
 Against git's own repository (83k commits, 412k objects, a 301 MiB pack), on
@@ -246,14 +257,34 @@ The same history pushed in 100 pieces and then compacted takes the same
 
 Pushes and walks through history use up to eight threads each.
 
+With 100,000 branches and 50,000 annotated tags in one repository
+(`./scripts/bench-refs.sh`), the server's time per request, with the metadata
+in SQLite and in PostgreSQL 17 on the same machine:
+
+| | SQLite | PostgreSQL |
+|---|---|---|
+| Fetch: list one branch | 0.3 ms | 3 ms |
+| Fetch: list the 200 branches under a prefix | 0.5 ms | 3 ms |
+| Fetch: list everything, as a clone does (13 MB) | 100 ms | 150 ms |
+| Push: the opening list of every ref (11 MB) | 65 ms | 105 ms |
+| Push of one new branch, after that list | 0.4 ms | not measured |
+| API: newest commit of the default branch | 0.3 ms | 2 ms |
+
+Before requests read only their own refs, each of these took at least 40 ms
+with SQLite and 90 ms with PostgreSQL.
+
 ## Not done
 
 - **The shared metadata stores are tested against local servers only.** PostgreSQL 17 in Docker and the Cloud Spanner emulator, each with two nodes on one database (`./scripts/meta-test.sh`). Not tested: Cloud Spanner itself (the emulator runs one transaction at a time, so real contention and Google credentials are unexercised), managed PostgreSQL services, and more than two nodes or any load.
 - **Real cloud buckets are untested.** The S3 API path is exercised against LocalStack (`./scripts/s3-smoke.sh`); AWS S3 itself, GCS and Azure are not.
+- **A push still opens with the list of every ref**, as the protocol has it: 11 MB for 150,000 refs, on every push. Hiding refs from that list is not done.
+- **Many refs cannot be brought in at once with git.** git's HTTP push compares every ref it sends with every ref it has: 150,000 in one push take it hours, all of it on the client. `scripts/bench-refs.sh` sends the same updates directly in a second; there is no supported way to do that.
+- **Listing refs reads each tag to find what it points at.** The peeled values are not stored next to the refs. Listing 50,000 annotated tags takes 50 ms.
+- **A fetch can send what the client has by another way.** A change picked onto a release branch brings the same files as the original, and a client that has the original is sent them again unless bitmaps say it has them. With etcd's repository (183k objects, 23 branches, 993 tags), a client holding the default branch that fetches every other branch is sent 3% it already had once the pool has bitmaps, 25% before (git itself, serving the same repository without bitmaps, sends 15%). What is pushed after the last compaction is not covered by bitmaps until the next. Measured on that one repository only.
 - **SSH.** Access is over HTTP(S) only.
 - **SHA-256 repositories.**
 - **Pruned objects are gone at once.** There is no window in which a force-pushed-away commit can still be fetched by id after the next full compaction.
-- **Indexing a push takes memory in proportion to its objects**: for the table of entries, the ids they point at, and one delta family per thread (up to eight) being resolved. The spool file needs local disk the size of the push, and is mapped into memory (the kernel pages it out as needed).
+- **Indexing a push takes memory in proportion to its objects**: about 180 bytes for each (72 MiB for the 412k objects of git's repository, where the whole server peaked at 142 MiB over that push), for the table of entries, the ids they point at and the index being built. On top come the objects whose deltas are being resolved, up to 64 MiB on each of up to eight threads; beyond that they are dropped and read again when needed. A single object larger than that is still held whole, together with the version made from it. Not measured beyond 412k objects. The spool file needs local disk the size of the push, and is mapped into memory: it counts as the process's memory wherever mapped files do, though the kernel can drop its pages at any time.
 - **Compaction computes deltas only for files changed since the last full merge**, against their previous version. It does not search for better bases; with packs that come from git, which already hold good deltas, nothing was lost by that in the measurement above.
 - **The pre-receive hook sees the commits a push brings, but not their files.** Rules about file sizes or secrets need a way to read a push before it commits.
 - **The event feed covers pushes only.** Repositories created, deleted or compacted are the application's own actions and are not echoed back.

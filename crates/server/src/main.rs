@@ -66,6 +66,9 @@ struct Args {
     /// Compact a repository once a push leaves it with this many packs.
     #[arg(long, default_value_t = 8)]
     compact_at: usize,
+    /// Compact a repository at once when a push brings this many objects and nothing in it has bitmaps yet (0: never).
+    #[arg(long, default_value_t = 20000)]
+    bitmaps_from: usize,
     /// Keep objects no ref reaches when a whole repository is rewritten.
     #[arg(long)]
     no_prune: bool,
@@ -130,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
         auto_create: args.auto_create,
         scratch_dir: args.scratch_dir.unwrap_or_else(std::env::temp_dir),
         compact_at: args.compact_at,
+        bitmaps_from: args.bitmaps_from,
         prune: !args.no_prune,
         gc_grace: Duration::from_secs(args.gc_grace_secs),
         orphan_grace: Duration::from_secs(args.orphan_grace_secs),

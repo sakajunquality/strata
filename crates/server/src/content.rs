@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use strata_git::object::{parse_tree, CommitInfo};
 use strata_git::walk::commit_tips;
 use strata_git::{ObjectKind, ObjectSource, Oid, PackSet};
-use strata_store::RepoState;
+use strata_store::{RefScope, RepoState};
 
 use crate::upload_pack::resolve_ref;
 use crate::{blocking, App, HttpError};
@@ -31,8 +31,15 @@ const MAX_CHANGES: usize = 1000;
 
 pub(crate) const VIEWS: [&str; 6] = ["refs", "commits", "commit", "compare", "tree", "blob"];
 
-pub(crate) async fn handle(app: &App, repo: RepoState, view: &str, query: &str) -> Result<Response, HttpError> {
+pub(crate) async fn handle(app: &App, name: &str, view: &str, query: &str) -> Result<Response, HttpError> {
     let params: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+    // Only the refs the request is about are read.
+    let scope = match (view, params.get("prefix")) {
+        ("refs", Some(prefix)) => RefScope::Prefixes(vec![prefix.clone()]),
+        ("refs", None) => RefScope::All,
+        _ => RefScope::Names(["rev", "base", "head"].iter().filter_map(|key| params.get(*key)).flat_map(|rev| crate::upload_pack::ref_candidates(rev)).collect()),
+    };
+    let repo = app.meta.get_repo(name, &scope).await?.ok_or_else(HttpError::not_found)?;
     let packs = app.packs.open(&repo.pool_id, &repo.packs).await?;
     let view = view.to_string();
     blocking(move || respond(&repo, &packs, &view, &params)).await?
@@ -46,7 +53,9 @@ fn respond(repo: &RepoState, packs: &PackSet, view: &str, params: &HashMap<Strin
     };
     match view {
         "refs" => {
-            let refs: Vec<Value> = repo.refs.iter().map(|(name, oid)| json!({ "name": name, "oid": oid.to_string() })).collect();
+            // The ref HEAD points at is read whatever the prefix.
+            let listed = repo.refs.iter().filter(|(name, _)| name.starts_with(param("prefix")));
+            let refs: Vec<Value> = listed.map(|(name, oid)| json!({ "name": name, "oid": oid.to_string() })).collect();
             Ok(crate::json(StatusCode::OK, json!({ "head": repo.head, "refs": refs })))
         }
         "commits" => {

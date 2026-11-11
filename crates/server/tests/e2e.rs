@@ -365,7 +365,7 @@ fn shallow_scenario(url: &str) {
 }
 
 async fn pack_count(app: &App, repo: &str) -> usize {
-    app.meta.get_repo(repo).await.unwrap().unwrap().packs.len()
+    app.meta.get_repo(repo, &strata_store::RefScope::All).await.unwrap().unwrap().packs.len()
 }
 
 /// Clones `url` into `root/name` and checks the clone is complete and at `head`.
@@ -608,6 +608,57 @@ async fn pushes_trigger_compaction_in_the_background() {
     tokio::task::spawn_blocking(move || clone_and_check(&dir, &remote, "clone", &head, "5")).await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_push_gets_bitmaps_without_being_asked() {
+    // "Large" set low enough for a test: four commits bring twelve objects.
+    let options = Options { auto_create: true, compact_at: usize::MAX, bitmaps_from: 10, gc_grace: Duration::ZERO, ..Options::default() };
+    let (base, app) = start_with(options).await;
+    spawn_background(app.clone(), Duration::from_millis(50));
+    let tmp = tempfile::tempdir().unwrap();
+    let has_bitmaps = |name: &'static str| {
+        let app = app.clone();
+        async move {
+            let repo = app.meta.get_repo(name, &strata_store::RefScope::none()).await.unwrap().unwrap();
+            let packs = app.packs.open_each(&repo.pool_id, &repo.packs).await.unwrap();
+            (packs.len(), packs.iter().any(|pack| pack.bitmaps().is_some()))
+        }
+    };
+
+    let (dir, big, small) = (tmp.path().to_path_buf(), format!("{base}/acme/big.git"), format!("{base}/acme/small.git"));
+    let head = tokio::task::spawn_blocking(move || {
+        let work = dir.join("work");
+        std::fs::create_dir(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("file.txt"), "version 1\n").unwrap();
+        commit_on(&work, 1, "commit 1");
+        // One commit is three objects: too few to be worth it.
+        git(&work, &["push", "-q", &small, "main"]);
+        let mut head = String::new();
+        for n in 2..=4 {
+            std::fs::write(work.join("file.txt"), format!("version {n}\n")).unwrap();
+            head = commit_on(&work, n, &format!("commit {n}"));
+        }
+        git(&work, &["push", "-q", &big, "main"]);
+        head
+    })
+    .await
+    .unwrap();
+
+    let mut state = (0, false);
+    for _ in 0..100 {
+        state = has_bitmaps("acme/big").await;
+        if state.1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(state, (1, true), "the pushed pack was not rewritten with bitmaps");
+    assert_eq!(has_bitmaps("acme/small").await, (1, false));
+
+    let (dir, remote) = (tmp.path().to_path_buf(), format!("{base}/acme/big.git"));
+    tokio::task::spawn_blocking(move || clone_and_check(&dir, &remote, "clone", &head, "4")).await.unwrap();
+}
+
 /// Calls the HTTP API and returns the status code and body.
 fn api(method: &str, url: &str, token: Option<&str>) -> (u16, String) {
     api_with(method, url, token, None)
@@ -803,7 +854,7 @@ async fn the_application_decides_who_may_do_what() {
     .unwrap();
 
     // Everything landed in the repository the application named, and only there.
-    let repo = app.meta.get_repo("r-1").await.unwrap().unwrap();
+    let repo = app.meta.get_repo("r-1", &strata_store::RefScope::All).await.unwrap().unwrap();
     assert_eq!(repo.refs.keys().collect::<Vec<_>>(), ["refs/heads/main"]);
     assert_eq!(app.meta.list_repos().await.unwrap(), ["r-1"]);
 
@@ -1008,6 +1059,21 @@ async fn content_can_be_read_through_the_api() {
         let names: Vec<&str> = refs["refs"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["refs/heads/main", "refs/heads/topic/x", "refs/tags/v1"]);
         assert_eq!(refs["refs"][0]["oid"], second.as_str());
+        // Only the refs under a prefix, for a repository with too many to list.
+        let listed = |path: &str| -> Vec<String> {
+            json(&get(path).1)["refs"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(listed("refs?prefix=refs/heads/topic/"), ["refs/heads/topic/x"]);
+        assert_eq!(listed("refs?prefix=refs/tags/"), ["refs/tags/v1"]);
+        assert_eq!(listed("refs?prefix=refs/heads/m"), ["refs/heads/main"]);
+        assert!(listed("refs?prefix=refs/nothing/").is_empty());
+        // git asks the same way: about the refs it is after, or about all of them.
+        let remote = format!("{base}/r-7.git");
+        let lines = |args: &[&str]| git(tmp.path(), &[&["ls-remote", remote.as_str()], args].concat()).lines().map(|l| l.split('\t').nth(1).unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(lines(&["refs/heads/topic/x"]), ["refs/heads/topic/x"]);
+        assert_eq!(lines(&["v1"]), ["refs/tags/v1"]);
+        assert_eq!(lines(&["HEAD"]), ["HEAD"]);
+        assert_eq!(lines(&[]), ["HEAD", "refs/heads/main", "refs/heads/topic/x", "refs/tags/v1", "refs/tags/v1^{}"]);
 
         // History, newest first, a page at a time.
         let page = json(&get("commits?limit=1").1);
@@ -1317,12 +1383,12 @@ async fn unreachable_objects_and_stray_packs_are_removed() {
     .await
     .unwrap();
 
-    let before = app.meta.get_repo("acme/prune").await.unwrap().unwrap();
+    let before = app.meta.get_repo("acme/prune", &strata_store::RefScope::All).await.unwrap().unwrap();
     let report = compact(&app, "acme/prune", true).await.unwrap().expect("two packs to merge");
     assert!(report.pruned);
     // One commit, one tree, one file.
     assert_eq!(report.objects, 3);
-    let after = app.meta.get_repo("acme/prune").await.unwrap().unwrap();
+    let after = app.meta.get_repo("acme/prune", &strata_store::RefScope::All).await.unwrap().unwrap();
     assert_eq!(after.epoch, before.epoch + 1);
     assert_eq!(sweep(&app).await.unwrap(), 2);
 

@@ -31,7 +31,7 @@ stop() {
 trap 'stop; rm -rf "$work"' EXIT
 
 start() {
-  "$bin" --listen "127.0.0.1:$port" --data-dir "$work/data" --auto-create --scratch-dir "$work" >>"$work/server.log" 2>&1 &
+  "$bin" --listen "127.0.0.1:$port" --data-dir "$work/data" --auto-create --scratch-dir "$work" --bitmaps-from 0 >>"$work/server.log" 2>&1 &
   pid=$!
   for _ in $(seq 1 50); do
     curl -s -o /dev/null "http://127.0.0.1:$port/healthz" && return

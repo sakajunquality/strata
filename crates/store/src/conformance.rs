@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use strata_git::Oid;
 
-use crate::meta::{Garbage, MetaError, MetaStore, RefUpdate, Txn};
+use crate::meta::{Garbage, MetaError, MetaStore, RefScope, RefUpdate, Txn};
 
 fn unique(what: &str) -> String {
     format!("test-{}/{what}", uuid::Uuid::new_v4().simple())
@@ -27,15 +27,65 @@ fn main_ref(old: Option<Oid>, new: Option<Oid>) -> RefUpdate {
 
 pub async fn check(store: Arc<dyn MetaStore>) {
     cas_and_manifest(&*store).await;
+    refs_are_read_by_scope(&*store).await;
     versions_guard_against_changes_in_between(&*store).await;
     leases(&*store).await;
     events_and_deletion(&*store).await;
     concurrent_commits(store).await;
 }
 
+/// A reader gets the refs it asked for, and the one HEAD points at.
+async fn refs_are_read_by_scope(store: &dyn MetaStore) {
+    let name = unique("scoped");
+    store.create_repo(&name).await.unwrap();
+    // Names chosen so that an order other than byte by byte would misplace
+    // them: capitals, a dash and a dot next to a slash, and beyond ASCII.
+    let names = [
+        "refs/heads/main",
+        "refs/heads/Zed",
+        "refs/heads/a",
+        "refs/heads/a-b",
+        "refs/heads/a.b",
+        "refs/heads/a/b",
+        "refs/heads/a/c",
+        "refs/heads/ab",
+        "refs/heads/é",
+        "refs/heads0",
+        "refs/tags/v1",
+    ];
+    let ref_updates = names.iter().map(|name| RefUpdate { name: name.to_string(), old: None, new: Some(oid(7)) }).collect();
+    store.commit(&name, Txn { ref_updates, ..Txn::default() }).await.unwrap();
+
+    let read = |scope: RefScope| {
+        let name = name.clone();
+        async move { store.get_repo(&name, &scope).await.unwrap().unwrap().refs.into_keys().collect::<Vec<_>>() }
+    };
+    let strings = |names: &[&str]| names.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+    let mut sorted = strings(&names);
+    sorted.sort();
+    assert_eq!(read(RefScope::All).await, sorted);
+    assert_eq!(read(RefScope::none()).await, ["refs/heads/main"]);
+    assert_eq!(
+        read(RefScope::Names(strings(&["refs/tags/v1", "refs/heads/a", "refs/heads/missing"]))).await,
+        ["refs/heads/a", "refs/heads/main", "refs/tags/v1"]
+    );
+    assert_eq!(read(RefScope::Prefixes(strings(&["refs/heads/a/"]))).await, ["refs/heads/a/b", "refs/heads/a/c", "refs/heads/main"]);
+    assert_eq!(
+        read(RefScope::Prefixes(strings(&["refs/heads/a", "refs/tags/", "refs/heads/a/b", "nothing"]))).await,
+        ["refs/heads/a", "refs/heads/a-b", "refs/heads/a.b", "refs/heads/a/b", "refs/heads/a/c", "refs/heads/ab", "refs/heads/main", "refs/tags/v1"]
+    );
+    assert_eq!(read(RefScope::Prefixes(strings(&["refs/heads/Z", "refs/heads/é"]))).await, ["refs/heads/Zed", "refs/heads/main", "refs/heads/é"]);
+    assert_eq!(read(RefScope::Prefixes(strings(&[""]))).await, sorted);
+
+    // HEAD pointing at nothing adds nothing.
+    store.commit(&name, Txn { set_head: Some("refs/heads/unborn".into()), ..Txn::default() }).await.unwrap();
+    assert!(read(RefScope::none()).await.is_empty());
+    assert_eq!(read(RefScope::Prefixes(strings(&["refs/tags/"]))).await, ["refs/tags/v1"]);
+}
+
 async fn cas_and_manifest(store: &dyn MetaStore) {
     let name = unique("repo");
-    assert!(store.get_repo(&name).await.unwrap().is_none());
+    assert!(store.get_repo(&name, &RefScope::All).await.unwrap().is_none());
     assert!(matches!(
         store.commit(&name, Txn::default()).await,
         Err(MetaError::NotFound)
@@ -65,7 +115,7 @@ async fn cas_and_manifest(store: &dyn MetaStore) {
         matches!(store.commit(&name, stale).await, Err(MetaError::Conflict { name }) if name == "refs/heads/main")
     );
 
-    let state = store.get_repo(&name).await.unwrap().unwrap();
+    let state = store.get_repo(&name, &RefScope::All).await.unwrap().unwrap();
     assert_eq!(
         (state.name.as_str(), &state.pool_id, state.head.as_str()),
         (name.as_str(), &repo.pool_id, "refs/heads/main")
@@ -97,9 +147,9 @@ async fn cas_and_manifest(store: &dyn MetaStore) {
         store.commit(&name, many(None)).await,
         Err(MetaError::Conflict { .. })
     ));
-    assert_eq!(store.get_repo(&name).await.unwrap().unwrap().refs.len(), 1);
+    assert_eq!(store.get_repo(&name, &RefScope::All).await.unwrap().unwrap().refs.len(), 1);
     store.commit(&name, many(Some(one))).await.unwrap();
-    let state = store.get_repo(&name).await.unwrap().unwrap();
+    let state = store.get_repo(&name, &RefScope::All).await.unwrap().unwrap();
     assert_eq!(state.refs.len(), 3);
     assert_eq!(
         (
@@ -130,7 +180,7 @@ async fn cas_and_manifest(store: &dyn MetaStore) {
         )
         .await
         .unwrap();
-    let state = store.get_repo(&name).await.unwrap().unwrap();
+    let state = store.get_repo(&name, &RefScope::All).await.unwrap().unwrap();
     assert_eq!(state.packs, ["p1", "p2", "a-later-pack"]);
     assert_eq!(state.refs_version, 2);
 
@@ -150,7 +200,7 @@ async fn cas_and_manifest(store: &dyn MetaStore) {
         ..Txn::default()
     };
     store.commit(&name, delete).await.unwrap();
-    assert_eq!(store.get_repo(&name).await.unwrap().unwrap().refs.len(), 1);
+    assert_eq!(store.get_repo(&name, &RefScope::All).await.unwrap().unwrap().refs.len(), 1);
 
     // Compaction swaps packs atomically; whoever loses a race changes nothing.
     let swap = |add: &str| Txn {
@@ -164,7 +214,7 @@ async fn cas_and_manifest(store: &dyn MetaStore) {
         Err(MetaError::PackConflict)
     ));
     assert_eq!(
-        store.get_repo(&name).await.unwrap().unwrap().packs,
+        store.get_repo(&name, &RefScope::All).await.unwrap().unwrap().packs,
         ["a-later-pack", "merged"]
     );
 
@@ -230,7 +280,7 @@ async fn versions_guard_against_changes_in_between(store: &dyn MetaStore) {
         Err(MetaError::Stale)
     ));
     store.commit(&name, prune(1)).await.unwrap();
-    let state = store.get_repo(&name).await.unwrap().unwrap();
+    let state = store.get_repo(&name, &RefScope::All).await.unwrap().unwrap();
     assert_eq!((state.epoch, state.refs_version), (2, 1));
 }
 
@@ -290,7 +340,7 @@ async fn events_and_deletion(store: &dyn MetaStore) {
     // A deleted repository is gone at once; its packs wait as garbage.
     assert!(store.delete_repo(&name).await.unwrap());
     assert!(!store.delete_repo(&name).await.unwrap());
-    assert!(store.get_repo(&name).await.unwrap().is_none());
+    assert!(store.get_repo(&name, &RefScope::All).await.unwrap().is_none());
     assert!(!store.list_repos().await.unwrap().contains(&name));
     assert!(matches!(store.commit(&name, Txn::default()).await, Err(MetaError::NotFound)));
     let garbage = store.list_garbage(i64::MAX).await.unwrap();
@@ -298,7 +348,7 @@ async fn events_and_deletion(store: &dyn MetaStore) {
     // The name can be used again, for a repository that shares nothing with the old one.
     let again = store.create_repo(&name).await.unwrap();
     assert_ne!(again.pool_id, repo.pool_id);
-    assert!(store.get_repo(&name).await.unwrap().unwrap().refs.is_empty());
+    assert!(store.get_repo(&name, &RefScope::All).await.unwrap().unwrap().refs.is_empty());
 }
 
 /// Several nodes at once: every race has exactly one winner.
@@ -329,7 +379,7 @@ async fn concurrent_commits(store: Arc<dyn MetaStore>) {
         }
     }
     assert_eq!(winners.len(), 1, "exactly one writer creates the branch");
-    let state = store.get_repo(&name).await.unwrap().unwrap();
+    let state = store.get_repo(&name, &RefScope::All).await.unwrap().unwrap();
     assert_eq!(state.refs["refs/heads/main"], oid(winners[0] + 1));
     assert_eq!(state.packs, [format!("race-{}", winners[0])]);
     assert_eq!(state.refs_version, 1);
@@ -360,7 +410,7 @@ async fn concurrent_commits(store: Arc<dyn MetaStore>) {
     for task in tasks {
         task.await.unwrap().unwrap();
     }
-    let state = store.get_repo(&name).await.unwrap().unwrap();
+    let state = store.get_repo(&name, &RefScope::All).await.unwrap().unwrap();
     assert_eq!(
         (state.refs.len(), state.packs.len()),
         (1 + WRITERS as usize, 1 + WRITERS as usize)
@@ -372,7 +422,7 @@ async fn concurrent_commits(store: Arc<dyn MetaStore>) {
         "the oldest pack stays first"
     );
     assert_eq!(
-        store.get_repo(&name).await.unwrap().unwrap().packs,
+        store.get_repo(&name, &RefScope::All).await.unwrap().unwrap().packs,
         state.packs,
         "the order is stable"
     );

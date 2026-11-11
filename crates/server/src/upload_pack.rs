@@ -9,7 +9,7 @@ use strata_git::pack::PackWriter;
 use strata_git::pktline::{self, Pkt, Reader, SidebandWriter};
 use strata_git::walk::{self, Filter, ShallowPlan, ShallowRequest};
 use strata_git::{Error, ObjectSource, Oid, PackSet};
-use strata_store::RepoState;
+use strata_store::{RefScope, RepoState};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -70,16 +70,23 @@ fn parse(body: &[u8]) -> Result<Request<'_>, HttpError> {
     Ok(Request { command, args })
 }
 
-pub(crate) async fn handle(app: &App, repo: RepoState, body: Bytes) -> Result<Body, HttpError> {
+pub(crate) async fn handle(app: &App, name: &str, body: Bytes) -> Result<Body, HttpError> {
     let request = parse(&body)?;
     match request.command {
-        b"ls-refs" => Ok(ls_refs(app, &repo, &request.args).await?.into()),
-        b"fetch" => fetch(app, &repo, &request.args).await,
+        b"ls-refs" => Ok(ls_refs(app, name, &request.args).await?.into()),
+        b"fetch" => {
+            // A fetch names objects, not refs: none are read unless it turns out to name one.
+            let repo = app.meta.get_repo(name, &RefScope::none()).await?.ok_or_else(HttpError::not_found)?;
+            fetch(app, &repo, &request.args).await
+        }
         _ => Err(HttpError::bad_request("unsupported command")),
     }
 }
 
-async fn ls_refs(app: &App, repo: &RepoState, args: &[&[u8]]) -> Result<Vec<u8>, HttpError> {
+/// Beyond this many prefixes, reading every ref and picking is the cheaper way.
+const MAX_REF_PREFIXES: usize = 32;
+
+async fn ls_refs(app: &App, name: &str, args: &[&[u8]]) -> Result<Vec<u8>, HttpError> {
     let (mut peel, mut symrefs, mut unborn) = (false, false, false);
     let mut prefixes = Vec::new();
     for arg in args {
@@ -95,6 +102,15 @@ async fn ls_refs(app: &App, repo: &RepoState, args: &[&[u8]]) -> Result<Vec<u8>,
         }
     }
     let matches = |name: &str| prefixes.is_empty() || prefixes.iter().any(|p| name.as_bytes().starts_with(p));
+    // Only the refs asked about are read: git names the few it is after, and
+    // a repository can have hundreds of thousands.
+    let scope = if prefixes.is_empty() || prefixes.len() > MAX_REF_PREFIXES {
+        RefScope::All
+    } else {
+        // A prefix that is not text is the start of no ref's name.
+        RefScope::Prefixes(prefixes.iter().filter_map(|p| String::from_utf8(p.clone()).ok()).collect())
+    };
+    let repo = &app.meta.get_repo(name, &scope).await?.ok_or_else(HttpError::not_found)?;
 
     let mut out = Vec::new();
     if matches("HEAD") {
@@ -169,7 +185,7 @@ async fn fetch(app: &App, repo: &RepoState, args: &[&[u8]]) -> Result<Body, Http
             fetch.shallow.since = Some(since);
         } else if let Some(name) = arg.strip_prefix(b"deepen-not ") {
             let name = text(name);
-            match resolve_ref(repo, &name) {
+            match lookup_ref(app, &repo.name, &name).await? {
                 Some(oid) => fetch.shallow.not.push(oid),
                 None => return Ok(error_response(&format!("deepen-not is not a ref: {name}")).into()),
             }
@@ -189,7 +205,7 @@ async fn fetch(app: &App, repo: &RepoState, args: &[&[u8]]) -> Result<Body, Http
 
     let packs = app.packs.open(&repo.pool_id, &repo.packs).await?;
     let repo_name = repo.name.clone();
-    let (fetch, packs) = match load_sparse(repo, packs, fetch).await? {
+    let (fetch, packs) = match load_sparse(app, repo, packs, fetch).await? {
         Ok(loaded) => loaded,
         Err(name) => return Ok(error_response(&format!("filter 'sparse:oid={name}' does not name a file of patterns")).into()),
     };
@@ -241,11 +257,12 @@ const MAX_SPARSE_FILE: usize = 1 << 20;
 
 /// Reads the pattern files a `sparse:oid=` filter names: a blob by id, or
 /// `<revision>:<path>`. Hands back the name that could not be read, if any.
-async fn load_sparse(repo: &RepoState, packs: PackSet, mut fetch: Fetch) -> Result<Result<(Fetch, PackSet), String>, HttpError> {
+async fn load_sparse(app: &App, repo: &RepoState, packs: PackSet, mut fetch: Fetch) -> Result<Result<(Fetch, PackSet), String>, HttpError> {
     if fetch.filter.sparse_names().is_empty() {
         return Ok(Ok((fetch, packs)));
     }
-    let repo = repo.clone();
+    let revs: Vec<&str> = fetch.filter.sparse_names().iter().filter_map(|name| name.split_once(':')).map(|(rev, _)| rev).collect();
+    let repo = if revs.is_empty() { repo.clone() } else { repo_with_revs(app, &repo.name, &revs).await?.ok_or_else(HttpError::not_found)? };
     crate::blocking(move || {
         let mut contents = Vec::new();
         for name in fetch.filter.sparse_names() {
@@ -271,9 +288,25 @@ fn io_error(e: std::io::Error) -> Error {
     Error::Io(e.to_string())
 }
 
-/// Resolves a ref the way a user would name it: in full, or as a tag or branch.
+/// The refs a user may mean by `name`: it in full, or a tag or branch called that.
+pub(crate) fn ref_candidates(name: &str) -> impl Iterator<Item = String> + '_ {
+    ["", "refs/", "refs/tags/", "refs/heads/"].iter().map(move |prefix| format!("{prefix}{name}"))
+}
+
+/// Resolves a ref the way a user would name it. `repo` must have been read
+/// with the refs `name` may mean, as [`repo_with_revs`] does.
 pub(crate) fn resolve_ref(repo: &RepoState, name: &str) -> Option<Oid> {
-    ["", "refs/", "refs/tags/", "refs/heads/"].iter().find_map(|prefix| repo.refs.get(&format!("{prefix}{name}")).copied())
+    ref_candidates(name).find_map(|candidate| repo.refs.get(&candidate).copied())
+}
+
+/// The repository with the refs that the given revisions may name, and no others.
+pub(crate) async fn repo_with_revs(app: &App, name: &str, revs: &[&str]) -> Result<Option<RepoState>, HttpError> {
+    let scope = RefScope::Names(revs.iter().flat_map(|rev| ref_candidates(rev)).collect());
+    Ok(app.meta.get_repo(name, &scope).await?)
+}
+
+async fn lookup_ref(app: &App, repo: &str, name: &str) -> Result<Option<Oid>, HttpError> {
+    Ok(repo_with_revs(app, repo, &[name]).await?.and_then(|repo| resolve_ref(&repo, name)))
 }
 
 /// A response that makes the git client abort and print `message`.
@@ -461,7 +494,7 @@ pub(crate) async fn handle_v0(app: &App, repo: RepoState, body: Bytes) -> Result
         } else if let Some(since) = line.strip_prefix("deepen-since ") {
             fetch.shallow.since = Some(since.parse().map_err(|_| bad())?);
         } else if let Some(name) = line.strip_prefix("deepen-not ") {
-            fetch.shallow.not.push(resolve_ref(&repo, name).ok_or_else(|| HttpError::bad_request("deepen-not is not a ref"))?);
+            fetch.shallow.not.push(lookup_ref(app, &repo.name, name).await?.ok_or_else(|| HttpError::bad_request("deepen-not is not a ref"))?);
         } else if let Some(spec) = line.strip_prefix("filter ") {
             fetch.filter = Filter::parse(spec).ok_or_else(|| HttpError::bad_request("filter is not supported"))?;
         }
@@ -491,7 +524,7 @@ pub(crate) async fn handle_v0(app: &App, repo: RepoState, body: Bytes) -> Result
 
     let packs = app.packs.open(&repo.pool_id, &repo.packs).await?;
     let repo_name = repo.name.clone();
-    let (fetch, packs) = load_sparse(&repo, packs, fetch).await?.map_err(|_| HttpError::bad_request("the sparse filter does not name a file of patterns"))?;
+    let (fetch, packs) = load_sparse(app, &repo, packs, fetch).await?.map_err(|_| HttpError::bad_request("the sparse filter does not name a file of patterns"))?;
     let (tx, rx) = mpsc::channel(4);
     tokio::task::spawn_blocking(move || {
         let mut out = ChannelWriter { tx, buf: Vec::with_capacity(CHANNEL_CHUNK) };

@@ -13,7 +13,7 @@ pub mod postgres;
 pub mod spanner;
 pub mod sqlite;
 
-pub use meta::{Event, Garbage, MemoryMetaStore, MetaError, MetaStore, RefUpdate, RepoState, Txn};
+pub use meta::{Event, Garbage, MemoryMetaStore, MetaError, MetaStore, RefScope, RefUpdate, RepoState, Txn};
 pub use packs::{CacheConfig, PackStore, PackUpload};
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresMetaStore;

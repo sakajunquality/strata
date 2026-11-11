@@ -27,7 +27,7 @@ use gcloud_spanner::transaction_rw::ReadWriteTransaction;
 use gcloud_spanner::value::CommitTimestamp;
 use strata_git::Oid;
 
-use crate::meta::{final_refs, new_repo, unix_now, Event, Garbage, MetaError, MetaStore, RepoState, Txn};
+use crate::meta::{final_refs, new_repo, unix_now, Event, Garbage, MetaError, MetaStore, RefScope, RepoState, Txn};
 
 /// Tables, each with the statements that create it. `refs` is stored
 /// inside its repository's row range, so a repository's metadata is read and
@@ -253,21 +253,24 @@ impl SpannerMetaStore {
     }
 }
 
-async fn read_refs(
-    tx: &mut Transaction,
-    repo: &str,
-    only: Option<Vec<String>>,
-) -> Result<BTreeMap<String, Oid>, TxError> {
-    let mut stmt = match &only {
-        Some(_) => Statement::new(
-            "SELECT name, oid FROM refs WHERE repo = @repo AND name IN UNNEST(@names)",
-        ),
-        None => Statement::new("SELECT name, oid FROM refs WHERE repo = @repo"),
+async fn read_refs(tx: &mut Transaction, repo: &str, scope: &RefScope) -> Result<BTreeMap<String, Oid>, TxError> {
+    let mut stmt = match scope {
+        RefScope::All => Statement::new("SELECT name, oid FROM refs WHERE repo = @repo"),
+        RefScope::Names(names) => {
+            let mut stmt = Statement::new("SELECT name, oid FROM refs WHERE repo = @repo AND name IN UNNEST(@names)");
+            stmt.add_param("names", names);
+            stmt
+        }
+        RefScope::Prefixes(prefixes) => {
+            // Each is a range of the primary key.
+            let mut stmt = Statement::new(
+                "SELECT r.name, r.oid FROM UNNEST(@prefixes) AS prefix JOIN refs AS r ON r.repo = @repo AND STARTS_WITH(r.name, prefix)",
+            );
+            stmt.add_param("prefixes", prefixes);
+            stmt
+        }
     };
     stmt.add_param("repo", &repo);
-    if let Some(names) = &only {
-        stmt.add_param("names", names);
-    }
     let mut rows = tx.query(stmt).await?;
     let mut refs = BTreeMap::new();
     while let Some(row) = rows.next().await? {
@@ -312,7 +315,7 @@ impl MetaStore for SpannerMetaStore {
         }
     }
 
-    async fn get_repo(&self, name: &str) -> Result<Option<RepoState>, MetaError> {
+    async fn get_repo(&self, name: &str, scope: &RefScope) -> Result<Option<RepoState>, MetaError> {
         // One snapshot, so that refs and packs belong together.
         let mut tx = self.client.read_only_transaction().await?;
         let Some(row) = tx
@@ -326,12 +329,17 @@ impl MetaStore for SpannerMetaStore {
             return Ok(None);
         };
         let pool_id: String = row.column(0)?;
-        let refs = read_refs(&mut tx, name, None).await?;
+        let head: String = row.column(1)?;
+        let mut refs = read_refs(&mut tx, name, scope).await?;
+        if *scope != RefScope::All && !refs.contains_key(&head) {
+            // The ref HEAD points at comes whatever was asked for.
+            refs.append(&mut read_refs(&mut tx, name, &RefScope::Names(vec![head.clone()])).await?);
+        }
         let packs = read_packs(&mut tx, &pool_id).await?;
         Ok(Some(RepoState {
             name: name.to_string(),
             pool_id,
-            head: row.column(1)?,
+            head,
             refs,
             packs: packs.into_iter().map(|(id, _)| id).collect(),
             epoch: row.column::<i64>(2)? as u64,
@@ -376,7 +384,7 @@ impl MetaStore for SpannerMetaStore {
                 let mut writes = Vec::new();
                 if !txn.ref_updates.is_empty() {
                     let names = txn.ref_updates.iter().map(|u| u.name.clone()).collect();
-                    let current = read_refs(tx, &name, Some(names)).await?;
+                    let current = read_refs(tx, &name, &RefScope::Names(names)).await?;
                     for update in &txn.ref_updates {
                         if current.get(&update.name) != update.old.as_ref() {
                             return Err(MetaError::Conflict {

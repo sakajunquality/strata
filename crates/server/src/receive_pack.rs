@@ -7,7 +7,7 @@ use bytes::{Bytes, BytesMut};
 use strata_git::pack::index_pack;
 use strata_git::pktline::{self, Pkt, Reader};
 use strata_git::{walk, ObjectSource, Oid, PackData, PackFile, PackSet};
-use strata_store::{MetaError, PackStore, RefUpdate, RepoState, Txn};
+use strata_store::{MetaError, PackStore, RefScope, RefUpdate, RepoState, Txn};
 use tokio::io::AsyncWriteExt;
 use tokio_stream::StreamExt;
 
@@ -170,7 +170,7 @@ async fn spool(app: &App, first: Bytes, mut body: BodyDataStream) -> Result<Opti
     Ok(Some(blocking(move || SpooledPack::open(&file)).await??))
 }
 
-pub(crate) async fn handle(app: &App, granted: &Granted, repo: Option<RepoState>, body: Body) -> Result<Vec<u8>, HttpError> {
+pub(crate) async fn handle(app: &App, granted: &Granted, body: Body) -> Result<Vec<u8>, HttpError> {
     let name = granted.repo.as_str();
     let mut body = body.into_data_stream();
     let mut head = BytesMut::new();
@@ -193,6 +193,12 @@ pub(crate) async fn handle(app: &App, granted: &Granted, repo: Option<RepoState>
         // git probes with a bare flush packet before sending a large chunked push.
         return Ok(Vec::new());
     }
+    // A push is about the refs it names, however many the repository has.
+    let scope = RefScope::Names(commands.iter().map(|c| c.name.clone()).collect());
+    let repo = app.meta.get_repo(name, &scope).await?;
+    if repo.is_none() && !app.options.auto_create {
+        return Err(HttpError::not_found());
+    }
     let pack: Option<Arc<dyn PackData>> = match spool(app, head.slice(end..), body).await? {
         Some(spooled) => Some(Arc::new(spooled)),
         None => None,
@@ -202,7 +208,7 @@ pub(crate) async fn handle(app: &App, granted: &Granted, repo: Option<RepoState>
         None => match app.meta.create_repo(name).await {
             Ok(repo) => repo,
             // Lost a race with another first push.
-            Err(MetaError::AlreadyExists) => app.meta.get_repo(name).await?.ok_or(MetaError::NotFound)?,
+            Err(MetaError::AlreadyExists) => app.meta.get_repo(name, &scope).await?.ok_or(MetaError::NotFound)?,
             Err(e) => return Err(e.into()),
         },
     };
@@ -217,7 +223,7 @@ pub(crate) async fn handle(app: &App, granted: &Granted, repo: Option<RepoState>
                 result = outcome;
                 break;
             }
-            None => repo = app.meta.get_repo(name).await?.ok_or(MetaError::NotFound)?,
+            None => repo = app.meta.get_repo(name, &scope).await?.ok_or(MetaError::NotFound)?,
         }
     }
     if let Err(Rejection::Unpack(reason) | Rejection::All(reason) | Rejection::Ref { reason, .. }) = &result {
@@ -275,11 +281,32 @@ const MAX_HOOK_COMMITS: usize = 1000;
 
 /// The commits an update adds to its ref, newest first, and whether there
 /// were more than are listed. For a ref that moves, these are the commits its
-/// old value lacks; for a new ref, those no existing ref has.
-fn new_commits(all: &PackSet, tips: &[Oid], old: &Oid, new: &Oid) -> Result<(Vec<serde_json::Value>, bool), HttpError> {
+/// old value lacks; for a new ref, those the repository did not have before
+/// this push, which takes no look at the other refs, however many there are.
+fn new_commits(all: &PackSet, existing: &PackSet, old: &Oid, new: &Oid) -> Result<(Vec<serde_json::Value>, bool), HttpError> {
     let Some(head) = walk::commit_tips(all, &[*new])?.first().copied().filter(|_| !new.is_zero()) else { return Ok((Vec::new(), false)) };
-    let bases = if old.is_zero() { walk::commit_tips(all, tips)? } else { walk::commit_tips(all, &[*old])? };
-    let ahead = crate::merge::diverge(all, &bases, head)?.ahead;
+    let ahead = if old.is_zero() {
+        let mut ahead = Vec::new();
+        let mut seen = std::collections::HashSet::from([head]);
+        let mut queue = std::collections::BinaryHeap::new();
+        if !existing.contains(&head) {
+            queue.push((i64::MAX, head));
+        }
+        while let Some((_, oid)) = queue.pop() {
+            ahead.push(oid);
+            if ahead.len() > MAX_HOOK_COMMITS {
+                break;
+            }
+            for parent in all.commit(&oid)?.map(|commit| commit.parents).unwrap_or_default() {
+                if seen.insert(parent) && !existing.contains(&parent) {
+                    queue.push((all.commit(&parent)?.map_or(0, |commit| commit.time), parent));
+                }
+            }
+        }
+        ahead
+    } else {
+        crate::merge::diverge(all, &walk::commit_tips(all, &[*old])?, head)?.ahead
+    };
     let commits = ahead.iter().take(MAX_HOOK_COMMITS).map(|oid| crate::content::commit_json(all, oid)).collect::<Result<Vec<_>, _>>()?;
     Ok((commits, ahead.len() > MAX_HOOK_COMMITS))
 }
@@ -318,6 +345,8 @@ async fn apply(
     let mut to_upload = None;
     // What the new pack points at outside itself, when it was indexed just now.
     let mut outside = None;
+    // A lot of history arriving where nothing has bitmaps: worth a compaction right after.
+    let mut wants_bitmaps = false;
     if let Some(pack_id) = uploaded.as_ref() {
         all = app.packs.open(&repo.pool_id, std::slice::from_ref(pack_id)).await?.merged_with(&existing);
     } else if let Some(spooled) = pack {
@@ -327,6 +356,7 @@ async fn apply(
             // A push that only moves refs to existing objects carries an empty pack.
             Ok(indexed) if indexed.index.is_empty() => {}
             Ok(indexed) => {
+                wants_bitmaps = app.options.wants_bitmaps(indexed.index.len()) && existing.packs().iter().all(|pack| pack.bitmaps().is_none());
                 outside = Some(indexed.outside.clone());
                 let data = indexed.data(spooled);
                 all = existing.with_pack(Arc::new(PackFile::new(data.clone(), indexed.index.clone(), None)?));
@@ -339,7 +369,7 @@ async fn apply(
     // a bad push leaves nothing behind.
     let tips: Vec<Oid> = commands.iter().map(|c| c.new).filter(|oid| !oid.is_zero()).collect();
     let moves: Vec<(Oid, Oid)> = commands.iter().map(|c| (c.old, c.new)).collect();
-    let pushed = all.clone();
+    let (pushed, before) = (all.clone(), existing.clone());
     let checked = blocking(move || {
         match outside {
             // Indexing saw every object of the pack and noted what each points
@@ -373,8 +403,7 @@ async fn apply(
         // The question also shows the commits each update brings, so that
         // rules can be about them: who signed, who wrote, what they say.
         let moves: Vec<(Oid, Oid)> = commands.iter().map(|c| (c.old, c.new)).collect();
-        let tips: Vec<Oid> = repo.refs.values().copied().collect();
-        let brought = blocking(move || moves.iter().map(|(old, new)| new_commits(&pushed, &tips, old, new)).collect::<Result<Vec<_>, HttpError>>()).await??;
+        let brought = blocking(move || moves.iter().map(|(old, new)| new_commits(&pushed, &before, old, new)).collect::<Result<Vec<_>, HttpError>>()).await??;
         let mut asked = updates.clone();
         for (update, (commits, truncated)) in asked.iter_mut().zip(brought) {
             update["commits"] = serde_json::Value::Array(commits);
@@ -433,7 +462,7 @@ async fn apply(
     let adds_pack = txn.add_pack.is_some();
     match app.meta.commit(&repo.name, txn).await {
         Ok(()) => {
-            if adds_pack && repo.packs.len() + 1 >= app.options.compact_at {
+            if adds_pack && (wants_bitmaps || repo.packs.len() + 1 >= app.options.compact_at) {
                 app.request_compaction(&repo.name);
             }
             Ok(Some(Ok(())))

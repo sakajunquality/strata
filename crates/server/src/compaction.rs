@@ -10,7 +10,7 @@ use anyhow::Context;
 use strata_git::compact::{self, BitmapRequest, CompactOptions, Compacted};
 use strata_git::walk::{self, Filter, ShallowPlan};
 use strata_git::{Oid, PackSet};
-use strata_store::{MetaError, PackStore, RepoState, Txn};
+use strata_store::{MetaError, PackStore, RefScope, RepoState, Txn};
 use tokio::sync::Notify;
 
 use crate::App;
@@ -57,7 +57,9 @@ fn unix_now() -> i64 {
 ///
 /// With `full`, every pack is merged. Otherwise only as many of the smallest
 /// packs as needed to keep pack sizes in geometric progression, so that the
-/// bulk of a large repository is rewritten rarely.
+/// bulk of a large repository is rewritten rarely. A pool of some size in
+/// which nothing has bitmaps yet is merged whole all the same, see
+/// [`crate::Options::bitmaps_from`].
 ///
 /// A merge of the whole pool also drops objects no ref reaches (unless
 /// pruning is switched off) and stores changed files as deltas against their
@@ -78,19 +80,18 @@ pub async fn compact(app: &App, name: &str, full: bool) -> anyhow::Result<Option
 }
 
 async fn compact_leased(app: &App, name: &str, full: bool) -> anyhow::Result<Option<CompactionReport>> {
-    let Some(repo) = app.meta.get_repo(name).await? else { return Ok(None) };
+    let Some(repo) = app.meta.get_repo(name, &RefScope::All).await? else { return Ok(None) };
     let files = app.packs.open_each(&repo.pool_id, &repo.packs).await?;
 
-    let mut chosen: Vec<usize> = if full {
-        (0..files.len()).collect()
-    } else {
-        let sizes: Vec<usize> = files.iter().map(|file| file.index().len()).collect();
-        compact::geometric_selection(&sizes)
-    };
+    let sizes: Vec<usize> = files.iter().map(|file| file.index().len()).collect();
+    // What a large push leaves behind: a lot of history, and no bitmaps for it.
+    let lacks_bitmaps = files.iter().all(|file| file.bitmaps().is_none());
+    let whole = full || (lacks_bitmaps && app.options.wants_bitmaps(sizes.iter().sum()));
+    let mut chosen: Vec<usize> = if whole { (0..files.len()).collect() } else { compact::geometric_selection(&sizes) };
     chosen.sort_unstable();
     let whole_pool = chosen.len() == files.len();
     // A lone pack is still worth rewriting once, to prune it and give it bitmaps.
-    let lone_without_bitmaps = full && files.len() == 1 && files[0].bitmaps().is_none();
+    let lone_without_bitmaps = whole && files.len() == 1 && lacks_bitmaps;
     if chosen.len() < 2 && !lone_without_bitmaps {
         return Ok(None);
     }
@@ -146,7 +147,7 @@ async fn compact_leased(app: &App, name: &str, full: bool) -> anyhow::Result<Opt
             // Objects are about to disappear. Pushes that validated themselves
             // against the old pool must notice (the epoch), and refs that moved
             // since the reachability walk must not depend on anything dropped.
-            let Some(current) = app.meta.get_repo(name).await? else { break };
+            let Some(current) = app.meta.get_repo(name, &RefScope::All).await? else { break };
             if current.epoch != repo.epoch || !still_complete(app, &repo, &current, &pack_id).await? {
                 tracing::warn!(repo = name, "abandoning pruning compaction: the repository moved onto pruned objects");
                 break;
@@ -221,7 +222,7 @@ pub async fn sweep_orphans(app: &App) -> anyhow::Result<usize> {
     let mut known: HashSet<(String, String)> =
         app.meta.list_garbage(i64::MAX).await?.into_iter().map(|g| (g.pool_id, g.pack_id)).collect();
     for name in app.meta.list_repos().await? {
-        let Some(repo) = app.meta.get_repo(&name).await? else { continue };
+        let Some(repo) = app.meta.get_repo(&name, &RefScope::none()).await? else { continue };
         known.extend(repo.packs.into_iter().map(|pack_id| (repo.pool_id.clone(), pack_id)));
     }
     // Pools are walked from storage, not from the repositories: a push that

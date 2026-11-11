@@ -15,6 +15,8 @@ pub struct RepoState {
     pub pool_id: String,
     /// The ref that HEAD points at.
     pub head: String,
+    /// The refs that were asked for, see [`RefScope`]. The one HEAD points at
+    /// is always among them, if it exists.
     pub refs: BTreeMap<String, Oid>,
     /// Pack ids in the pool, oldest first.
     pub packs: Vec<String>,
@@ -23,6 +25,48 @@ pub struct RepoState {
     pub epoch: u64,
     /// Incremented whenever a ref or HEAD changes.
     pub refs_version: u64,
+}
+
+/// Which of a repository's refs a reader needs. A repository can have
+/// hundreds of thousands, and most requests are about a handful: reading
+/// them all for each would make every request as slow as the list is long.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefScope {
+    All,
+    /// The refs with exactly these names.
+    Names(Vec<String>),
+    /// The refs whose names start with one of these.
+    Prefixes(Vec<String>),
+}
+
+impl RefScope {
+    /// No refs but the one HEAD points at.
+    pub fn none() -> RefScope {
+        RefScope::Names(Vec::new())
+    }
+
+    pub fn includes(&self, name: &str) -> bool {
+        match self {
+            RefScope::All => true,
+            RefScope::Names(names) => names.iter().any(|n| n == name),
+            RefScope::Prefixes(prefixes) => prefixes.iter().any(|p| name.starts_with(p.as_str())),
+        }
+    }
+}
+
+/// The smallest string greater than every string starting with `prefix`, for
+/// reading a prefix as a range of an ordered index. `None` if there is none:
+/// every string is in the range then.
+pub(crate) fn prefix_end(prefix: &str) -> Option<String> {
+    let mut end: Vec<char> = prefix.chars().collect();
+    while let Some(last) = end.pop() {
+        // The next character, past the gap that is not characters.
+        if let Some(next) = (last as u32 + 1..=char::MAX as u32).find_map(char::from_u32) {
+            end.push(next);
+            return Some(end.into_iter().collect());
+        }
+    }
+    None
 }
 
 /// A compare-and-swap on one ref. `None` means "does not exist".
@@ -96,7 +140,8 @@ pub enum MetaError {
 #[async_trait]
 pub trait MetaStore: Send + Sync {
     async fn create_repo(&self, name: &str) -> Result<RepoState, MetaError>;
-    async fn get_repo(&self, name: &str) -> Result<Option<RepoState>, MetaError>;
+    /// The repository as it is now, with the refs `refs` selects.
+    async fn get_repo(&self, name: &str, refs: &RefScope) -> Result<Option<RepoState>, MetaError>;
     async fn list_repos(&self) -> Result<Vec<String>, MetaError>;
     async fn commit(&self, name: &str, txn: Txn) -> Result<(), MetaError>;
     /// Forgets a repository. Its packs become garbage. Returns whether it existed.
@@ -166,8 +211,11 @@ impl MetaStore for MemoryMetaStore {
         Ok(repo)
     }
 
-    async fn get_repo(&self, name: &str) -> Result<Option<RepoState>, MetaError> {
-        Ok(self.repos.lock().unwrap().get(name).cloned())
+    async fn get_repo(&self, name: &str, refs: &RefScope) -> Result<Option<RepoState>, MetaError> {
+        let repos = self.repos.lock().unwrap();
+        let Some(repo) = repos.get(name) else { return Ok(None) };
+        let selected = repo.refs.iter().filter(|(name, _)| **name == repo.head || refs.includes(name)).map(|(name, oid)| (name.clone(), *oid)).collect();
+        Ok(Some(RepoState { refs: selected, ..repo.clone() }))
     }
 
     async fn list_repos(&self) -> Result<Vec<String>, MetaError> {
@@ -282,5 +330,14 @@ mod tests {
     #[tokio::test]
     async fn conforms() {
         crate::conformance::check(Arc::new(MemoryMetaStore::default())).await;
+    }
+
+    #[test]
+    fn prefix_ranges() {
+        assert_eq!(prefix_end("refs/heads/").as_deref(), Some("refs/heads0"));
+        assert_eq!(prefix_end("a\u{10FFFF}").as_deref(), Some("b"));
+        assert_eq!(prefix_end("a\u{D7FF}").as_deref(), Some("a\u{E000}"));
+        assert_eq!(prefix_end(""), None);
+        assert_eq!(prefix_end("\u{10FFFF}"), None);
     }
 }

@@ -25,7 +25,7 @@ use serde_json::json;
 use strata_git::object::{object_id, parse_tree, CommitInfo};
 use strata_git::pack::{index_pack, PackWriter};
 use strata_git::{ObjectKind, ObjectSource, Oid, PackData, PackSet};
-use strata_store::{MetaError, PackStore, RefUpdate, RepoState, Txn};
+use strata_store::{MetaError, PackStore, RefScope, RefUpdate, RepoState, Txn};
 
 use crate::content::{changes, commit_json, entries, resolve};
 use crate::{blocking, App, HttpError};
@@ -482,8 +482,12 @@ pub(crate) async fn merge(app: &App, name: &str, body: Body) -> Result<Response,
     let body = axum::body::to_bytes(body, 1 << 20).await.map_err(|_| HttpError::bad_request("request too large"))?;
     let request: Arc<Request> = Arc::new(serde_json::from_slice(&body).map_err(|e| HttpError::bad_request(format!("malformed request: {e}")))?);
 
+    // The branch merged into, and whatever the head may name.
+    let mut names = vec![request.base.clone(), format!("refs/heads/{}", request.base)];
+    names.extend(crate::upload_pack::ref_candidates(&request.head));
+    let scope = RefScope::Names(names);
     for _ in 0..ATTEMPTS {
-        let repo = app.meta.get_repo(name).await?.ok_or_else(HttpError::not_found)?;
+        let repo = app.meta.get_repo(name, &scope).await?.ok_or_else(HttpError::not_found)?;
         let packs = app.packs.open(&repo.pool_id, &repo.packs).await?;
         let (snapshot, existing, asked) = (repo.clone(), packs.clone(), request.clone());
         let plan = blocking(move || plan(&snapshot, &existing, &asked)).await??;
