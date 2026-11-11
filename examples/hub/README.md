@@ -60,8 +60,8 @@ It is an example, not a product:
 
 - No issues, forks, search, webhooks or email.
 - Pull requests are between branches of one repository, with a conversation
-  and a merge button (merge commit or squash). No reviews or approvals, no
-  comments on lines, no rebase, and conflicts are settled on your machine.
+  and a merge button (merge commit, squash or rebase). No reviews or
+  approvals, no comments on lines, and conflicts are settled on your machine.
   Merged branches are not deleted for you.
 - Permissions are per owner: a user's repositories are theirs alone, and an
   organization's members can push to all of its repositories.

@@ -162,7 +162,7 @@ CI triggers and audit logs are built from this, with whatever retries they need.
 | `GET /api/repos/<id>/tree?rev=&path=` | A directory listing. |
 | `GET /api/repos/<id>/blob?rev=&path=` | A file's bytes (or `?oid=` for a blob by id). |
 | `GET /api/repos/<id>/compare?base=&head=` | What `head` has that `base` does not: the merge base, the commits, and the files changed since the two parted. |
-| `POST /api/repos/<id>/merge` | Merge a revision into a branch, as a merge commit or squashed into one. |
+| `POST /api/repos/<id>/merge` | Merge a revision into a branch: as a merge commit, squashed into one commit, or rebased. |
 | `GET /api/events` | The feed above. |
 | `GET /healthz` | Liveness, without credentials. |
 
@@ -184,7 +184,11 @@ three-way merge against the merge base, done without a working copy: files
 changed on both sides are merged line by line, and overlapping edits, binary
 files or a change to something the other side deleted are conflicts, answered
 with 409 and nothing written. `method` is `merge` (a commit with both
-parents, even where a fast-forward would do) or `squash`. `expect_head`
+parents, even where a fast-forward would do), `squash` (one commit on top of
+the branch) or `rebase` (each commit made again on top of the branch, with
+its author and message; merge commits are left out, commits whose change the
+branch already has are skipped, and a branch that is already a straight line
+on top just moves up). `expect_head`
 refuses the merge if the head is no longer that commit, and `dry_run` only
 says whether it would work (`{"mergeable": ..., "conflicts": [...]}`). A
 merge appears in the event feed as a push by `actor`, with a `merge` field.

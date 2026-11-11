@@ -231,14 +231,15 @@ export function addPullRoutes(api: Hono<Env>) {
     if (!canWrite(c.get("level"))) throw fail(403, "only those who can push here can merge");
     if (pull.state !== "open") throw fail(409, `this pull request is ${pull.state}`);
     const body = await c.req.json();
-    const squash = body.method === "squash";
+    const method = body.method === "squash" || body.method === "rebase" ? (body.method as "squash" | "rebase") : "merge";
     const merged = await strata.merge(repo.id, {
       base: pull.base,
       head: pull.head,
       // What the page showed when the button was pressed, if it said.
       expect_head: body.head ? String(body.head) : undefined,
-      method: squash ? "squash" : "merge",
-      message: squash ? `${pull.title} (#${pull.number})\n\n${pull.body}` : `Merge pull request #${pull.number} from ${pull.head}\n\n${pull.title}`,
+      method,
+      // A rebase keeps each commit's own message.
+      message: method === "squash" ? `${pull.title} (#${pull.number})\n\n${pull.body}` : `Merge pull request #${pull.number} from ${pull.head}\n\n${pull.title}`,
       author: { name: user.display_name || user.name, email: `${user.name}@users.noreply.hub` },
       actor: user.name,
     });

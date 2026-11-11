@@ -1031,8 +1031,47 @@ async fn branches_can_be_compared_and_merged() {
         assert_eq!(git(&copy, &["diff", "--stat", "origin/main", "two-steps"]), "");
         git(&copy, &["fsck", "--strict"]);
 
+        // A rebase makes each commit again on top of the base. This branch left
+        // main two merges ago and holds a merge of its own, which is left out.
+        git(&copy, &["checkout", "-q", "-b", "replay", &main]);
+        std::fs::write(copy.join("a.txt"), lines(&[(5, "five"), (9, "nine")])).unwrap();
+        let five = commit_on(&copy, 7, "five");
+        git(&copy, &["merge", "-q", "--no-edit", &topic]);
+        std::fs::write(copy.join("f.txt"), "f\n").unwrap();
+        commit_on(&copy, 8, "add f\n\nwith a body");
+        git(&copy, &["push", "-q", "origin", "replay"]);
+        let before = git(&copy, &["rev-parse", "origin/main"]);
+        let asked = json(&merge(serde_json::json!({ "base": "main", "head": "replay", "method": "rebase", "dry_run": true })).1);
+        assert_eq!(asked["mergeable"], true);
+        let rebased = merge(serde_json::json!({
+            "base": "main", "head": "replay", "method": "rebase",
+            "author": { "name": "Bob", "email": "bob@example.com" },
+        }));
+        assert_eq!(rebased.0, 200, "{}", rebased.1);
+        git(&copy, &["fetch", "-q", "origin"]);
+        // Two commits on top, in order: the topic's own commit is in main already and adds nothing.
+        assert_eq!(git(&copy, &["log", "--format=%s|%an|%cn", &format!("{before}..origin/main")]), "add f|Test|Bob\nfive|Test|Bob");
+        assert_eq!(git(&copy, &["log", "-1", "--format=%b", "origin/main"]), "with a body");
+        assert_eq!(git(&copy, &["rev-list", "--merges", "--count", &format!("{before}..origin/main")]), "0");
+        assert_eq!(git(&copy, &["log", "-1", "--format=%ad", "--date=short", "origin/main~1"]), "2020-01-07");
+        assert_ne!(git(&copy, &["rev-parse", "origin/main~1"]), five);
+        assert_eq!(git(&copy, &["show", "origin/main:a.txt"]) + "\n", lines(&[(2, "two"), (5, "five"), (9, "nine")]));
+        assert_eq!(git(&copy, &["show", "origin/main:f.txt"]), "f");
+        git(&copy, &["fsck", "--strict"]);
+        // A straight line on top of the base is taken as it is: the branch moves up.
+        git(&copy, &["checkout", "-q", "-B", "line", "origin/main"]);
+        std::fs::write(copy.join("g.txt"), "g\n").unwrap();
+        let line = commit_on(&copy, 9, "add g");
+        git(&copy, &["push", "-q", "origin", "line"]);
+        let moved = json(&merge(serde_json::json!({ "base": "main", "head": "line", "method": "rebase" })).1);
+        assert_eq!(moved["oid"], line.as_str());
+        assert_eq!(merge(serde_json::json!({ "base": "main", "head": "line", "method": "rebase" })).0, 409);
+        // Replaying meets the same conflicts a merge does.
+        let refused = merge(serde_json::json!({ "base": "main", "head": "clash", "method": "rebase" }));
+        assert_eq!(refused, (409, "conflicting changes in a.txt".to_string()));
+
         assert_eq!(merge(serde_json::json!({ "base": "nope", "head": "topic" })).0, 404);
-        assert_eq!(merge(serde_json::json!({ "base": "main", "head": "topic", "method": "rebase" })).0, 400);
+        assert_eq!(merge(serde_json::json!({ "base": "main", "head": "topic", "method": "octopus" })).0, 400);
         assert_eq!(api("GET", &format!("{repo}/merge"), None).0, 405);
     })
     .await

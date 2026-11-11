@@ -174,7 +174,7 @@ function Note({ author, time, body, opening }: { author: string; time: number; b
 
 /** Where an open pull request stands, and the button that merges it. */
 function MergeBox({ pull, base, act }: { pull: PullDetail; base: string; act: (what: () => Promise<unknown>) => Promise<void> }) {
-  const [method, setMethod] = useState<"merge" | "squash">("merge");
+  const [method, setMethod] = useState<"merge" | "squash" | "rebase">("merge");
   const [busy, setBusy] = useState(false);
   if (!pull.compare) return <Alert className="stack" type="warning" showIcon title="One of its branches is gone, so there is nothing to merge." />;
   if (pull.compare.ahead === 0) return <Alert className="stack" type="info" showIcon title={`${pull.head} has nothing that ${pull.base} lacks.`} />;
@@ -213,7 +213,7 @@ function MergeBox({ pull, base, act }: { pull: PullDetail; base: string; act: (w
               onChange={setMethod}
               aria-label="How to merge"
               popupMatchSelectWidth={false}
-              options={[{ value: "merge", label: "Create a merge commit" }, { value: "squash", label: "Squash into one commit" }]}
+              options={[{ value: "merge", label: "Create a merge commit" }, { value: "squash", label: "Squash into one commit" }, { value: "rebase", label: "Rebase onto the base" }]}
             />
             <Button type="primary" loading={busy} onClick={merge}>Merge pull request</Button>
           </Space>

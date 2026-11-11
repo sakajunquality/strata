@@ -7,11 +7,13 @@
 //! A merge is a three-way merge of trees against the merge base. Files changed
 //! on both sides are merged line by line; whatever cannot be (overlapping
 //! edits, binary files, one side deleting what the other changed) is reported
-//! as a conflict and nothing is written. The result lands like a push: one
+//! as a conflict and nothing is written. The result is a merge commit, one
+//! squashed commit, or (rebase) each commit made again on top of the branch. The result lands like a push: one
 //! small pack and one ref update in a single transaction, with an event in
 //! the feed. The pre-receive hook is not asked: the application is the caller.
 
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,7 +22,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use bytes::Bytes;
 use serde_json::json;
-use strata_git::object::object_id;
+use strata_git::object::{object_id, parse_tree, CommitInfo};
 use strata_git::pack::{index_pack, PackWriter};
 use strata_git::{ObjectKind, ObjectSource, Oid, PackData, PackSet};
 use strata_store::{MetaError, PackStore, RefUpdate, RepoState, Txn};
@@ -132,17 +134,38 @@ fn is_file(mode: u32) -> bool {
 struct Merger<'a> {
     packs: &'a PackSet,
     objects: Vec<(ObjectKind, Vec<u8>)>,
-    made: HashSet<Oid>,
+    /// Where in `objects` each new object is.
+    made: HashMap<Oid, usize>,
     conflicts: Vec<String>,
 }
 
 impl Merger<'_> {
     fn keep(&mut self, kind: ObjectKind, data: Vec<u8>) -> Oid {
         let oid = object_id(kind, &data);
-        if !self.packs.contains(&oid) && self.made.insert(oid) {
+        if !self.packs.contains(&oid) && !self.made.contains_key(&oid) {
+            self.made.insert(oid, self.objects.len());
             self.objects.push((kind, data));
         }
         oid
+    }
+
+    /// An object's content, whether stored or made here: a rebase merges on
+    /// top of trees it has only just built.
+    fn data(&self, oid: &Oid) -> Result<Option<Vec<u8>>, HttpError> {
+        match self.made.get(oid) {
+            Some(at) => Ok(Some(self.objects[*at].1.clone())),
+            None => Ok(self.packs.get(oid)?.map(|object| object.data.to_vec())),
+        }
+    }
+
+    fn entries(&self, tree: Option<Oid>) -> Result<BTreeMap<Vec<u8>, Entry>, HttpError> {
+        match tree {
+            Some(tree) if self.made.contains_key(&tree) => {
+                let data = self.data(&tree)?.unwrap_or_default();
+                Ok(parse_tree(&data)?.iter().map(|entry| (entry.name.to_vec(), (entry.mode, entry.oid))).collect())
+            }
+            _ => entries(self.packs, tree),
+        }
     }
 
     fn conflict(&mut self, path: String) {
@@ -153,7 +176,7 @@ impl Merger<'_> {
 
     /// The merged directory, or `None` if nothing is left in it.
     fn tree(&mut self, base: Option<Oid>, ours: Option<Oid>, theirs: Option<Oid>, prefix: &str) -> Result<Option<Oid>, HttpError> {
-        let (base, ours, theirs) = (entries(self.packs, base)?, entries(self.packs, ours)?, entries(self.packs, theirs)?);
+        let (base, ours, theirs) = (self.entries(base)?, self.entries(ours)?, self.entries(theirs)?);
         let names: BTreeSet<&Vec<u8>> = base.keys().chain(ours.keys()).chain(theirs.keys()).collect();
         let mut merged: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
         for name in names {
@@ -210,7 +233,7 @@ impl Merger<'_> {
         }
         let mut texts = Vec::new();
         for oid in [base.1, ours.1, theirs.1] {
-            let data = self.packs.get(&oid)?.ok_or_else(HttpError::not_found)?.data;
+            let data = self.data(&oid)?.ok_or_else(HttpError::not_found)?;
             if data.len() > MAX_MERGED_FILE || data.contains(&0) {
                 return Ok(None);
             }
@@ -260,7 +283,8 @@ struct Request {
     head: String,
     /// Refuse unless `head` is this commit, so that what is merged is what was looked at.
     expect_head: Option<String>,
-    /// `merge` (a commit with both as parents, the default) or `squash` (one commit on top of `base`).
+    /// `merge` (a commit with both as parents, the default), `squash` (one
+    /// commit on top of `base`) or `rebase` (each commit again on top of `base`).
     method: Option<String>,
     message: Option<String>,
     author: Option<Person>,
@@ -298,10 +322,11 @@ fn plan(repo: &RepoState, packs: &PackSet, request: &Request) -> Result<Plan, Ht
     if request.expect_head.as_ref().is_some_and(|expected| *expected != head.to_string()) {
         return Err(conflict("the head has changed since"));
     }
-    let squash = match request.method.as_deref() {
-        None | Some("merge") => false,
-        Some("squash") => true,
-        Some(_) => return Err(HttpError::bad_request("method must be merge or squash")),
+    let method = match request.method.as_deref() {
+        None | Some("merge") => Method::Merge,
+        Some("squash") => Method::Squash,
+        Some("rebase") => Method::Rebase,
+        Some(_) => return Err(HttpError::bad_request("method must be merge, squash or rebase")),
     };
     let divergence = diverge(packs, base, head)?;
     let merge_base = divergence.bases.first().copied();
@@ -311,7 +336,50 @@ fn plan(repo: &RepoState, packs: &PackSet, request: &Request) -> Result<Plan, Ht
     }
     let Some(merge_base) = merge_base else { return Err(conflict("the two have no history in common")) };
 
-    let mut merger = Merger { packs, objects: Vec::new(), made: HashSet::new(), conflicts: Vec::new() };
+    let clean = |text: &str| text.chars().filter(|c| !matches!(c, '<' | '>' | '\n' | '\r' | '\0')).collect::<String>().trim().to_string();
+    let who = match &request.author {
+        Some(person) => format!("{} <{}>", clean(&person.name), clean(&person.email)),
+        None => "Strata <strata@localhost>".to_string(),
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_secs()).unwrap_or(0);
+    let who = format!("{who} {now} +0000");
+    let mut merger = Merger { packs, objects: Vec::new(), made: HashMap::new(), conflicts: Vec::new() };
+
+    if method == Method::Rebase {
+        let commits = oldest_first(packs, &divergence.ahead)?;
+        if merge_base == base && commits.iter().all(|(_, commit)| commit.parents.len() == 1) {
+            // Already a straight line on top of the base: the branch just moves up.
+            plan.commit = head;
+            return Ok(plan);
+        }
+        let (mut tip, mut tip_tree) = (base, tree_of(packs, &base)?);
+        for (oid, commit) in commits {
+            // Merges are left out: what they brought in is replayed commit by commit.
+            let [parent] = commit.parents[..] else { continue };
+            let before = tree_of(packs, &parent)?;
+            let tree = merger.tree(Some(before), Some(tip_tree), Some(commit.tree), "")?;
+            if !merger.conflicts.is_empty() {
+                plan.conflicts = merger.conflicts;
+                return Ok(plan);
+            }
+            let tree = tree.unwrap_or_else(|| merger.keep(ObjectKind::Tree, Vec::new()));
+            if tree == tip_tree {
+                // The base has this change already.
+                continue;
+            }
+            let raw = packs.get(&oid)?.ok_or_else(HttpError::not_found)?.data;
+            tip = merger.keep(ObjectKind::Commit, replayed(&raw, tree, tip, &who));
+            tip_tree = tree;
+        }
+        if tip == base {
+            plan.ahead = 0;
+        } else if !request.dry_run {
+            plan.commit = tip;
+            plan.objects = merger.objects;
+        }
+        return Ok(plan);
+    }
+
     let tree = if merge_base == base {
         // Nothing happened on the base since: the result is the head as it is.
         tree_of(packs, &head)?
@@ -324,25 +392,83 @@ fn plan(repo: &RepoState, packs: &PackSet, request: &Request) -> Result<Plan, Ht
         return Ok(plan);
     }
 
-    let clean = |text: &str| text.chars().filter(|c| !matches!(c, '<' | '>' | '\n' | '\r' | '\0')).collect::<String>().trim().to_string();
-    let who = match &request.author {
-        Some(person) => format!("{} <{}>", clean(&person.name), clean(&person.email)),
-        None => "Strata <strata@localhost>".to_string(),
-    };
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_secs()).unwrap_or(0);
     let short = plan.name.strip_prefix("refs/heads/").unwrap_or(&plan.name);
     let message = match request.message.as_deref().map(str::trim).filter(|message| !message.is_empty()) {
         Some(message) => message.replace('\0', ""),
         None => format!("Merge {} into {short}", request.head),
     };
     let mut commit = format!("tree {tree}\nparent {base}\n");
-    if !squash {
+    if method == Method::Merge {
         commit.push_str(&format!("parent {head}\n"));
     }
-    commit.push_str(&format!("author {who} {now} +0000\ncommitter {who} {now} +0000\n\n{message}\n"));
+    commit.push_str(&format!("author {who}\ncommitter {who}\n\n{message}\n"));
     plan.commit = merger.keep(ObjectKind::Commit, commit.into_bytes());
     plan.objects = merger.objects;
     Ok(plan)
+}
+
+#[derive(PartialEq)]
+enum Method {
+    Merge,
+    Squash,
+    Rebase,
+}
+
+/// Puts commits in an order in which each comes after its parents, older
+/// ones first where there is a choice.
+fn oldest_first(packs: &PackSet, commits: &[Oid]) -> Result<Vec<(Oid, CommitInfo)>, HttpError> {
+    let mut infos = HashMap::new();
+    for oid in commits {
+        infos.insert(*oid, packs.commit(oid)?.ok_or_else(HttpError::not_found)?);
+    }
+    let mut waiting: HashMap<Oid, usize> = HashMap::new();
+    let mut children: HashMap<Oid, Vec<Oid>> = HashMap::new();
+    let mut ready = BinaryHeap::new();
+    for (oid, info) in &infos {
+        let parents: Vec<&Oid> = info.parents.iter().filter(|parent| infos.contains_key(parent)).collect();
+        if parents.is_empty() {
+            ready.push(Reverse((info.time, *oid)));
+        }
+        waiting.insert(*oid, parents.len());
+        for parent in parents {
+            children.entry(*parent).or_default().push(*oid);
+        }
+    }
+    let mut ordered = Vec::with_capacity(infos.len());
+    while let Some(Reverse((_, oid))) = ready.pop() {
+        for child in children.remove(&oid).unwrap_or_default() {
+            let left = waiting.get_mut(&child).expect("every commit is counted");
+            *left -= 1;
+            if *left == 0 {
+                ready.push(Reverse((infos[&child].time, child)));
+            }
+        }
+        ordered.push(oid);
+    }
+    Ok(ordered.into_iter().map(|oid| (oid, infos.remove(&oid).expect("ordered from these"))).collect())
+}
+
+/// A commit made again on another parent: same author and message, a new
+/// committer. A signature would no longer hold, and is dropped.
+fn replayed(raw: &[u8], tree: Oid, parent: Oid, committer: &str) -> Vec<u8> {
+    let end = raw.windows(2).position(|pair| pair == b"\n\n").map_or(raw.len(), |at| at + 1);
+    let (headers, message) = raw.split_at(end);
+    let mut out = format!("tree {tree}\nparent {parent}\n").into_bytes();
+    let mut kept = false;
+    for line in headers.split_inclusive(|byte| *byte == b'\n') {
+        // A line starting with a space continues the header above it.
+        if !line.starts_with(b" ") {
+            kept = line.starts_with(b"author ") || line.starts_with(b"encoding ");
+        }
+        if kept {
+            out.extend_from_slice(line);
+        }
+        if line.starts_with(b"author ") {
+            out.extend_from_slice(format!("committer {committer}\n").as_bytes());
+        }
+    }
+    out.extend_from_slice(message);
+    out
 }
 
 /// `POST /api/repos/<id>/merge`, with a JSON body as in [`Request`].
@@ -378,21 +504,26 @@ pub(crate) async fn merge(app: &App, name: &str, body: Body) -> Result<Response,
             return Err(conflict(format!("conflicting changes in {}", plan.conflicts.join(", "))));
         }
 
-        let objects = plan.objects;
-        let indexed = blocking(move || -> strata_git::Result<_> {
-            let mut writer = PackWriter::new(Vec::new(), objects.len() as u32)?;
-            for (kind, data) in &objects {
-                writer.add(*kind, data)?;
-            }
-            let data = Bytes::from(writer.finish()?.out);
-            let indexed = index_pack(&data, &packs)?;
-            Ok((data, indexed))
-        })
-        .await??;
-        let (data, indexed) = indexed;
-        let pack_id = PackStore::new_pack_id();
-        let data: Arc<dyn PackData> = Arc::new(data);
-        app.packs.put_pack(&repo.pool_id, &pack_id, data, indexed.index, indexed.graph).await?;
+        // A branch that only moves up to commits already stored needs no pack.
+        let mut pack_id = None;
+        if !plan.objects.is_empty() {
+            let objects = plan.objects;
+            let indexed = blocking(move || -> strata_git::Result<_> {
+                let mut writer = PackWriter::new(Vec::new(), objects.len() as u32)?;
+                for (kind, data) in &objects {
+                    writer.add(*kind, data)?;
+                }
+                let data = Bytes::from(writer.finish()?.out);
+                let indexed = index_pack(&data, &packs)?;
+                Ok((data, indexed))
+            })
+            .await??;
+            let (data, indexed) = indexed;
+            let id = PackStore::new_pack_id();
+            let data: Arc<dyn PackData> = Arc::new(data);
+            app.packs.put_pack(&repo.pool_id, &id, data, indexed.index, indexed.graph).await?;
+            pack_id = Some(id);
+        }
 
         let update = json!({ "ref": plan.name, "old": plan.base.to_string(), "new": plan.commit.to_string(), "change": "fast-forward" });
         let event = json!({
@@ -402,7 +533,7 @@ pub(crate) async fn merge(app: &App, name: &str, body: Body) -> Result<Response,
             "merge": { "head": plan.head.to_string(), "method": request.method.as_deref().unwrap_or("merge") },
         });
         let txn = Txn {
-            add_pack: Some(pack_id),
+            add_pack: pack_id.clone(),
             ref_updates: vec![RefUpdate { name: plan.name.clone(), old: Some(plan.base), new: Some(plan.commit) }],
             // The merge was worked out from the objects of this epoch.
             expect_epoch: Some(repo.epoch),
@@ -411,7 +542,7 @@ pub(crate) async fn merge(app: &App, name: &str, body: Body) -> Result<Response,
         };
         match app.meta.commit(&repo.name, txn).await {
             Ok(()) => {
-                if repo.packs.len() + 1 >= app.options.compact_at {
+                if pack_id.is_some() && repo.packs.len() + 1 >= app.options.compact_at {
                     app.request_compaction(&repo.name);
                 }
                 let mut answer = described;

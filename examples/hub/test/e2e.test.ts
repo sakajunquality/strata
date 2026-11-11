@@ -354,6 +354,17 @@ test("pull requests", async () => {
   expect((await carol("PATCH", `${pulls}/4`, { state: "open" })).status).toBe(404);
   expect((await anyone("GET", pulls)).data).toMatchObject({ open: 0, closed: 4 });
   expect((await anyone("GET", `${pulls}/9`)).status).toBe(404);
+
+  // Rebasing: the branch's commits go on top of the base, with no merge commit.
+  git(work, "checkout", "-q", "-b", "fifth", "main~1");
+  commit("f.txt", "f\n", "Add f");
+  git(work, "push", "-q", origin, "fifth");
+  expect((await carol("POST", pulls, { title: "Fifth", base: "main", head: "fifth" })).data).toEqual({ number: 5 });
+  const rebased = await carol("POST", `${pulls}/5/merge`, { method: "rebase" });
+  expect(rebased.status).toBe(200);
+  git(work, "fetch", "-q", origin, "main");
+  expect(git(work, "log", "-1", "--format=%s|%an|%cn|%p", "FETCH_HEAD").out).toBe(`Add f|Alice|Carol C|${third.slice(0, 7)}`);
+  expect(await state(5)).toBe("merged");
 }, 60_000);
 
 test("other sites cannot act for a signed-in user", async () => {

@@ -47,7 +47,7 @@ export type MergeRequest = {
   base: string;
   head: string;
   expect_head?: string;
-  method?: "merge" | "squash";
+  method?: "merge" | "squash" | "rebase";
   message?: string;
   author?: { name: string; email: string };
   actor?: string;
