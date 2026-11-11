@@ -23,7 +23,7 @@ pub use bitmap::PackBitmaps;
 pub use graph::CommitGraph;
 pub use idx::PackIndex;
 pub use object::{CommitInfo, Object, ObjectKind};
-pub use oid::Oid;
+pub use oid::{Oid, OidMap, OidSet};
 pub use pack::{PackFile, PackSet};
 
 #[derive(Debug, thiserror::Error)]

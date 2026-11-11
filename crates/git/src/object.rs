@@ -131,6 +131,19 @@ impl TreeEntry<'_> {
     }
 }
 
+impl TreeEntry<'_> {
+    /// Where this entry sorts among those of a tree: by name, a directory
+    /// as if its name ended in a slash. Equal only for entries of the same
+    /// name that are both directories or both not.
+    pub fn order(&self, other: &TreeEntry<'_>) -> std::cmp::Ordering {
+        let shared = self.name.len().min(other.name.len());
+        self.name[..shared].cmp(&other.name[..shared]).then_with(|| {
+            let after = |entry: &TreeEntry<'_>| entry.name.get(shared).copied().unwrap_or(if entry.is_tree() { b'/' } else { 0 });
+            after(self).cmp(&after(other))
+        })
+    }
+}
+
 pub fn parse_tree(data: &[u8]) -> Result<Vec<TreeEntry<'_>>> {
     let mut entries = Vec::new();
     let mut rest = data;
@@ -139,10 +152,15 @@ pub fn parse_tree(data: &[u8]) -> Result<Vec<TreeEntry<'_>>> {
             .iter()
             .position(|b| *b == b' ')
             .ok_or_else(|| corrupt("tree entry without mode"))?;
-        let mode = std::str::from_utf8(&rest[..space])
-            .ok()
-            .and_then(|s| u32::from_str_radix(s, 8).ok())
-            .ok_or_else(|| corrupt("bad tree entry mode"))?;
+        // Octal, at most seven digits: read as it stands, since every tree
+        // of a walk through history comes through here.
+        let mut mode = 0u32;
+        if space == 0 || space > 7 || !rest[..space].iter().all(|digit| (b'0'..=b'7').contains(digit)) {
+            return Err(corrupt("bad tree entry mode"));
+        }
+        for digit in &rest[..space] {
+            mode = mode * 8 + u32::from(digit - b'0');
+        }
         rest = &rest[space + 1..];
         let nul = rest
             .iter()

@@ -10,7 +10,7 @@ use crate::bitmap::Reachable;
 use crate::bitset::BitSet;
 use crate::object::{parse_tag, parse_tree, CommitInfo};
 use crate::sparse::Patterns;
-use crate::{Error, ObjectKind, ObjectSource, Oid, PackFile, PackSet, Result};
+use crate::{Error, ObjectKind, ObjectSource, Oid, OidMap, OidSet, PackFile, PackSet, Result};
 
 /// Follows annotated tags from `oid`. Returns the first non-tag object, or
 /// `None` if `oid` is not a tag.
@@ -407,28 +407,43 @@ fn diff_trees(
                 known_trees.push(object);
             }
         }
-        let mut known_entries: HashMap<&[u8], Vec<(Oid, bool)>> = HashMap::new();
+        // Trees keep their entries sorted, so the known trees are read side
+        // by side with this one, each with a place of its own. Should a tree
+        // not be sorted, an entry may be taken for new when it is not: more
+        // is sent then, never less.
+        let mut known_entries = Vec::with_capacity(known_trees.len());
         for known_tree in &known_trees {
-            for entry in parse_tree(&known_tree.data)? {
-                known_entries.entry(entry.name).or_default().push((entry.oid, entry.is_tree()));
-            }
+            known_entries.push((parse_tree(&known_tree.data)?, 0));
         }
         for entry in parse_tree(&tree.data)? {
             if entry.is_gitlink() {
                 continue;
             }
-            let same_path = known_entries.get(entry.name).map(Vec::as_slice).unwrap_or_default();
-            if same_path.iter().any(|(known_oid, _)| *known_oid == entry.oid) {
+            // What the known trees have under this name, where it is something else.
+            let mut same_kind = Vec::new();
+            let mut unchanged = false;
+            for (entries, at) in &mut known_entries {
+                while entries.get(*at).is_some_and(|other| other.order(&entry).is_lt()) {
+                    *at += 1;
+                }
+                if let Some(other) = entries.get(*at).filter(|other| other.order(&entry).is_eq()) {
+                    if other.oid == entry.oid {
+                        unchanged = true;
+                        break;
+                    }
+                    same_kind.push(other.oid);
+                }
+            }
+            if unchanged {
                 continue;
             }
-            let same_kind = same_path.iter().filter(|(_, is_tree)| *is_tree == entry.is_tree()).map(|(oid, _)| *oid);
             let mut entry_path = Vec::new();
             if by_path {
                 entry_path = [&path[..], entry.name].concat();
             }
             if entry.is_tree() {
                 entry_path.push(b'/');
-                jobs.push(TreeJob { tree: entry.oid, known: same_kind.collect(), depth: depth + 1, path: entry_path });
+                jobs.push(TreeJob { tree: entry.oid, known: same_kind, depth: depth + 1, path: entry_path });
             } else if filter.keeps_depth(depth + 1) && filter.keeps_blob(src, &entry.oid, &entry_path)? && mark(&entry.oid)? {
                 emit(entry.oid, same_kind.into_iter().next());
             }
@@ -499,8 +514,8 @@ struct CommitWalk<'a> {
     src: &'a dyn ObjectSource,
     /// Where to look for bitmaps, if they may be used.
     bitmaps: Option<&'a PackSet>,
-    info: HashMap<Oid, CommitInfo>,
-    flags: HashMap<Oid, u8>,
+    info: OidMap<CommitInfo>,
+    flags: OidMap<u8>,
     queue: BinaryHeap<(i64, Oid)>,
     /// Queued commits not (yet) known to be uninteresting.
     pending: usize,
@@ -667,8 +682,8 @@ pub fn plan_fetch(packs: &PackSet, wants: &[Oid], haves: &[Oid], shallow: &Shall
     let mut walk = CommitWalk {
         src: packs,
         bitmaps: use_bitmaps.then_some(packs),
-        info: HashMap::new(),
-        flags: HashMap::new(),
+        info: OidMap::default(),
+        flags: OidMap::default(),
         queue: BinaryHeap::new(),
         pending: 0,
         want_bits: HashMap::new(),
@@ -680,7 +695,7 @@ pub fn plan_fetch(packs: &PackSet, wants: &[Oid], haves: &[Oid], shallow: &Shall
     }
 
     let mut objects: Vec<(Oid, Option<Oid>)> = Vec::new();
-    let mut sent = HashSet::new();
+    let mut sent = OidSet::default();
     let mut jobs = Vec::new();
     let mut wanted_blobs = Vec::new();
     for oid in wants.iter().chain(&shallow.extra_tips) {
