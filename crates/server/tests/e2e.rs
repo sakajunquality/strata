@@ -1271,6 +1271,214 @@ async fn content_can_be_read_through_the_api() {
     .unwrap();
 }
 
+/// The commit git itself puts each line of a file down to.
+fn git_blame(dir: &Path, path: &str) -> Vec<String> {
+    git(dir, &["blame", "-l", "-s", "--root", path]).lines().map(|line| line[..40].to_string()).collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn code_can_be_blamed_searched_and_followed() {
+    let base = start(false).await;
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = format!("{base}/api/repos/r-code");
+        let get = |path: &str| api("GET", &format!("{repo}/{path}"), None);
+        assert_eq!(api("PUT", &repo, None).0, 201);
+
+        // A file that grows, has lines changed and removed on two branches, and is merged.
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        let write = |lines: &[String]| std::fs::write(work.join("src/lib.rs"), lines.join("\n") + "\n").unwrap();
+        let mut lines: Vec<String> = (1..=40).map(|n| format!("fn line_{n}() {{}}")).collect();
+        write(&lines);
+        std::fs::write(work.join("README.md"), "# Code\n\nSearch me: Needle in a haystack.\n").unwrap();
+        std::fs::write(work.join("blob.bin"), [0u8, 1, 2, b'n', b'e', b'e', b'd', b'l', b'e']).unwrap();
+        let first = commit_on(&work, 1, "first");
+        lines[4] = "fn line_5_changed() {}".into();
+        lines.insert(10, "fn inserted_by_second() { needle(); }".into());
+        write(&lines);
+        let second = commit_on(&work, 2, "second");
+        git(&work, &["checkout", "-q", "-b", "side"]);
+        lines.truncate(35);
+        lines.push("fn added_on_side() {}".into());
+        write(&lines);
+        commit_on(&work, 3, "on the side");
+        git(&work, &["checkout", "-q", "main"]);
+        let mut ours: Vec<String> = git(&work, &["show", "HEAD:src/lib.rs"]).lines().map(str::to_string).collect();
+        ours[0] = "fn line_1_on_main() {}".into();
+        ours.remove(20);
+        write(&ours);
+        std::fs::write(work.join("other.txt"), "untouched by the rest\n").unwrap();
+        let fourth = commit_on(&work, 4, "on main");
+        git(&work, &["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
+        std::fs::write(work.join("src/lib.rs"), std::fs::read_to_string(work.join("src/lib.rs")).unwrap() + "// the end").unwrap();
+        commit_on(&work, 5, "no newline at the end");
+        git(&work, &["push", "-q", &format!("{base}/r-code.git"), "main", "side"]);
+
+        // Every line is put down to the commit git puts it down to.
+        let blame = |rev: &str| {
+            let answer = json(&get(&format!("blame?rev={rev}&path=src/lib.rs")).1);
+            let mut by_line = Vec::new();
+            for hunk in answer["hunks"].as_array().unwrap() {
+                assert_eq!(hunk["start"].as_u64().unwrap() as usize, by_line.len() + 1);
+                assert!(answer["commits"][hunk["oid"].as_str().unwrap()]["message"].is_string());
+                by_line.extend(std::iter::repeat_n(hunk["oid"].as_str().unwrap().to_string(), hunk["lines"].as_u64().unwrap() as usize));
+            }
+            assert_eq!(answer["lines"].as_u64().unwrap() as usize, by_line.len());
+            assert_eq!(answer["truncated"], false);
+            by_line
+        };
+        assert_eq!(blame("main"), git_blame(&work, "src/lib.rs"));
+        git(&work, &["checkout", "-q", "side"]);
+        assert_eq!(blame("side"), git_blame(&work, "src/lib.rs"));
+        git(&work, &["checkout", "-q", &second]);
+        let at_second = blame(&second);
+        assert_eq!(at_second, git_blame(&work, "src/lib.rs"));
+        assert_eq!(at_second.iter().filter(|oid| **oid == second).count(), 2);
+        assert_eq!(get("blame?path=src").0, 404);
+        assert_eq!(get("blame?path=nope.rs").0, 404);
+        assert_eq!(get("blame?path=blob.bin").0, 422);
+
+        // The history of one path: the commits that changed it, and no merge that only took a side.
+        let touched = |path: &str| -> Vec<String> {
+            json(&get(&format!("commits?path={path}&limit=100")).1)["commits"].as_array().unwrap().iter().map(|c| c["message"].as_str().unwrap().trim().to_string()).collect()
+        };
+        assert_eq!(touched("src/lib.rs"), ["no newline at the end", "merge side", "on main", "on the side", "second", "first"]);
+        assert_eq!(touched("other.txt"), ["on main"]);
+        assert_eq!(touched("src"), touched("src/lib.rs"));
+        assert_eq!(touched("README.md"), ["first"]);
+        assert!(touched("nope").is_empty());
+        let page = json(&get("commits?path=src/lib.rs&limit=2&skip=2").1);
+        assert_eq!(page["commits"][0]["oid"], fourth.as_str());
+        assert_eq!(page["next"], 4);
+
+        // Text is found wherever it stands, whatever its case; binary files are passed over.
+        let found = json(&get("search?q=needle").1);
+        let hits: Vec<(String, u64)> = found["files"].as_array().unwrap().iter().flat_map(|f| f["matches"].as_array().unwrap().iter().map(|m| (f["path"].as_str().unwrap().to_string(), m["line"].as_u64().unwrap())).collect::<Vec<_>>()).collect();
+        assert_eq!(hits, [("README.md".to_string(), 3), ("src/lib.rs".to_string(), 11)]);
+        assert_eq!(found["files"][0]["matches"][0]["text"], "Search me: Needle in a haystack.");
+        assert_eq!(found["truncated"], false);
+        assert_eq!(json(&get("search?q=needle&case=1").1)["matches"], 1);
+        assert_eq!(json(&get("search?q=needle&path=src").1)["matches"], 1);
+        assert_eq!(json(&get(&format!("search?q=needle&rev={first}")).1)["matches"], 1);
+        // A pattern, a limit, and files found by their names.
+        let pattern = json(&get("search?regex=1&q=fn%20line_%5B0-9%5D%2B%5C(").1);
+        assert_eq!(pattern["files"][0]["matches"].as_array().unwrap().len(), 20);
+        assert_eq!(pattern["files"][0]["more"], true);
+        let limited = json(&get("search?q=fn&limit=3").1);
+        assert_eq!((limited["matches"].as_u64(), limited["truncated"].as_bool()), (Some(3), Some(true)));
+        assert_eq!(json(&get("search?q=lib.rs").1)["paths"], serde_json::json!(["src/lib.rs"]));
+        assert_eq!(json(&get("search?q=a.c").1)["matches"], 0);
+        assert_eq!(json(&get("search?regex=1&q=%5Efn%20line_7%5C(%5C)%20%5C%7B%5C%7D%24").1)["matches"], 1);
+        assert_eq!(get("search?q=").0, 400);
+        assert_eq!(get("search?regex=1&q=(").0, 400);
+        assert_eq!(get("search?q=x&path=README.md").0, 400);
+    })
+    .await
+    .unwrap();
+}
+
+fn curl(args: &[&str]) -> (u16, String) {
+    let out = Command::new("curl").args(["-s", "-w", "\n%{http_code}"]).args(args).output().expect("curl must be installed");
+    let out = String::from_utf8_lossy(&out.stdout).to_string();
+    let (body, status) = out.rsplit_once('\n').unwrap();
+    (status.parse().unwrap(), body.to_string())
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Git LFS: large files go beside the packs, to those who may push, and come back to those who may fetch.
+#[tokio::test(flavor = "multi_thread")]
+async fn large_files_are_kept_beside_the_repository() {
+    let (application, _seen) = application::start().await;
+    let options = Options {
+        compact_at: usize::MAX,
+        admin_token: Some("root-secret".into()),
+        authz_url: Some(format!("{application}/authz")),
+        authz_cache: Duration::ZERO,
+        hook_secret: Some("hook-secret".into()),
+        ..Options::default()
+    };
+    let (base, app) = start_with(options).await;
+    app.meta.create_repo("r-1").await.unwrap();
+    app.meta.create_repo("r-2").await.unwrap();
+
+    let served = base.clone();
+    tokio::task::spawn_blocking(move || {
+        let base = served;
+        let tmp = tempfile::tempdir().unwrap();
+        let lfs = format!("{base}/acme/app.git/info/lfs");
+        let data = incompressible(3 << 20);
+        let oid = sha256_hex(&data);
+        let file = tmp.path().join("large.bin");
+        std::fs::write(&file, &data).unwrap();
+        let batch = |user: &str, operation: &str, oid: &str| {
+            let body = serde_json::json!({ "operation": operation, "transfers": ["basic"], "objects": [{ "oid": oid, "size": data.len() }], "hash_algo": "sha256" }).to_string();
+            let (status, text) = curl(&["-X", "POST", "-u", &format!("git:{user}-token"), "-H", "Content-Type: application/vnd.git-lfs+json", "-d", &body, &format!("{lfs}/objects/batch")]);
+            (status, json(&text))
+        };
+
+        // Bob may only read: he is told so in the way LFS clients read.
+        let (status, refused) = batch("bob", "upload", &oid);
+        assert_eq!((status, refused["message"].as_str()), (403, Some("bob may only read")));
+        assert_eq!(curl(&["-X", "POST", "-d", "{}", &format!("{lfs}/objects/batch")]).0, 401);
+        assert_eq!(batch("alice", "download", &oid).1["objects"][0]["error"]["code"], 404);
+
+        // Alice is told where to send it, and what to show there.
+        let (status, answer) = batch("alice", "upload", &oid);
+        assert_eq!(status, 200);
+        let upload = &answer["objects"][0]["actions"]["upload"];
+        let href = upload["href"].as_str().unwrap().to_string();
+        assert_eq!(href, format!("{lfs}/objects/{oid}"));
+        let authorization = format!("Authorization: {}", upload["header"]["Authorization"].as_str().unwrap());
+        // Not without that, not as Bob, and not content that is something else.
+        let put = |header: &str, path: &Path, href: &str| curl(&["-X", "PUT", "-H", header, "-H", "Content-Type: application/octet-stream", "--data-binary", &format!("@{}", path.display()), href]).0;
+        assert_eq!(put("X-Nothing: 1", &file, &href), 401);
+        let other = tmp.path().join("other.bin");
+        std::fs::write(&other, b"something else").unwrap();
+        assert_eq!(put(&authorization, &other, &href), 422);
+        assert_eq!(batch("alice", "download", &oid).1["objects"][0]["error"]["code"], 404);
+        assert_eq!(put(&authorization, &file, &href), 200);
+        assert_eq!(put(&authorization, &file, &href), 200);
+        // Now there: nothing more to send, and Bob can fetch it.
+        assert!(batch("alice", "upload", &oid).1["objects"][0]["actions"].is_null());
+        let (_, answer) = batch("bob", "download", &oid);
+        let download = &answer["objects"][0]["actions"]["download"];
+        let fetched = tmp.path().join("fetched.bin");
+        let got = curl(&["-H", &format!("Authorization: {}", download["header"]["Authorization"].as_str().unwrap()), "-o", &fetched.display().to_string(), download["href"].as_str().unwrap()]);
+        assert_eq!(got.0, 200);
+        assert_eq!(sha256_hex(&std::fs::read(&fetched).unwrap()), oid);
+        assert_eq!(curl(&[&href]).0, 401);
+        // An empty file is a file too.
+        let empty = tmp.path().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        let none = sha256_hex(b"");
+        assert_eq!(put(&authorization, &empty, &format!("{lfs}/objects/{none}")), 200);
+        assert_eq!(curl(&["-H", &authorization, &format!("{lfs}/objects/{none}")]), (200, String::new()));
+
+        // The application reads it with the admin token; another repository does not have it.
+        let admin = |path: &str| curl(&["-H", "Authorization: Bearer root-secret", "-o", "/dev/null", &format!("{base}/api/repos/{path}")]).0;
+        assert_eq!(admin(&format!("r-1/lfs/{oid}")), 200);
+        assert_eq!(admin(&format!("r-2/lfs/{oid}")), 404);
+        assert_eq!(admin("r-1/lfs/not-an-id"), 400);
+        let metrics = api("GET", &format!("{base}/metrics"), Some("root-secret")).1;
+        assert!(metrics.contains("strata_lfs_objects_total{op=\"upload\"} 2"), "{metrics}");
+        assert!(metrics.contains(&format!("strata_lfs_bytes_total{{op=\"upload\"}} {}", data.len())), "{metrics}");
+
+        // With the repository, its large files go.
+        assert_eq!(api("DELETE", &format!("{base}/api/repos/r-1"), Some("root-secret")).0, 200);
+    })
+    .await
+    .unwrap();
+    assert_eq!(app.packs.lfs_delete_all("anything").await.unwrap(), 0);
+    let left = app.packs.list_pools().await.unwrap();
+    assert!(left.is_empty(), "{left:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn branches_can_be_compared_and_merged() {
     let base = start(false).await;

@@ -148,6 +148,11 @@ fn object_path(pool_id: &str, pack_id: &str, ext: &str) -> Path {
     Path::from(format!("pools/{pool_id}/packs/pack-{pack_id}.{ext}"))
 }
 
+/// Large files (Git LFS) sit beside a pool's packs, by the SHA-256 of their content.
+fn lfs_path(pool_id: &str, oid: &str) -> Path {
+    Path::from(format!("pools/{pool_id}/lfs/{}/{oid}", &oid[..2]))
+}
+
 fn cache_key(pool_id: &str, pack_id: &str) -> String {
     format!("{pool_id}/{pack_id}")
 }
@@ -356,6 +361,67 @@ impl PackStore {
             newest.entry(pack_id.to_string()).and_modify(|at| *at = (*at).max(written)).or_insert(written);
         }
         Ok(newest.into_iter().collect())
+    }
+
+    /// The size of a large file kept for a pool (Git LFS), or `None` if it is not there.
+    pub async fn lfs_size(&self, pool_id: &str, oid: &str) -> anyhow::Result<Option<u64>> {
+        match self.blocks.store.head(&lfs_path(pool_id, oid)).await {
+            Ok(meta) => Ok(Some(meta.size as u64)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("looking for large file {oid}")),
+        }
+    }
+
+    /// A large file's content, to be streamed out.
+    pub async fn lfs_get(&self, pool_id: &str, oid: &str) -> anyhow::Result<Option<object_store::GetResult>> {
+        match self.blocks.store.get(&lfs_path(pool_id, oid)).await {
+            Ok(found) => Ok(Some(found)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("reading large file {oid}")),
+        }
+    }
+
+    /// Stores a large file under the id its content was checked to have,
+    /// reading `data` sequentially. `None`: the file is empty.
+    pub async fn lfs_put(&self, pool_id: &str, oid: &str, data: Option<Arc<dyn PackData>>) -> anyhow::Result<()> {
+        let path = lfs_path(pool_id, oid);
+        let Some(data) = data else {
+            self.blocks.store.put(&path, Bytes::new().into()).await.context("storing an empty large file")?;
+            return Ok(());
+        };
+        let upload = self.blocks.store.put_multipart(&path).await.context("starting large file upload")?;
+        let mut upload = PackUpload { runtime: self.blocks.runtime.clone(), inner: WriteMultipart::new(upload) };
+        let size = data.size();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut offset = 0;
+            while offset < size {
+                let chunk = data.chunk(offset)?;
+                anyhow::ensure!(!chunk.is_empty(), "large file data ended early");
+                let piece = &chunk[..chunk.len().min(UPLOAD_PIECE)];
+                upload.write_all(piece)?;
+                offset += piece.len() as u64;
+            }
+            upload.finish()
+        })
+        .await?
+    }
+
+    /// Deletes every large file of a pool: what is left to do for them when
+    /// its repository is deleted. Returns how many there were.
+    pub async fn lfs_delete_all(&self, pool_id: &str) -> anyhow::Result<usize> {
+        let prefix = Path::from(format!("pools/{pool_id}/lfs"));
+        let mut found = Vec::new();
+        let mut listing = self.blocks.store.list(Some(&prefix));
+        while let Some(entry) = listing.next().await {
+            found.push(entry.context("listing large files")?.location);
+        }
+        for location in &found {
+            match self.blocks.store.delete(location).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(e).context("deleting a large file"),
+            }
+        }
+        Ok(found.len())
     }
 
     /// Deletes a pack and everything stored with it. Missing files are fine:

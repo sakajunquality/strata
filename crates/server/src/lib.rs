@@ -18,7 +18,9 @@ mod auth;
 mod compaction;
 mod content;
 mod hooks;
+mod code;
 mod import;
+mod lfs;
 mod merge;
 mod metrics;
 mod receive_pack;
@@ -75,6 +77,10 @@ pub struct Options {
     pub pre_receive_url: Option<String>,
     /// Sent to the hooks as a Bearer token, so that they know Strata is asking.
     pub hook_secret: Option<String>,
+    /// Where clients reach this node over HTTP, as `https://host`. Large
+    /// files (Git LFS) are fetched from and sent to addresses under it;
+    /// without it they are made from each request's own `Host`.
+    pub public_url: Option<String>,
     /// How long events stay in the feed.
     pub event_retention: Duration,
 }
@@ -103,6 +109,7 @@ impl Default for Options {
             authz_cache: Duration::from_secs(10),
             pre_receive_url: None,
             hook_secret: None,
+            public_url: None,
             event_retention: Duration::from_secs(7 * 24 * 3600),
         }
     }
@@ -252,6 +259,10 @@ async fn route(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body: 
         return repos(app, &method, rest, uri.query().unwrap_or(""), body).await;
     }
 
+    if let Some((name, rest)) = path.split_once("/info/lfs/") {
+        return Ok(lfs::handle(app, &method, name, rest, headers, body).await);
+    }
+
     if let Some(name) = path.strip_suffix("/info/refs") {
         if method != Method::GET {
             return Err(method_not_allowed());
@@ -326,6 +337,7 @@ fn json(status: StatusCode, value: serde_json::Value) -> Response {
 /// - `GET /api/repos/<id>/{refs,commits,commit,compare,tree,blob}` read its content, see [`content`]
 /// - `POST /api/repos/<id>/merge` merges a revision into a branch, see [`merge`]
 /// - `POST /api/repos/<id>/import` takes in a bundle: its objects and all its refs, see [`import`]
+/// - `GET /api/repos/<id>/lfs/<oid>` reads a large file, see [`lfs`]
 async fn repos(app: &App, method: &Method, rest: &str, query: &str, body: Body) -> Result<Response, HttpError> {
     if let Some((name, view)) = rest.rsplit_once('/').filter(|(_, view)| content::VIEWS.contains(view)) {
         let name = repo_name(name)?;
@@ -333,6 +345,13 @@ async fn repos(app: &App, method: &Method, rest: &str, query: &str, body: Body) 
             return Err(method_not_allowed());
         }
         return content::handle(app, name, view, query).await;
+    }
+    if let Some((name, oid)) = rest.split_once("/lfs/") {
+        let name = repo_name(name)?;
+        if method != Method::GET {
+            return Err(method_not_allowed());
+        }
+        return lfs::read(app, name, oid).await;
     }
     if let Some(name) = rest.strip_suffix("/merge") {
         let name = repo_name(name)?;
@@ -400,10 +419,19 @@ async fn repos(app: &App, method: &Method, rest: &str, query: &str, body: Body) 
             ))
         }
         // Gone for every request from here on; the packs follow after the grace period.
-        Method::DELETE => match app.meta.delete_repo(name).await? {
-            true => Ok("deleted\n".into_response()),
-            false => Err(HttpError::not_found()),
-        },
+        Method::DELETE => {
+            let pool = app.meta.get_repo(name, &RefScope::none()).await?.map(|repo| repo.pool_id);
+            if !app.meta.delete_repo(name).await? {
+                return Err(HttpError::not_found());
+            }
+            // Its large files go now; nothing else points at them.
+            if let Some(pool) = pool {
+                if let Err(e) = app.packs.lfs_delete_all(&pool).await {
+                    tracing::warn!(repo = name, "its large files are left behind: {e:#}");
+                }
+            }
+            Ok("deleted\n".into_response())
+        }
         _ => Err(method_not_allowed()),
     }
 }

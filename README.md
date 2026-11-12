@@ -159,6 +159,20 @@ itself since 2.26; older clients fetch over HTTP. Without a hook, SSH serves
 what HTTP serves without credentials: everything if there is no admin token,
 fetches with `--anonymous-read`, nothing otherwise.
 
+**Large files (Git LFS)** are served by the node itself, from
+`<repo>.git/info/lfs`, which is where git-lfs looks. A file is kept whole in
+object storage beside the repository's packs, under the SHA-256 of its
+content, and stored only once that content has been checked to hash to it.
+Who may do what is decided as for git: a download is a fetch, an upload is
+a push, and the authorization hook is asked the same two questions. A
+client that came in over SSH is given a ticket for the HTTP routes instead,
+good for an hour and signed with a key made from the admin token, so every
+node honours it; that needs `--public-url https://host`, for the node to
+say where those routes are. Only the basic transfer is spoken, without
+locks. Uploads are spooled to the scratch directory first, like pushes. A
+file stays until its repository is deleted, whether or not a commit still
+points at it. `GET /api/repos/<id>/lfs/<oid>` reads one for the application.
+
 **The pre-receive hook** (`--pre-receive-url`) can veto a push before
 anything is stored, which is where protected branches go:
 
@@ -207,7 +221,10 @@ CI triggers and audit logs are built from this, with whatever retries they need.
 | `DELETE /api/repos/<id>` | Remove it. It is gone at once; its packs are deleted after the grace period. |
 | `POST /api/repos/<id>/compact` | Rewrite its packs into one now. |
 | `GET /api/repos/<id>/refs` | HEAD and every ref with the id it points at. `prefix=refs/heads/` lists only the refs under a prefix. |
-| `GET /api/repos/<id>/commits?rev=&skip=&limit=` | History of a revision, newest first, up to 100 at a time. |
+| `GET /api/repos/<id>/commits?rev=&skip=&limit=&path=` | History of a revision, newest first, up to 100 at a time. With `path`, only the commits that changed that file or directory. |
+| `GET /api/repos/<id>/blame?rev=&path=` | For each run of lines of a file, the commit that last changed them. |
+| `GET /api/repos/<id>/search?rev=&q=` | Lines of the revision's files that hold `q`, and files whose names do. `regex=1` takes a regular expression, `case=1` minds case, `path=` looks below a directory, `limit=` stops sooner than at 200 lines. |
+| `GET /api/repos/<id>/lfs/<oid>` | A large file (Git LFS), by the SHA-256 of its content. |
 | `GET /api/repos/<id>/commit?rev=` | One commit and the files it changed against its first parent. |
 | `GET /api/repos/<id>/tree?rev=&path=` | A directory listing. |
 | `GET /api/repos/<id>/blob?rev=&path=` | A file's bytes (or `?oid=` for a blob by id). |
@@ -287,6 +304,7 @@ scrape_configs:
 | `strata_http_requests_total{handler,status}`, `strata_http_request_duration_seconds{handler}`, `strata_http_requests_in_flight` | Requests by what they asked for: `info-refs`, `upload-pack`, `receive-pack`, `content`, `merge`, `import`, `events`, `repos`, `compact`. Timed until the answer starts. |
 | `strata_fetches_total{result}`, `strata_fetch_bytes_total`, `strata_fetch_duration_seconds` | Fetch responses to their end, at the pace the client reads: `sent`, `aborted` (the client left) or `error`. |
 | `strata_ssh_commands_total{service,result}`, `strata_ssh_command_duration_seconds{service}` | Commands over SSH (`upload-pack`, `receive-pack`, `other`): `ok`, `refused` or `aborted` (the client left). Their fetches and pushes are counted in the rows around this one too. |
+| `strata_lfs_objects_total{op}`, `strata_lfs_bytes_total{op}` | Large files sent out (`download`) and taken in (`upload`). |
 | `strata_pushes_total{result}`, `strata_push_bytes_total`, `strata_push_wait_seconds` | Pushes `accepted` or `rejected`, the pack data they brought, and how long they were held back for compaction (`--wait-at`). |
 | `strata_compactions_total{result}`, `strata_compaction_duration_seconds`, `strata_compaction_objects_total`, `strata_compactions_pending` | Compaction: runs that `merged` packs, found `nothing` to do or ended in `error`, and the repositories waiting. |
 | `strata_hook_requests_total{hook,result}`, `strata_hook_duration_seconds{hook}`, `strata_authz_cache_total{result}` | The application's `authz` and `pre-receive` hooks, and how often an authorization was answered from memory. |
@@ -387,6 +405,8 @@ row stayed locked for seven trips to the database: 240 a second).
 - **A fetch can send what the client has by another way.** A change picked onto a release branch brings the same files as the original, and a client that has the original is sent them again unless bitmaps say it has them. With etcd's repository (183k objects, 23 branches, 993 tags), a client holding the default branch that fetches every other branch is sent 3% it already had once the pool has bitmaps, 25% before (git itself, serving the same repository without bitmaps, sends 15%). What is pushed after the last compaction is not covered by bitmaps until the next. Measured on that one repository only.
 - **Pushes at a high rate are measured on one machine only**, with packs on local disk and the database next to the node. In object storage each push is three uploads and each compaction reads what it merges back, so both will be slower there, by how much is not known. Two nodes on the same laptop handled no more than one (840 against 1,110 a second): they share its processors, so this says nothing about adding nodes. Pushes to the same branch were not part of it.
 - **SSH is narrower than HTTP.** Fetches need protocol version 2 (libgit2 and clients older than git 2.26 fetch over HTTP). Clients are known by plain public keys: no certificates, no passwords. Tested with OpenSSH's client and Ed25519 and RSA keys; not under load, and a large clone over SSH has not been timed against HTTP.
+- **Search, blame and the history of a path are worked out each time**, from the objects: nothing is indexed. A search reads every file of the revision, a blame diffs the file through its history, and each gives up after ten seconds and says so (`truncated`). Renames are not followed. Blame agreed with `git blame` line for line on the histories it was tried on, which were small; on a long history neither its speed nor its agreement has been measured.
+- **Large files are never collected.** One that no commit points at any more stays until its repository is deleted. There are no locks, no quota, and no transfer but the basic one. Tested with git-lfs 3.5 over HTTP and over SSH, with files of a few megabytes.
 - **SHA-256 repositories.**
 - **Pruned objects are gone at once.** There is no window in which a force-pushed-away commit can still be fetched by id after the next full compaction.
 - **Indexing a push takes memory in proportion to its objects**: about 180 bytes for each (72 MiB for the 412k objects of git's repository, where the whole server peaked at 142 MiB over that push), for the table of entries, the ids they point at and the index being built. On top come the objects whose deltas are being resolved, up to 64 MiB on each of up to eight threads; beyond that they are dropped and read again when needed. A single object larger than that is still held whole, together with the version made from it. Not measured beyond 412k objects. The spool file needs local disk the size of the push, and is mapped into memory: it counts as the process's memory wherever mapped files do, though the kernel can drop its pages at any time.

@@ -39,6 +39,11 @@ struct Args {
     /// node behind one name needs the same one [default: ssh_host_key in --data-dir].
     #[arg(long, env = "STRATA_SSH_HOST_KEY")]
     ssh_host_key: Option<PathBuf>,
+    /// Where clients reach this node over HTTP, as https://host. Addresses
+    /// for large files (Git LFS) are made from it; needed for them to work
+    /// for clients that came in over SSH.
+    #[arg(long, env = "STRATA_PUBLIC_URL")]
+    public_url: Option<String>,
     /// Create repositories on first push.
     #[arg(long)]
     auto_create: bool,
@@ -157,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
         authz_cache: Duration::from_secs(args.authz_cache_secs),
         pre_receive_url: args.pre_receive_url,
         hook_secret: args.hook_secret,
+        public_url: args.public_url.map(|url| url.trim_end_matches('/').to_string()),
         event_retention: Duration::from_secs(args.event_retention_secs),
     };
     let meta = match &args.meta {

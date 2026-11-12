@@ -213,12 +213,27 @@ async fn run(app: Arc<App>, channel: Channel<Msg>, command: String, key: Option<
     let mut input = read.make_reader();
     let mut output = write.make_writer();
     let presented = Presented { authorization: None, ssh_key: key.as_deref() };
+    // git-lfs asks over SSH where large files go, and for something to show there.
+    if let Some(arguments) = command.trim().strip_prefix("git-lfs-authenticate ") {
+        let mut words = arguments.split_whitespace();
+        let path = words.next().unwrap_or_default().trim_matches('\'').trim_start_matches('/');
+        let outcome = match crate::lfs::authenticate(&app, presented, path, words.next().unwrap_or_default()).await {
+            Ok(answer) => output.write_all(answer.as_bytes()).await.map_err(Stop::from),
+            Err(e) => Err(e.into()),
+        };
+        return finish(&app, write, output, "lfs-authenticate", outcome, started).await;
+    }
     let (service, outcome) = match parse_command(&command) {
         Some((Service::Upload, path)) => ("upload-pack", upload(&app, presented, path, v2, &mut input, &mut output).await),
         Some((Service::Receive, path)) => ("receive-pack", receive(&app, presented, path, &mut input, &mut output).await),
         None if command.is_empty() => ("other", Err(Stop::Refused("you are signed in, but there is no shell here: use git".into()))),
         None => ("other", Err(Stop::Refused("only git-upload-pack and git-receive-pack are served here".into()))),
     };
+    finish(&app, write, output, service, outcome, started).await;
+}
+
+/// Ends a command: tells the client why it was refused, if it was, and how it went.
+async fn finish(app: &App, write: russh::ChannelWriteHalf<Msg>, mut output: impl AsyncWrite + Unpin, service: &str, outcome: Result<(), Stop>, started: Instant) {
     let _ = output.flush().await;
     let (result, code) = match outcome {
         Ok(()) => ("ok", 0),

@@ -34,6 +34,8 @@ pub struct Metrics {
     fetch_bytes: IntCounter,
     fetch_seconds: Histogram,
     ssh: IntCounterVec,
+    lfs: IntCounterVec,
+    lfs_bytes: IntCounterVec,
     ssh_seconds: HistogramVec,
     compactions: IntCounterVec,
     compaction_seconds: Histogram,
@@ -109,6 +111,8 @@ impl Metrics {
             fetch_seconds: histogram("strata_fetch_duration_seconds", "Time to produce and send a fetch response, at the pace the client reads it."),
             ssh: counters("strata_ssh_commands_total", "Commands run over SSH, by service and whether they ran to the end (ok), were turned down (refused) or lost their client (aborted).", &["service", "result"]),
             ssh_seconds: histograms("strata_ssh_command_duration_seconds", "Time from a command's arrival over SSH to its end, at the pace of the client.", &["service"]),
+            lfs: counters("strata_lfs_objects_total", "Large files (Git LFS) sent out (download) and taken in (upload).", &["op"]),
+            lfs_bytes: counters("strata_lfs_bytes_total", "Bytes of large files sent out and taken in.", &["op"]),
             compactions: counters("strata_compactions_total", "Compaction runs, by whether they merged packs, found nothing to do, or failed.", &["result"]),
             compaction_seconds: histogram("strata_compaction_duration_seconds", "Time taken by compaction runs."),
             compaction_objects: counter("strata_compaction_objects_total", "Objects written into packs by compaction."),
@@ -160,6 +164,11 @@ impl Metrics {
     pub(crate) fn ssh(&self, service: &str, result: &str, took: Duration) {
         self.ssh.with_label_values(&[service, result]).inc();
         self.ssh_seconds.with_label_values(&[service]).observe(took.as_secs_f64());
+    }
+
+    pub(crate) fn lfs(&self, op: &str, bytes: u64) {
+        self.lfs.with_label_values(&[op]).inc();
+        self.lfs_bytes.with_label_values(&[op]).inc_by(bytes);
     }
 
     pub(crate) fn compaction(&self, result: &str, objects: usize, took: Duration) {
@@ -216,11 +225,14 @@ pub(crate) fn handler(path: &str) -> Option<&'static str> {
             Some("import") => "import",
             Some("merge") => "merge",
             Some("compact") => "compact",
+            _ if rest.contains("/lfs/") => "lfs",
             Some(view) if crate::content::VIEWS.contains(&view) => "content",
             _ => "repos",
         });
     }
-    Some(if path.ends_with("/info/refs") {
+    Some(if path.contains("/info/lfs/") {
+        "lfs"
+    } else if path.ends_with("/info/refs") {
         "info-refs"
     } else if path.ends_with("/git-upload-pack") {
         "upload-pack"

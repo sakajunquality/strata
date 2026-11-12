@@ -29,7 +29,7 @@ use crate::{blocking, App, HttpError};
 /// How many changed files a commit view lists before it gives up.
 const MAX_CHANGES: usize = 1000;
 
-pub(crate) const VIEWS: [&str; 6] = ["refs", "commits", "commit", "compare", "tree", "blob"];
+pub(crate) const VIEWS: [&str; 8] = ["refs", "commits", "commit", "compare", "tree", "blob", "blame", "search"];
 
 pub(crate) async fn handle(app: &App, name: &str, view: &str, query: &str) -> Result<Response, HttpError> {
     let params: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
@@ -65,9 +65,11 @@ fn respond(repo: &RepoState, packs: &PackSet, view: &str, params: &HashMap<Strin
             }
             let skip = number("skip", 0)?;
             let tip = resolve(repo, packs, param("rev"))?;
-            let (oids, more) = history(packs, tip, skip, limit)?;
+            // With a path: only the commits that changed what is there.
+            let path = param("path").trim_matches('/');
+            let (oids, more, truncated) = history(packs, tip, skip, limit, (!path.is_empty()).then_some(path))?;
             let commits = oids.iter().map(|oid| commit_json(packs, oid)).collect::<Result<Vec<_>, _>>()?;
-            Ok(crate::json(StatusCode::OK, json!({ "commits": commits, "next": more.then_some(skip + limit) })))
+            Ok(crate::json(StatusCode::OK, json!({ "commits": commits, "next": more.then_some(skip + limit), "truncated": truncated })))
         }
         "commit" => {
             let oid = resolve(repo, packs, param("rev"))?;
@@ -85,6 +87,8 @@ fn respond(repo: &RepoState, packs: &PackSet, view: &str, params: &HashMap<Strin
             Ok(crate::json(StatusCode::OK, commit))
         }
         "compare" => crate::merge::compare(repo, packs, params),
+        "blame" => crate::code::blame(repo, packs, param("rev"), param("path")),
+        "search" => crate::code::search(repo, packs, params),
         "tree" => {
             let oid = resolve(repo, packs, param("rev"))?;
             let info = packs.commit(&oid)?.ok_or_else(HttpError::not_found)?;
@@ -157,9 +161,15 @@ pub(crate) fn resolve(repo: &RepoState, packs: &PackSet, rev: &str) -> Result<Oi
     commit_tips(packs, &[oid])?.first().copied().ok_or_else(unknown)
 }
 
+/// How long a history narrowed to a path is searched for before it gives up.
+const PATH_HISTORY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The history of `tip`, newest first: `limit` commits after the first
-/// `skip`, and whether there are more. Costs as much as the commits passed over.
-fn history(packs: &PackSet, tip: Oid, skip: usize, limit: usize) -> Result<(Vec<Oid>, bool), HttpError> {
+/// `skip`, whether there are more, and whether the search was given up
+/// before its end. With `path`, only commits that changed what is there
+/// count. Costs as much as the commits passed over.
+fn history(packs: &PackSet, tip: Oid, skip: usize, limit: usize, path: Option<&str>) -> Result<(Vec<Oid>, bool, bool), HttpError> {
+    let started = std::time::Instant::now();
     let mut seen = HashSet::from([tip]);
     let mut queue = BinaryHeap::new();
     let time = packs.commit(&tip)?.map(|commit| commit.time).unwrap_or(0);
@@ -168,14 +178,19 @@ fn history(packs: &PackSet, tip: Oid, skip: usize, limit: usize) -> Result<(Vec<
     let mut passed = 0;
     while let Some((_, oid)) = queue.pop() {
         if out.len() == limit {
-            return Ok((out, true));
-        }
-        if passed < skip {
-            passed += 1;
-        } else {
-            out.push(oid);
+            return Ok((out, true, false));
         }
         let Some(commit) = packs.commit(&oid)? else { continue };
+        let counts = match path {
+            None => true,
+            Some(_) if started.elapsed() > PATH_HISTORY_BUDGET => return Ok((out, false, true)),
+            Some(path) => crate::code::touches(packs, &commit, path)?,
+        };
+        if counts && passed < skip {
+            passed += 1;
+        } else if counts {
+            out.push(oid);
+        }
         for parent in commit.parents {
             if seen.insert(parent) {
                 if let Some(info) = packs.commit(&parent)? {
@@ -184,7 +199,7 @@ fn history(packs: &PackSet, tip: Oid, skip: usize, limit: usize) -> Result<(Vec<
             }
         }
     }
-    Ok((out, false))
+    Ok((out, false, false))
 }
 
 /// The entry at `path` below a commit's root: its mode and id.
