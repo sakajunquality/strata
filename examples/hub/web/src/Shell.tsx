@@ -54,7 +54,7 @@ export function Shell() {
         {me && !user && (
           <Space>
             <Link to="/login"><Button type="text">Sign in</Button></Link>
-            <Link to="/signup"><Button type="primary">Sign up</Button></Link>
+            {me.signIn.passwords && <Link to="/signup"><Button type="primary">Sign up</Button></Link>}
           </Space>
         )}
       </header>

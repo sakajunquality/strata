@@ -73,5 +73,5 @@ export async function gitUser(authorization: string | null | undefined): Promise
     if (user) db.run("UPDATE tokens SET last_used_at = ? WHERE hash = ?", [now(), hash]);
     return user;
   }
-  return password ? checkPassword(username, password) : null;
+  return password && config.passwords ? checkPassword(username, password) : null;
 }

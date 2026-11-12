@@ -3,7 +3,7 @@
 import { Hono } from "hono";
 import { gitUser, sha256 } from "./auth";
 import { config } from "./config";
-import { canRead, canWrite, permission, repoById, repoByPath } from "./db";
+import { canRead, canWrite, mirrorOf, permission, repoById, repoByPath } from "./db";
 import { verify } from "./signing";
 import { strata, type StrataCommit } from "./strata";
 
@@ -30,6 +30,9 @@ hooks.post("/authz", async (c) => {
   if (access === "write" && !canWrite(level)) {
     return c.json(user ? { allow: false, status: 403, message: `${user.name} may not push to ${repo.owner_name}/${repo.name}` } : { allow: false, status: 401, message: "sign in to push" });
   }
+  // The next fetch from its source would undo whatever was pushed.
+  const mirror = access === "write" ? mirrorOf(repo.id) : null;
+  if (mirror) return c.json({ allow: false, status: 403, message: `${repo.owner_name}/${repo.name} mirrors ${mirror.source} and does not take pushes` });
   return c.json({ allow: true, repo: repo.id, actor: user?.name });
 });
 

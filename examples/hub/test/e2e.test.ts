@@ -4,12 +4,15 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
 
 const root = resolve(import.meta.dir, "..");
 const strataBin = process.env.STRATA_BIN ?? resolve(root, "../../target/debug/strata");
 const strataPort = 18190 + Math.floor(Math.random() * 500);
 const hubPort = strataPort + 1000;
 const hub = `http://127.0.0.1:${hubPort}`;
+const elsewherePort = strataPort + 2000;
+const elsewhere = `http://127.0.0.1:${elsewherePort}`;
 const tmp = mkdtempSync(join(tmpdir(), "strata-hub-"));
 const children: Bun.Subprocess[] = [];
 // gpg talks to its agent over a socket in here, and socket paths have to be short.
@@ -24,10 +27,84 @@ async function up(url: string) {
   throw new Error(`${url} did not come up`);
 }
 
+/**
+ * Everything the hub reaches outside itself, on one port: an OpenID Connect
+ * provider under /oidc, GitHub's sign-in and API, and GitHub's repositories,
+ * which are the ones in Strata.
+ */
+const outside = {
+  /** Who signs in next. */
+  person: { sub: "", preferred_username: "", name: "", id: 0, login: "" },
+  /** Sign-ins under way, by the code handed out: what the token has to answer. */
+  codes: new Map<string, { nonce: string; challenge: string }>(),
+};
+
+async function startElsewhere() {
+  const { publicKey, privateKey } = await generateKeyPair("RS256");
+  const jwk = { ...(await exportJWK(publicKey)), kid: "k1", alg: "RS256", use: "sig" };
+  const s256 = (text: string) => new Bun.CryptoHasher("sha256").update(text).digest("base64url");
+  const authorize = (url: URL) => {
+    const code = crypto.randomUUID();
+    outside.codes.set(code, { nonce: url.searchParams.get("nonce") ?? "", challenge: url.searchParams.get("code_challenge") ?? "" });
+    return Response.redirect(`${url.searchParams.get("redirect_uri")}?${new URLSearchParams({ code, state: url.searchParams.get("state") ?? "" })}`, 302);
+  };
+  /** The sign-in a token request is for, if it proves to come from who started it. */
+  const redeem = async (request: Request, secret: string) => {
+    const form = new URLSearchParams(await request.text());
+    const asked = outside.codes.get(form.get("code") ?? "");
+    outside.codes.delete(form.get("code") ?? "");
+    return asked && form.get("client_secret") === secret && s256(form.get("code_verifier") ?? "") === asked.challenge ? asked : null;
+  };
+  Bun.serve({
+    port: elsewherePort,
+    hostname: "127.0.0.1",
+    async fetch(request) {
+      const url = new URL(request.url);
+      switch (url.pathname) {
+        case "/oidc/.well-known/openid-configuration":
+          return Response.json({ issuer: `${elsewhere}/oidc`, authorization_endpoint: `${elsewhere}/oidc/authorize`, token_endpoint: `${elsewhere}/oidc/token`, jwks_uri: `${elsewhere}/oidc/jwks` });
+        case "/oidc/jwks":
+          return Response.json({ keys: [jwk] });
+        case "/oidc/authorize":
+        case "/login/oauth/authorize":
+          return authorize(url);
+        case "/oidc/token": {
+          const asked = await redeem(request, "oidc-secret");
+          if (!asked) return Response.json({ error: "invalid_grant" }, { status: 400 });
+          const { sub, preferred_username, name } = outside.person;
+          const token = new SignJWT({ nonce: asked.nonce, preferred_username, name }).setProtectedHeader({ alg: "RS256", kid: "k1" }).setIssuer(`${elsewhere}/oidc`).setAudience("hub-at-oidc").setSubject(sub).setIssuedAt().setExpirationTime("5m");
+          return Response.json({ id_token: await token.sign(privateKey), token_type: "Bearer", access_token: "unused" });
+        }
+        case "/login/oauth/access_token":
+          return Response.json((await redeem(request, "github-secret")) ? { access_token: "gho_test", token_type: "bearer" } : { error: "bad_verification_code" });
+        case "/api/user":
+          if (request.headers.get("authorization") !== "Bearer gho_test") return new Response("", { status: 401 });
+          return Response.json({ id: outside.person.id, login: outside.person.login, name: outside.person.name });
+      }
+      // Anything else is a repository being fetched.
+      const headers = new Headers(request.headers);
+      headers.delete("host");
+      return fetch(`http://127.0.0.1:${strataPort}${url.pathname}${url.search}`, { method: request.method, headers, body: request.method === "POST" ? await request.arrayBuffer() : undefined, decompress: false } as RequestInit);
+    },
+  });
+}
+
 beforeAll(async () => {
   if (!existsSync(strataBin)) throw new Error(`build Strata first: ${strataBin} is missing`);
+  await startElsewhere();
   const env = {
     ...process.env,
+    HUB_PUBLIC_URL: hub,
+    HUB_OIDC_ISSUER: `${elsewhere}/oidc`,
+    HUB_OIDC_NAME: "Example",
+    HUB_OIDC_CLIENT_ID: "hub-at-oidc",
+    HUB_OIDC_CLIENT_SECRET: "oidc-secret",
+    HUB_GITHUB_URL: elsewhere,
+    HUB_GITHUB_API_URL: `${elsewhere}/api`,
+    HUB_GITHUB_CLIENT_ID: "hub-at-github",
+    HUB_GITHUB_CLIENT_SECRET: "github-secret",
+    HUB_MIRROR_DIR: join(tmp, "mirrors"),
+    HUB_MIRROR_MINUTES: "0",
     HUB_PORT: String(hubPort),
     HUB_DB: join(tmp, "hub.sqlite"),
     STRATA_URL: `http://127.0.0.1:${strataPort}`,
@@ -468,4 +545,157 @@ test("only Strata may ask the hooks", async () => {
   expect((await ask("guess")).status).toBe(403);
   const answer = await ask("test-hook-secret");
   expect(await answer.json()).toEqual({ allow: false, status: 401, message: "sign in to continue" });
+});
+
+/**
+ * A browser going through a sign-in elsewhere: sent there, sent back, and
+ * then whoever the hub says it is. `meddle` changes the address it comes back to.
+ */
+async function signInAt(provider: string, meddle = (back: URL) => back) {
+  const cookies = new Map<string, string>();
+  const visit = async (url: string) => {
+    const response = await fetch(url, { redirect: "manual", headers: { cookie: [...cookies].map(([name, value]) => `${name}=${value}`).join("; ") } });
+    for (const cookie of response.headers.getSetCookie()) {
+      const [name, value] = cookie.split(";")[0]!.split("=") as [string, string];
+      if (value) cookies.set(name, value);
+      else cookies.delete(name);
+    }
+    return response;
+  };
+  const sent = await visit(`${hub}/api/auth/${provider}`);
+  expect(sent.status).toBe(302);
+  const there = await fetch(sent.headers.get("location")!, { redirect: "manual" });
+  const back = await visit(meddle(new URL(there.headers.get("location")!)).toString());
+  const me = await (await visit(`${hub}/api/me`)).json();
+  return { landed: back.headers.get("location")!, user: me.user as { name: string; displayName: string } | null, cookie: `hub_session=${cookies.get("hub_session")}` };
+}
+
+test("signing in elsewhere", async () => {
+  const me = (await browser()("GET", "/me")).data;
+  expect(me.signIn).toEqual({ passwords: true, providers: [{ id: "github", name: "GitHub" }, { id: "oidc", name: "Example" }] });
+
+  // OpenID Connect: a first arrival makes an account, named after who arrived.
+  outside.person = { ...outside.person, sub: "subject-1", preferred_username: "Carol.Jones@example.com", name: "Carol Jones" };
+  const carol = await signInAt("oidc");
+  expect(carol).toMatchObject({ landed: `${hub}/`, user: { name: "Carol-Jones", displayName: "Carol Jones" } });
+  // Coming back is the same account, whatever they are called by then.
+  outside.person.preferred_username = "carol@example.com";
+  expect((await signInAt("oidc")).user!.name).toBe("Carol-Jones");
+  // Someone else who would get a name that is taken (alice signed up with a password) gets another.
+  outside.person = { ...outside.person, sub: "subject-2", preferred_username: "alice@example.com", name: "Another Alice" };
+  expect((await signInAt("oidc")).user!.name).toBe("alice-2");
+
+  // GitHub: the same, by the account's number there.
+  outside.person = { ...outside.person, id: 4242, login: "gina", name: "Gina" };
+  const gina = await signInAt("github");
+  expect(gina).toMatchObject({ landed: `${hub}/`, user: { name: "gina", displayName: "Gina" } });
+  outside.person.login = "gina-renamed";
+  expect((await signInAt("github")).user!.name).toBe("gina");
+  // The same number at another provider is somebody else.
+  outside.person = { ...outside.person, sub: "4242", preferred_username: "hana" };
+  expect((await signInAt("oidc")).user!.name).toBe("hana");
+
+  // Such an account has no password; git takes an access token.
+  const made = await fetch(`${hub}/api/tokens`, { method: "POST", headers: { origin: hub, cookie: gina.cookie, "content-type": "application/json" }, body: JSON.stringify({ name: "laptop" }) });
+  expect(made.status).toBe(201);
+  expect((await anyoneLogin("gina", "")).status).toBe(401);
+
+  // An answer that is not to this browser's question signs nobody in.
+  const forged = await signInAt("oidc", (back) => (back.searchParams.set("state", "guessed"), back));
+  expect(forged.user).toBeNull();
+  expect(forged.landed).toStartWith(`${hub}/login?error=`);
+  // Nor does a code the provider does not know, or a provider saying no.
+  const stale = await signInAt("github", (back) => (back.searchParams.set("code", "made-up"), back));
+  expect(stale).toMatchObject({ user: null, landed: `${hub}/login?error=GitHub+did+not+accept+the+sign-in` });
+  const declined = await signInAt("oidc", (back) => (back.searchParams.set("error", "access_denied"), back));
+  expect(declined.user).toBeNull();
+  // Without the browser that started it, the answer is worth nothing.
+  outside.codes.set("stolen", { nonce: "", challenge: "" });
+  const alone = await fetch(`${hub}/api/auth/oidc/callback?code=stolen&state=anything`, { redirect: "manual" });
+  expect(alone.headers.get("location")).toStartWith(`${hub}/login?error=`);
+  expect(alone.headers.getSetCookie().some((cookie) => cookie.startsWith("hub_session="))).toBe(false);
+  expect((await fetch(`${hub}/api/auth/nowhere`, { redirect: "manual" })).status).toBe(404);
+});
+
+const anyoneLogin = (username: string, password: string) => browser()("POST", "/login", { username, password });
+
+test("mirrors of repositories on GitHub", async () => {
+  const mia = browser();
+  expect((await mia("POST", "/signup", { username: "mia", password: "correct horse" })).status).toBe(201);
+  const token: string = (await mia("POST", "/tokens", { name: "laptop" })).data.token;
+
+  // What stands in for GitHub here serves the hub's own repositories: the source is one of them.
+  expect((await mia("POST", "/repos", { name: "source" })).status).toBe(201);
+  const work = join(tmp, "mirror-work");
+  git(tmp, "init", "-q", "-b", "trunk", work);
+  writeFileSync(join(work, "README.md"), "# Source\n");
+  git(work, "add", ".");
+  git(work, "commit", "-q", "-m", "first");
+  git(work, "tag", "-a", "-m", "one", "v1");
+  git(work, "branch", "side");
+  const source = remote(`mia:${token}`, "mia/source");
+  expect(git(work, "push", "-q", source, "trunk", "side", "v1").ok).toBe(true);
+  const first = git(work, "rev-parse", "HEAD").out;
+  expect((await mia("PATCH", "/repos/mia/source", { defaultBranch: "trunk" })).status).toBe(200);
+
+  expect((await mia("POST", "/repos", { name: "bad", mirror: "not a repository" })).status).toBe(400);
+  expect((await mia("POST", "/repos", { name: "copy", mirror: `${elsewhere}/mia/source.git` })).status).toBe(201);
+  const synced = async (path: string, since = 0) => {
+    const detail = (await mia("GET", path)).data;
+    return detail.mirror.state === "synced" && detail.mirror.syncedAt >= since && detail;
+  };
+  let copy = await eventually(() => synced("/repos/mia/copy"));
+  expect(copy.mirror).toMatchObject({ source: "mia/source", url: `${elsewhere}/mia/source`, pulls: false, error: null });
+  expect(copy).toMatchObject({ empty: false, defaultBranch: "trunk", branches: [{ name: "side", oid: first }, { name: "trunk", oid: first }] });
+  expect(copy.tags.map((tag: { name: string }) => tag.name)).toEqual(["v1"]);
+  const clone = join(tmp, "mirror-clone");
+  expect(git(tmp, "clone", "-q", remote("", "mia/copy"), clone).ok).toBe(true);
+  expect(git(clone, "rev-parse", "HEAD", "v1^{commit}").out).toBe(`${first}\n${first}`);
+  expect(git(clone, "fsck", "--strict").ok).toBe(true);
+
+  // A mirror changes with its source and not otherwise.
+  const pushed = git(work, "push", remote(`mia:${token}`, "mia/copy"), "trunk:other");
+  expect(pushed.ok).toBe(false);
+  expect(pushed.err).toContain("mia/copy mirrors mia/source and does not take pushes");
+
+  // The source moves on: a commit, a new branch, a branch gone, a tag moved to a commit already there.
+  writeFileSync(join(work, "README.md"), "# Source\n\nMore.\n");
+  git(work, "commit", "-q", "-am", "second");
+  const second = git(work, "rev-parse", "HEAD").out;
+  git(work, "branch", "next", first);
+  git(work, "tag", "-f", "light", first);
+  expect(git(work, "push", "-q", source, "trunk", "next", "light", ":side").ok).toBe(true);
+  expect((await browser()("POST", "/repos/mia/copy/mirror/sync")).status).toBe(401);
+  const asked = Math.floor(Date.now() / 1000);
+  await Bun.sleep(1100);
+  expect((await mia("POST", "/repos/mia/copy/mirror/sync")).status).toBe(202);
+  copy = await eventually(() => synced("/repos/mia/copy", asked + 1));
+  expect(copy.branches).toEqual([{ name: "next", oid: first }, { name: "trunk", oid: second }]);
+  expect(copy.tags.map((tag: { name: string }) => tag.name)).toEqual(["light", "v1"]);
+  expect(git(clone, "pull", "-q").ok).toBe(true);
+  expect(git(clone, "rev-parse", "HEAD").out).toBe(second);
+  // Each fetch that brought something shows as one entry, however many refs it moved.
+  const activity = await eventually(async () => {
+    const { activity } = (await mia("GET", "/repos/mia/copy/activity")).data;
+    return activity.length === 2 && activity;
+  });
+  expect(activity.map((entry: { actor: string; imported: number }) => [entry.actor, entry.imported])).toEqual([["mirror", 4], ["mirror", 3]]);
+
+  // A private source needs a token that may read it; without one it looks as if it were not there.
+  expect((await mia("PATCH", "/repos/mia/source", { private: true })).status).toBe(200);
+  expect((await mia("POST", "/repos", { name: "dark", mirror: "mia/source" })).status).toBe(201);
+  const failed = await eventually(async () => {
+    const { mirror } = (await mia("GET", "/repos/mia/dark")).data;
+    return mirror.state === "failed" && mirror;
+  });
+  expect(failed.error).toBe("mia/source is not there, or is private: a private repository needs an access token");
+  expect((await mia("POST", "/repos", { name: "lit", mirror: "mia/source", mirrorToken: token, mirrorPulls: true })).status).toBe(201);
+  const lit = await eventually(() => synced("/repos/mia/lit"));
+  expect(lit.branches).toEqual(copy.branches);
+  expect(JSON.stringify(lit)).not.toContain(token);
+
+  // Let go of its source, it is a repository like any other.
+  expect((await mia("DELETE", "/repos/mia/copy/mirror")).status).toBe(200);
+  expect((await mia("GET", "/repos/mia/copy")).data.mirror).toBeNull();
+  expect(git(work, "push", "-q", remote(`mia:${token}`, "mia/copy"), "trunk:other").ok).toBe(true);
 });

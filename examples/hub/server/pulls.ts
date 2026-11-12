@@ -3,7 +3,7 @@
 // of Strata each time, so a pull request follows its branches as they move.
 import type { Hono } from "hono";
 import { fail, REPO, signedIn, text, type Env } from "./common";
-import { canWrite, db, now, type Owner, type Permission, type Repo } from "./db";
+import { canWrite, db, mirrorOf, now, type Owner, type Permission, type Repo } from "./db";
 import { withVerification } from "./signing";
 import { strata, StrataError, type Compare, type StrataEvent } from "./strata";
 
@@ -91,10 +91,11 @@ function finish(pull: PullRow, state: "closed" | "merged", by: Owner | null, com
  * pushed, say) is merged. The event only says where to look; the feed can
  * lag, so what counts is how the branches stand now.
  */
-export async function followPush(repo: Repo, updates: NonNullable<NonNullable<StrataEvent["event"]>["updates"]>) {
-  const pushed = new Set(updates.filter((update) => update.ref.startsWith("refs/heads/")).map((update) => update.ref.slice("refs/heads/".length)));
+export async function followPush(repo: Repo, updates: NonNullable<NonNullable<StrataEvent["event"]>["updates"]> | null) {
+  // Without a list of what moved (an import), anything may have.
+  const pushed = updates && new Set(updates.filter((update) => update.ref.startsWith("refs/heads/")).map((update) => update.ref.slice("refs/heads/".length)));
   for (const pull of openPulls(repo.id)) {
-    if (!pushed.has(pull.base) && !pushed.has(pull.head)) continue;
+    if (pushed && !pushed.has(pull.base) && !pushed.has(pull.head)) continue;
     const compared = await unlessGone(strata.compare(repo.id, pull.base, pull.head));
     if (!compared) finish(pull, "closed", null, null);
     else if (compared.ahead === 0) finish(pull, "merged", null, null, compared.base);
@@ -108,7 +109,7 @@ function mayChange(pull: PullRow, user: Owner, level: Permission) {
 
 export function addPullRoutes(api: Hono<Env>) {
   const branchesOf = async (repo: Repo) => {
-    const { refs } = await strata.refs(repo.id);
+    const { refs } = await strata.refs(repo.id, "refs/heads/");
     return new Set(refs.filter((ref) => ref.name.startsWith("refs/heads/")).map((ref) => ref.name.slice("refs/heads/".length)));
   };
 
@@ -187,7 +188,7 @@ export function addPullRoutes(api: Hono<Env>) {
       compare: compared && { ...compared, commits: await withVerification(compared.commits) },
       mergeable: check?.mergeable ?? null,
       conflicts: check?.conflicts ?? [],
-      can: { change: !!user && mayChange(pull, user, c.get("level")), merge: canWrite(c.get("level")) },
+      can: { change: !!user && mayChange(pull, user, c.get("level")), merge: canWrite(c.get("level")) && !mirrorOf(repo.id) },
     });
   });
 
@@ -231,6 +232,7 @@ export function addPullRoutes(api: Hono<Env>) {
     const repo = c.get("repo");
     const pull = find(repo, c.req.param("number"));
     if (!canWrite(c.get("level"))) throw fail(403, "only those who can push here can merge");
+    if (mirrorOf(repo.id)) throw fail(409, "a mirror only changes when its source does");
     if (pull.state !== "open") throw fail(409, `this pull request is ${pull.state}`);
     const body = await c.req.json();
     const method = body.method === "squash" || body.method === "rebase" ? (body.method as "squash" | "rebase") : "merge";

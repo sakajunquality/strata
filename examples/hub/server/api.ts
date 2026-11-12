@@ -5,10 +5,12 @@ import { csrf } from "hono/csrf";
 import { HTTPException } from "hono/http-exception";
 import { checkPassword, createToken, endSession, sessionUser, startSession } from "./auth";
 import { fail, REPO, signedIn, text, type Env } from "./common";
-import { config } from "./config";
-import { canRead, db, now, ownerByName, permission, REPO_COLUMNS, repoByPath, roleIn, type Owner, type Repo } from "./db";
+import { config, signInAt } from "./config";
+import { canRead, canWrite, db, mirrorOf, now, ownerByName, permission, REPO_COLUMNS, repoByPath, roleIn, type Mirror, type Owner, type Repo } from "./db";
+import { forget, requestSync, sourceName, sourceUrl } from "./mirror";
 import { addPullRoutes, openPullCount } from "./pulls";
 import { addKey, keysOf, removeKey, withVerification } from "./signing";
+import { addSignInRoutes } from "./sso";
 import { strata, StrataError } from "./strata";
 
 export const api = new Hono<Env>();
@@ -55,10 +57,14 @@ const publicUser = (user: Owner) => ({ name: user.name, displayName: user.displa
 
 api.get("/me", (c) => {
   const user = c.get("user");
-  return c.json({ user: user && publicUser(user), orgs: user ? orgsOf(user.id) : [] });
+  const signIn = { passwords: config.passwords, providers: signInAt.map(({ id, name }) => ({ id, name })) };
+  return c.json({ user: user && publicUser(user), orgs: user ? orgsOf(user.id) : [], signIn });
 });
 
+addSignInRoutes(api, RESERVED);
+
 api.post("/signup", async (c) => {
+  if (!config.passwords) throw fail(403, "accounts are made by signing in, not here");
   const body = await c.req.json();
   const name = ownerName(body.username);
   const password = String(body.password ?? "");
@@ -70,6 +76,7 @@ api.post("/signup", async (c) => {
 });
 
 api.post("/login", async (c) => {
+  if (!config.passwords) throw fail(403, "passwords are not used here");
   const body = await c.req.json();
   const user = await checkPassword(String(body.username ?? ""), String(body.password ?? ""));
   if (!user) throw fail(401, "wrong user name or password");
@@ -193,8 +200,8 @@ api.delete("/owners/:name/members/:username", (c) => {
 
 // ---- repositories ----
 
-type ActivityRow = { id: number; actor: string | null; time: number; updates: string; owner_name: string; name: string; repo_id: string };
-const activityJson = (row: ActivityRow) => ({ id: row.id, owner: row.owner_name, repo: row.name, actor: row.actor, time: row.time, updates: JSON.parse(row.updates) });
+type ActivityRow = { id: number; actor: string | null; time: number; updates: string; imported: number | null; owner_name: string; name: string; repo_id: string };
+const activityJson = (row: ActivityRow) => ({ id: row.id, owner: row.owner_name, repo: row.name, actor: row.actor, time: row.time, updates: JSON.parse(row.updates), imported: row.imported });
 const ACTIVITY = "SELECT activity.*, repos.name, owners.name AS owner_name FROM activity JOIN repos ON repos.id = activity.repo_id JOIN owners ON owners.id = repos.owner_id";
 
 api.get("/repos", (c) => c.json({ repos: visibleRepos(c.get("user")?.id ?? null).map(repoSummary) }));
@@ -218,15 +225,23 @@ api.post("/repos", async (c) => {
   const name = repoName(body.name);
   if (repoByPath(owner.name, name)) throw fail(409, `${owner.name}/${name} already exists`);
 
+  // A mirror: the repository follows one on GitHub from the start.
+  const source = body.mirror ? sourceName(String(body.mirror)) : null;
+  if (body.mirror && !source) throw fail(400, `name a repository on ${new URL(config.githubUrl).host}, as owner/name or by its address`);
+
   // Strata knows the repository by this id only, so its name is free to change.
   const id = `r-${crypto.randomUUID()}`;
   await strata.create(id);
   try {
-    db.run("INSERT INTO repos (id, owner_id, name, description, private, created_at) VALUES (?, ?, ?, ?, ?, ?)", [id, owner.id, name, text(body.description, 300), body.private ? 1 : 0, now()]);
+    db.transaction(() => {
+      db.run("INSERT INTO repos (id, owner_id, name, description, private, created_at) VALUES (?, ?, ?, ?, ?, ?)", [id, owner.id, name, text(body.description, 300), body.private ? 1 : 0, now()]);
+      if (source) db.run("INSERT INTO mirrors (repo_id, source, pulls, token) VALUES (?, ?, ?, ?)", [id, source, body.mirrorPulls ? 1 : 0, text(body.mirrorToken, 500) || null]);
+    })();
   } catch (error) {
     await strata.remove(id).catch(() => {});
     throw error;
   }
+  if (source) requestSync(id);
   return c.json({ owner: owner.name, name }, 201);
 });
 
@@ -242,9 +257,18 @@ api.use(`${REPO}/*`, async (c, next) => {
 
 const short = (ref: string) => ref.replace(/^refs\/(heads|tags)\//, "");
 
+// The access token stays here: it is used, never shown.
+const mirrorJson = (mirror: Mirror) => ({ source: mirror.source, url: sourceUrl(mirror.source), pulls: !!mirror.pulls, state: mirror.state, error: mirror.error, syncedAt: mirror.synced_at });
+
 api.get(REPO, async (c) => {
   const found = c.get("repo");
-  const [{ head, refs }, info] = await Promise.all([strata.refs(found.id), strata.info(found.id)]);
+  // Branches and tags only: a mirror may hold a ref for every pull request there ever was.
+  const listed = async () => {
+    const [head, tags] = await Promise.all([strata.refs(found.id, "refs/heads/"), strata.refs(found.id, "refs/tags/")]);
+    return { head: head.head, refs: [...head.refs, ...tags.refs] };
+  };
+  const [{ head, refs }, info] = await Promise.all([listed(), strata.info(found.id)]);
+  const mirror = mirrorOf(found.id);
   const named = (prefix: string) => refs.filter((ref) => ref.name.startsWith(prefix)).map((ref) => ({ name: ref.name.slice(prefix.length), oid: ref.oid }));
   const branches = named("refs/heads/");
   return c.json({
@@ -262,7 +286,27 @@ api.get(REPO, async (c) => {
     branches,
     tags: named("refs/tags/"),
     size: info.bytes,
+    mirror: mirror && mirrorJson(mirror),
   });
+});
+
+/** Fetches a mirror's source now, rather than when it is next due. */
+api.post(`${REPO}/mirror/sync`, (c) => {
+  signedIn(c);
+  const found = c.get("repo");
+  if (!canWrite(c.get("level"))) throw fail(403, "only those who can push here can ask for that");
+  if (!mirrorOf(found.id)) throw fail(404, "this repository is not a mirror");
+  requestSync(found.id);
+  return c.json({}, 202);
+});
+
+/** Lets go of the source: from here on the repository is an ordinary one, and takes pushes. */
+api.delete(`${REPO}/mirror`, (c) => {
+  const found = c.get("repo");
+  if (c.get("level") !== "admin") throw fail(403, "only the repository's owners can change its settings");
+  db.run("DELETE FROM mirrors WHERE repo_id = ?", [found.id]);
+  forget(found.id);
+  return c.json({});
 });
 
 api.patch(REPO, async (c) => {
@@ -294,6 +338,7 @@ api.delete(REPO, async (c) => {
   if (c.get("level") !== "admin") throw fail(403, "only the repository's owners can delete it");
   // Gone from the hub first: from then on nobody is let through to it.
   db.run("DELETE FROM repos WHERE id = ?", [found.id]);
+  forget(found.id);
   await strata.remove(found.id).catch((error) => console.error(`repository ${found.id} is left behind in Strata:`, error));
   return c.json({});
 });

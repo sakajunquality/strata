@@ -1,4 +1,4 @@
-// Follows Strata's event feed: records pushes as activity, keeps pull
+// Follows Strata's event feed: records pushes and imports as activity, keeps pull
 // requests in step with their branches and gives a repository a default
 // branch when its first branch arrives.
 import { db, repoById } from "./db";
@@ -10,7 +10,15 @@ const CURSOR = "events_cursor";
 async function record(event: StrataEvent) {
   const repo = repoById(event.repo);
   // Events of repositories deleted since, or of someone else's, are not ours.
-  if (!repo || event.event?.type !== "push") return;
+  if (!repo || !event.event) return;
+  if (event.event.type === "import") {
+    // Too many refs to list, and none are: every open pull request is looked at again.
+    db.run("INSERT INTO activity (repo_id, actor, time, updates, imported) VALUES (?, ?, ?, '[]', ?)", [repo.id, event.event.actor ?? null, event.time, event.event.refs ?? 0]);
+    db.run("UPDATE repos SET pushed_at = ? WHERE id = ?", [event.time, repo.id]);
+    await followPush(repo, null);
+    return;
+  }
+  if (event.event.type !== "push") return;
   const updates = event.event.updates ?? [];
   db.run("INSERT INTO activity (repo_id, actor, time, updates) VALUES (?, ?, ?, ?)", [repo.id, event.event.actor ?? null, event.time, JSON.stringify(updates)]);
   db.run("UPDATE repos SET pushed_at = ? WHERE id = ?", [event.time, repo.id]);

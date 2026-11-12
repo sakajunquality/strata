@@ -70,6 +70,15 @@ export function RepoSettings({ repo, base, reload }: RepoContext) {
         </Form>
       </Card>
 
+      {repo.mirror && (
+        <Card title="Mirror" className="stack">
+          <Typography.Paragraph>
+            This repository follows <a href={repo.mirror.url}>{repo.mirror.source}</a> and does not take pushes. Let go of the source, and it becomes an ordinary repository with what it holds now.
+          </Typography.Paragraph>
+          <Button onClick={() => api(`${base}/mirror`, "DELETE").then(reload, (e) => message.error((e as Error).message))}>Stop mirroring</Button>
+        </Card>
+      )}
+
       <Card title="Delete this repository" className="stack danger">
         <Typography.Paragraph>Its history and files are gone for good.</Typography.Paragraph>
         <Button danger onClick={() => setDeleting(true)}>Delete repository</Button>

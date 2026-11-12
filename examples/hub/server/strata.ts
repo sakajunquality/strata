@@ -7,7 +7,7 @@ export class StrataError extends Error {
   }
 }
 
-async function call(method: string, path: string, body?: string): Promise<Response> {
+async function call(method: string, path: string, body?: string | Blob): Promise<Response> {
   let response: Response;
   try {
     response = await fetch(`${config.strataUrl}${path}`, {
@@ -39,7 +39,8 @@ export type StrataEvent = {
   cursor: string;
   repo: string;
   time: number;
-  event: { type?: string; actor?: string | null; updates?: { ref: string; old: string | null; new: string | null; change: string }[] } | null;
+  /** A push lists its updates; an import only says how many refs it set. */
+  event: { type?: string; actor?: string | null; refs?: number; updates?: { ref: string; old: string | null; new: string | null; change: string }[] } | null;
 };
 
 export type Compare = { base: string; head: string; merge_base: string | null; ahead: number; behind: number; commits: StrataCommit[]; files: unknown[]; truncated: boolean };
@@ -63,7 +64,8 @@ export const strata = {
   remove: (id: string) => call("DELETE", repo(id)),
   setHead: (id: string, ref: string) => call("PUT", `${repo(id)}/head`, ref),
   info: async (id: string) => (await call("GET", repo(id))).json() as Promise<{ packs: number; objects: number; bytes: number }>,
-  refs: async (id: string) => (await call("GET", `${repo(id)}/refs`)).json() as Promise<Refs>,
+  /** All refs, or those whose names start with `prefix`. */
+  refs: async (id: string, prefix?: string) => (await call("GET", `${repo(id)}/refs${query({ prefix })}`)).json() as Promise<Refs>,
   commits: async (id: string, rev: string, skip: number, limit: number) => (await call("GET", `${repo(id)}/commits${query({ rev, skip, limit })}`)).json() as Promise<{ commits: StrataCommit[]; next: number | null }>,
   commit: async (id: string, rev: string) => (await call("GET", `${repo(id)}/commit${query({ rev })}`)).json() as Promise<StrataCommit>,
   tree: async (id: string, rev: string, path: string) => (await call("GET", `${repo(id)}/tree${query({ rev, path })}`)).json(),
@@ -73,6 +75,9 @@ export const strata = {
   mergeable: async (id: string, base: string, head: string) =>
     (await call("POST", `${repo(id)}/merge`, JSON.stringify({ base, head, dry_run: true }))).json() as Promise<Merged & { mergeable: boolean; conflicts: string[] }>,
   merge: async (id: string, request: MergeRequest) => (await call("POST", `${repo(id)}/merge`, JSON.stringify(request))).json() as Promise<Merged & { oid: string }>,
+  /** Takes in a bundle: sets every ref in it, and deletes those under `prune` that it does not name. */
+  import: async (id: string, bundle: Blob, actor: string, prune: string[]) =>
+    (await call("POST", `${repo(id)}/import?${new URLSearchParams([["actor", actor], ...prune.map((prefix) => ["prune", prefix])])}`, bundle)).json() as Promise<{ refs: number; updated: number; objects: number }>,
   events: async (after: string | null) =>
     (await call("GET", `/api/events${query({ after: after ?? undefined, limit: 200 })}`)).json() as Promise<{ events: StrataEvent[]; next: string | null }>,
 };

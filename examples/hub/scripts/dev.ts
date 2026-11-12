@@ -17,6 +17,8 @@ const secret = () => crypto.randomUUID().replaceAll("-", "");
 const env = {
   ...process.env,
   HUB_PORT: hubPort,
+  // Where a sign-in elsewhere comes back to: the address the UI is open at.
+  HUB_PUBLIC_URL: process.env.HUB_PUBLIC_URL ?? `http://127.0.0.1:${built ? hubPort : "5173"}`,
   STRATA_URL: `http://127.0.0.1:${strataPort}`,
   STRATA_ADMIN_TOKEN: process.env.STRATA_ADMIN_TOKEN ?? secret(),
   STRATA_HOOK_SECRET: process.env.STRATA_HOOK_SECRET ?? secret(),

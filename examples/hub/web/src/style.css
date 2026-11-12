@@ -103,3 +103,6 @@ pre { font-family: var(--mono); font-size: 13px; line-height: 20px; margin: 0; }
 .note-head { font-weight: normal; }
 .conflicts { margin: 4px 0 8px; padding-left: 20px; }
 .tab-count { margin-left: 6px; }
+
+.full { width: 100%; }
+.mirror-note { margin-bottom: 16px; }

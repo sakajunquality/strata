@@ -55,6 +55,7 @@ function CloneButton({ url }: { url: string }) {
 
 function EmptyRepo({ repo }: RepoContext) {
   const { me } = useSession();
+  if (repo.mirror) return <Card title="Nothing here yet">{repo.mirror.state === "failed" ? "It fills once its source can be fetched." : "It fills as soon as its source has been fetched."}</Card>;
   return (
     <Card title="This repository is empty">
       <Typography.Paragraph>Push an existing repository to fill it:</Typography.Paragraph>

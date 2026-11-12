@@ -34,6 +34,12 @@ export function ActivityList({ activity, showRepo }: { activity: Activity[]; sho
     <ul className="rows">
       {activity.map((push) => (
         <li key={push.id}>
+          {push.imported !== null && (
+            <div>
+              <strong>{push.actor ?? "someone"}</strong> brought in {push.imported} {push.imported === 1 ? "ref" : "refs"}
+              {showRepo && <> to <Link to={`/${push.owner}/${push.repo}`}>{push.owner}/{push.repo}</Link></>}
+            </div>
+          )}
           {push.updates.map((update) => {
             const base = `/${push.owner}/${push.repo}`;
             return (

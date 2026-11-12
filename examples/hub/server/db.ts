@@ -54,7 +54,32 @@ CREATE TABLE IF NOT EXISTS activity (
   repo_id TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
   actor TEXT,
   time INTEGER NOT NULL,
-  updates TEXT NOT NULL
+  updates TEXT NOT NULL,
+  -- Set for an import, which moves too many refs to list: how many.
+  imported INTEGER
+);
+-- Who a user is elsewhere: what signing in at a provider comes back with.
+CREATE TABLE IF NOT EXISTS identities (
+  provider TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  user_id INTEGER NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (provider, subject)
+);
+-- Repositories that follow one on GitHub.
+CREATE TABLE IF NOT EXISTS mirrors (
+  repo_id TEXT PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,
+  -- "owner/name" there.
+  source TEXT NOT NULL,
+  -- Whether the heads of its pull requests come along (refs/pull/*/head).
+  pulls INTEGER NOT NULL DEFAULT 0,
+  -- For a private source. Kept as given: it has to be presented again at every fetch.
+  token TEXT,
+  state TEXT NOT NULL DEFAULT 'waiting' CHECK (state IN ('waiting', 'syncing', 'synced', 'failed')),
+  error TEXT,
+  -- When the source was last fetched, and when that last worked.
+  checked_at INTEGER,
+  synced_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS activity_by_repo ON activity (repo_id, id);
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -106,6 +131,10 @@ for (const setting of ["require_pulls", "require_signed"]) {
   }
 }
 
+if (!db.query<{ name: string }, []>("PRAGMA table_info(activity)").all().some((column) => column.name === "imported")) {
+  db.exec("ALTER TABLE activity ADD COLUMN imported INTEGER");
+}
+
 export const now = () => Math.floor(Date.now() / 1000);
 
 export type Owner = { id: number; name: string; kind: "user" | "org"; display_name: string; password_hash: string | null; created_at: number };
@@ -154,6 +183,10 @@ export function permission(repo: Repo, userId: number | null): Permission {
   const role = roleIn(repo.owner_id, userId);
   return role === "owner" ? "admin" : role === "member" ? "write" : open;
 }
+
+export type Mirror = { repo_id: string; source: string; pulls: number; token: string | null; state: "waiting" | "syncing" | "synced" | "failed"; error: string | null; checked_at: number | null; synced_at: number | null };
+
+export const mirrorOf = (repoId: string) => db.query<Mirror, [string]>("SELECT * FROM mirrors WHERE repo_id = ?").get(repoId);
 
 export const canRead = (p: Permission) => p !== "none";
 export const canWrite = (p: Permission) => p === "write" || p === "admin";

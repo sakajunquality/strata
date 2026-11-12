@@ -47,7 +47,7 @@ export function useLoad<T>(load: () => Promise<T>, key: string) {
 }
 
 export type User = { name: string; displayName: string };
-export type Me = { user: User | null; orgs: { name: string; role: string }[] };
+export type Me = { user: User | null; orgs: { name: string; role: string }[]; signIn: { passwords: boolean; providers: { id: string; name: string }[] } };
 export type RepoSummary = { owner: string; name: string; description: string; private: boolean; createdAt: number; pushedAt: number | null };
 export type Named = { name: string; oid: string };
 export type RepoDetail = RepoSummary & {
@@ -63,6 +63,8 @@ export type RepoDetail = RepoSummary & {
   branches: Named[];
   tags: Named[];
   size: number;
+  /** Set if the repository follows one on GitHub. */
+  mirror: { source: string; url: string; pulls: boolean; state: "waiting" | "syncing" | "synced" | "failed"; error: string | null; syncedAt: number | null } | null;
 };
 export type Person = { name: string; email: string; time: number; zone: string };
 /** What a commit's signature is worth: null if it has none. */
@@ -98,7 +100,7 @@ export type PullDetail = Pull & {
 export type TreeEntry = { name: string; mode: string; type: "tree" | "blob" | "commit"; oid: string };
 export type Tree = { commit: string; path: string; entries: TreeEntry[] };
 export type Update = { ref: string; old: string | null; new: string | null; change: string };
-export type Activity = { id: number; owner: string; repo: string; actor: string | null; time: number; updates: Update[] };
+export type Activity = { id: number; owner: string; repo: string; actor: string | null; time: number; updates: Update[]; imported: number | null };
 export type OwnerPage = {
   name: string;
   kind: "user" | "org";

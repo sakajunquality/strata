@@ -1,10 +1,11 @@
-import { LockOutlined } from "@ant-design/icons";
-import { Badge, Menu, Select, Table, Tag, Typography } from "antd";
+import { LockOutlined, SyncOutlined } from "@ant-design/icons";
+import { Alert, App, Badge, Button, Menu, Select, Table, Tag, Typography } from "antd";
+import { useEffect } from "react";
 import { Link, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
 import { api, useLoad, type Activity, type RepoDetail } from "../api";
 import { ActivityList } from "../RepoList";
 import { useSession } from "../session";
-import { Loaded, shortOid, urlPath } from "../util";
+import { Loaded, shortOid, urlPath, When } from "../util";
 import { BlobPage, CodePage } from "./Code";
 import { CommitPage, CommitsPage } from "./History";
 import { NewPullPage, PullPage, PullsPage } from "./Pulls";
@@ -80,6 +81,43 @@ function RepoActivity({ base }: RepoContext) {
   return <Loaded from={activity}>{(data) => <ActivityList activity={data.activity} />}</Loaded>;
 }
 
+/** Where a mirror comes from and how fresh it is. */
+function MirrorNote({ repo, base, reload }: RepoContext) {
+  const { message } = App.useApp();
+  const mirror = repo.mirror!;
+  const working = mirror.state === "waiting" || mirror.state === "syncing";
+  // Looks again while a fetch is under way, so that its result shows by itself.
+  useEffect(() => {
+    if (!working) return;
+    const timer = setTimeout(reload, 2000);
+    return () => clearTimeout(timer);
+  });
+  const sync = async () => {
+    try {
+      await api(`${base}/mirror/sync`, "POST");
+      reload();
+    } catch (e) {
+      message.error((e as Error).message);
+    }
+  };
+  return (
+    <Alert
+      className="mirror-note"
+      type={mirror.state === "failed" ? "error" : "info"}
+      showIcon
+      icon={<SyncOutlined spin={working} />}
+      title={
+        <>
+          Mirror of <a href={mirror.url}>{mirror.source}</a>
+          {working ? <>: fetching…</> : mirror.syncedAt ? <>, fetched <When time={mirror.syncedAt} /></> : null}
+        </>
+      }
+      description={mirror.state === "failed" ? `The last fetch failed: ${mirror.error}` : undefined}
+      action={repo.permission !== "read" && <Button size="small" onClick={sync} disabled={working}>Fetch now</Button>}
+    />
+  );
+}
+
 export function Repo() {
   const { owner = "", repo: name = "" } = useParams();
   const { me } = useSession();
@@ -104,6 +142,7 @@ export function Repo() {
               {repo.private && <Tag icon={<LockOutlined />}>Private</Tag>}
             </div>
             {repo.description && <p className="muted repo-description">{repo.description}</p>}
+            {repo.mirror && <MirrorNote {...context} />}
             <Menu
               mode="horizontal"
               selectedKeys={[tab]}
