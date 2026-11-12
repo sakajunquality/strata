@@ -22,11 +22,13 @@ mod import;
 mod merge;
 mod metrics;
 mod receive_pack;
+mod ssh;
 mod upload_pack;
 
 use auth::Access;
 pub use compaction::{compact, spawn_background, sweep, sweep_orphans, CompactionReport};
 pub use metrics::Metrics;
+pub use ssh::{host_key, serve_ssh};
 
 /// Fetch requests are negotiation only; anything larger is not a git client.
 const MAX_FETCH_REQUEST: usize = 16 << 20;
@@ -258,7 +260,7 @@ async fn route(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body: 
         let service = uri.query().unwrap_or("").split('&').find_map(|kv| kv.strip_prefix("service="));
         return match service {
             Some("git-upload-pack") => {
-                let granted = auth::authorize_git(app, headers, name, Access::Read).await?;
+                let granted = auth::authorize_git(app, auth::Presented::by_http(headers), name, Access::Read).await?;
                 // Version 2 lists refs only when asked, and then only those asked about.
                 let scope = if wants_v2(headers) { RefScope::none() } else { RefScope::All };
                 let repo = app.meta.get_repo(&granted.repo, &scope).await?.ok_or_else(HttpError::not_found)?;
@@ -267,7 +269,7 @@ async fn route(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body: 
                 Ok(git_response("upload-pack-advertisement", advertisement))
             }
             Some("git-receive-pack") => {
-                let granted = auth::authorize_git(app, headers, name, Access::Write).await?;
+                let granted = auth::authorize_git(app, auth::Presented::by_http(headers), name, Access::Write).await?;
                 // A push opens with every ref: the protocol has no way to ask for some.
                 let repo = app.meta.get_repo(&granted.repo, &RefScope::All).await?;
                 if repo.is_none() && !app.options.auto_create {
@@ -283,7 +285,7 @@ async fn route(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body: 
         if method != Method::POST {
             return Err(method_not_allowed());
         }
-        let granted = auth::authorize_git(app, headers, repo_name(name)?, Access::Read).await?;
+        let granted = auth::authorize_git(app, auth::Presented::by_http(headers), repo_name(name)?, Access::Read).await?;
         let body = axum::body::to_bytes(body, MAX_FETCH_REQUEST)
             .await
             .map_err(|_| HttpError::new(StatusCode::PAYLOAD_TOO_LARGE, "fetch request too large"))?;
@@ -301,7 +303,7 @@ async fn route(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body: 
         if method != Method::POST {
             return Err(method_not_allowed());
         }
-        let granted = auth::authorize_git(app, headers, repo_name(name)?, Access::Write).await?;
+        let granted = auth::authorize_git(app, auth::Presented::by_http(headers), repo_name(name)?, Access::Write).await?;
         if headers.contains_key(header::CONTENT_ENCODING) {
             return Err(HttpError::new(StatusCode::UNSUPPORTED_MEDIA_TYPE, "compressed push bodies are not supported"));
         }

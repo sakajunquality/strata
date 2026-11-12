@@ -735,6 +735,8 @@ mod application {
     pub struct Seen {
         pub authz_questions: usize,
         pub pushes: Vec<Value>,
+        /// Whose SSH keys the application knows: the key, as an `authorized_keys` line, and the user.
+        pub ssh_keys: Vec<(String, &'static str)>,
     }
 
     type Shared = Arc<Mutex<Seen>>;
@@ -748,12 +750,18 @@ mod application {
         if !from_strata(&headers) {
             return Json(json!({ "allow": false, "status": 403, "message": "who is asking?" }));
         }
+        let by_key = q["ssh_key"].as_str().map(|key| seen.lock().unwrap().ssh_keys.iter().find(|(known, _)| known == key).map(|(_, user)| *user));
+        if q["access"] == "identify" {
+            return Json(json!({ "allow": matches!(by_key, Some(Some(_))) }));
+        }
         // "Basic " + base64("git:<token>")
-        let user = match q["authorization"].as_str() {
-            Some("Basic Z2l0OmFsaWNlLXRva2Vu") => "alice",
-            Some("Basic Z2l0OmJvYi10b2tlbg==") => "bob",
-            Some(_) => return Json(json!({ "allow": false, "status": 401 })),
-            None => return Json(json!({ "allow": false })),
+        let user = match (q["authorization"].as_str(), by_key) {
+            (_, Some(Some(user))) => user,
+            (_, Some(None)) => return Json(json!({ "allow": false, "status": 401 })),
+            (Some("Basic Z2l0OmFsaWNlLXRva2Vu"), _) => "alice",
+            (Some("Basic Z2l0OmJvYi10b2tlbg=="), _) => "bob",
+            (Some(_), _) => return Json(json!({ "allow": false, "status": 401 })),
+            (None, _) => return Json(json!({ "allow": false })),
         };
         // The repository was renamed once; both names lead to it.
         if !matches!(q["path"].as_str(), Some("acme/app" | "acme/renamed")) {
@@ -938,6 +946,138 @@ async fn the_application_decides_who_may_do_what() {
 
 /// With the application out of reach, nobody gets in. Answers are
 /// remembered briefly, so that one git command is one question, not several.
+/// A key pair made by `ssh-keygen`, and the public half as the server will see it.
+fn ssh_key(dir: &Path, name: &str, kind: &str) -> String {
+    let path = dir.join(name);
+    let made = Command::new("ssh-keygen").args(["-q", "-t", kind, "-N", "", "-C", "", "-f"]).arg(&path).output().expect("ssh-keygen must be installed");
+    assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+    std::fs::read_to_string(path.with_extension("pub")).unwrap().trim().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn git_is_served_over_ssh_to_those_whose_key_is_known() {
+    let (application, seen) = application::start().await;
+    let options = Options {
+        compact_at: usize::MAX,
+        admin_token: Some("root-secret".into()),
+        authz_url: Some(format!("{application}/authz")),
+        authz_cache: Duration::ZERO,
+        pre_receive_url: Some(format!("{application}/pre-receive")),
+        hook_secret: Some("hook-secret".into()),
+        ..Options::default()
+    };
+    let (base, app) = start_with(options).await;
+    app.meta.create_repo("r-1").await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    // Made on first use, and the same one from then on.
+    let host_key = strata_server::host_key(&root.join("host_key")).unwrap();
+    assert_eq!(strata_server::host_key(&root.join("host_key")).unwrap().public_key(), host_key.public_key());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(strata_server::serve_ssh(app.clone(), listener, host_key, std::future::pending()));
+
+    seen.lock().unwrap().ssh_keys = vec![(ssh_key(&root, "alice", "ed25519"), "alice"), (ssh_key(&root, "bob", "rsa"), "bob")];
+    ssh_key(&root, "mallory", "ed25519");
+
+    let pushes = tokio::task::spawn_blocking(move || {
+        let ssh = |keys: &[&str]| {
+            let keys: String = keys.iter().map(|key| format!(" -i {}", root.join(key).display())).collect();
+            format!("ssh -F /dev/null{keys} -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o BatchMode=yes")
+        };
+        let url = format!("ssh://git@127.0.0.1:{port}/acme/app.git");
+        let as_user = |dir: &Path, keys: &[&str], args: &[&str]| git_with(dir, args, &[("GIT_SSH_COMMAND", &ssh(keys))]);
+        #[track_caller]
+        fn ok(out: std::process::Output) -> String {
+            assert!(out.status.success(), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        #[track_caller]
+        fn refused(out: std::process::Output) -> String {
+            assert!(!out.status.success());
+            String::from_utf8_lossy(&out.stderr).to_string()
+        }
+
+        let work = root.join("work");
+        std::fs::create_dir(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("file.txt"), "one\n").unwrap();
+        // Larger than one SSH packet many times over, and not to be shrunk.
+        std::fs::write(work.join("large.bin"), incompressible(700 << 10)).unwrap();
+        let first = commit_on(&work, 1, "one");
+
+        // A key nobody knows gets nowhere; Bob's reads and Alice's writes.
+        let denied = refused(as_user(&work, &["mallory"], &["push", &url, "main"]));
+        assert!(denied.contains("Permission denied"), "{denied}");
+        let denied = refused(as_user(&work, &["bob"], &["push", &url, "main"]));
+        assert!(denied.contains("bob may only read"), "{denied}");
+        ok(as_user(&work, &["alice"], &["push", "-q", &url, "main"]));
+        let missing = refused(as_user(&work, &["alice"], &["ls-remote", &format!("ssh://git@127.0.0.1:{port}/acme/other.git")]));
+        assert!(missing.contains("no such repository"), "{missing}");
+
+        // A client with several keys is let in with the one that is known.
+        ok(as_user(&root, &["mallory", "bob"], &["clone", "-q", &url, "clone"]));
+        let clone = root.join("clone");
+        assert_eq!(git(&clone, &["rev-parse", "HEAD"]), first);
+        git(&clone, &["fsck", "--strict"]);
+
+        // What came in over SSH goes out over HTTP, and the other way round.
+        let http = format!("{}/acme/app.git", base.replace("http://", "http://git:alice-token@"));
+        assert!(git(&root, &["ls-remote", &http, "refs/heads/main"]).starts_with(&first));
+        std::fs::write(work.join("file.txt"), "two\n").unwrap();
+        let second = commit_on(&work, 2, "two");
+        git(&work, &["push", "-q", &http, "main"]);
+        ok(as_user(&clone, &["bob"], &["pull", "-q", "--ff-only"]));
+        assert_eq!(git(&clone, &["rev-parse", "HEAD"]), second);
+
+        // Several refs at once, a push that only deletes, and one that brings nothing new.
+        std::fs::write(work.join("file.txt"), "three\n").unwrap();
+        let third = commit_on(&work, 3, "three");
+        ok(as_user(&work, &["alice"], &["push", "-q", &url, "main", "main:refs/heads/topic", "main:refs/tags/v1"]));
+        ok(as_user(&work, &["alice"], &["push", "-q", &url, ":topic"]));
+        ok(as_user(&work, &["alice"], &["push", "-q", &url, &format!("{second}:refs/heads/older")]));
+        let listed = ok(as_user(&root, &["bob"], &["ls-remote", &url]));
+        assert!(listed.contains(&format!("{third}\trefs/heads/main")) && listed.contains(&format!("{second}\trefs/heads/older")), "{listed}");
+        assert!(listed.contains("refs/tags/v1") && !listed.contains("topic"), "{listed}");
+
+        // The application's push rules hold here too.
+        git(&work, &["reset", "-q", "--hard", &first]);
+        let denied = refused(as_user(&work, &["alice"], &["push", "--force", &url, "main"]));
+        assert!(denied.contains("main is protected"), "{denied}");
+
+        // Shallow and partial clones.
+        ok(as_user(&root, &["bob"], &["clone", "-q", "--depth", "1", &url, "shallow"]));
+        assert_eq!(commit_count(&root.join("shallow")), "1");
+        ok(as_user(&root, &["bob"], &["clone", "-q", "--filter=blob:none", "--no-checkout", &url, "partial"]));
+        assert!(missing_objects(&root.join("partial")) > 0);
+
+        // The older protocol is turned down in words, as is asking for a shell or another program.
+        let old = refused(as_user(&root, &["bob"], &["-c", "protocol.version=0", "ls-remote", &url]));
+        assert!(old.contains("protocol version 2"), "{old}");
+        let run = |command: &[&str]| {
+            let mut parts = ssh(&["bob"]);
+            parts.push_str(&format!(" -p {port} git@127.0.0.1"));
+            let mut words = parts.split(' ');
+            Command::new(words.next().unwrap()).args(words).args(command).output().unwrap()
+        };
+        assert!(String::from_utf8_lossy(&run(&[]).stderr).contains("no shell"));
+        assert!(String::from_utf8_lossy(&run(&["cat", "/etc/passwd"]).stderr).contains("only git-upload-pack"));
+
+        let metrics = api("GET", &format!("{base}/metrics"), Some("root-secret")).1;
+        assert!(metrics.contains("strata_ssh_commands_total{result=\"ok\",service=\"receive-pack\"}"), "{metrics}");
+        assert!(metrics.contains("strata_ssh_commands_total{result=\"refused\",service=\"other\"} 2"), "{metrics}");
+        (first, second, third)
+    })
+    .await
+    .unwrap();
+
+    // Pushes over SSH are told to the application like any other, with who made them.
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.pushes[0]["actor"], "alice");
+    assert_eq!(seen.pushes[0]["updates"][0]["new"], pushes.0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unreachable_application_means_no() {
     let (application, seen) = application::start().await;

@@ -34,6 +34,8 @@ memmap2 = "0.9.12"
 prometheus = { version = "0.14", default-features = false }
 async-trait.workspace = true
 futures-core = "0.3"
+russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa", "flate2"] }
+rand = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Adds the process's own CPU, memory and file descriptors to /metrics.

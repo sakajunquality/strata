@@ -77,6 +77,11 @@ git clone http://127.0.0.1:8080/me/project.git
 Without `--auto-create`, create repositories with `curl -X PUT http://127.0.0.1:8080/api/repos/me/project`.
 `POST /api/repos/<name>/compact` forces a full merge.
 
+Git over SSH is off until asked for: `--ssh-listen 0.0.0.0:22`. The host key
+is read from `--ssh-host-key` (OpenSSH's format; made on first start if it is
+not there, by default in the data directory). Nodes behind one name must all
+be given the same key. See "SSH" below for who is let in.
+
 To keep packs in a bucket: `--object-store s3://bucket/prefix` (or `gs://`,
 `az://`), with credentials in the usual `AWS_*`, `GOOGLE_*` or `AZURE_*`
 environment variables. Give the bucket a lifecycle rule that aborts incomplete
@@ -134,6 +139,25 @@ to the application's own table, and nothing moves inside Strata. `actor` is
 recorded with pushes. Answers are reused for `--authz-cache-secs` (10 by
 default), which is how long a revoked permission keeps working. If the hook
 cannot be reached, the request is refused.
+
+**SSH.** A client over SSH shows a key instead of a header, and the same
+hook is asked, with the key as one `authorized_keys` line:
+
+```
+-> {"path": "", "access": "identify", "ssh_key": "ssh-ed25519 AAAA..."}     # when the key is offered
+<- {"allow": true}
+-> {"path": "acme/app", "access": "write", "ssh_key": "ssh-ed25519 AAAA..."}  # for each command
+<- {"allow": true, "repo": "r-8f3a", "actor": "alice"}
+```
+
+The first question is put before the client is let in, so that one with
+several keys goes on to its next: answer `allow` for keys the application
+knows. The user name the client connects as (`git@`) means nothing. Nothing
+but `git-upload-pack` and `git-receive-pack` runs: there is no shell.
+Fetches over SSH speak protocol version 2 only, which git has asked for by
+itself since 2.26; older clients fetch over HTTP. Without a hook, SSH serves
+what HTTP serves without credentials: everything if there is no admin token,
+fetches with `--anonymous-read`, nothing otherwise.
 
 **The pre-receive hook** (`--pre-receive-url`) can veto a push before
 anything is stored, which is where protected branches go:
@@ -262,6 +286,7 @@ scrape_configs:
 |---|---|
 | `strata_http_requests_total{handler,status}`, `strata_http_request_duration_seconds{handler}`, `strata_http_requests_in_flight` | Requests by what they asked for: `info-refs`, `upload-pack`, `receive-pack`, `content`, `merge`, `import`, `events`, `repos`, `compact`. Timed until the answer starts. |
 | `strata_fetches_total{result}`, `strata_fetch_bytes_total`, `strata_fetch_duration_seconds` | Fetch responses to their end, at the pace the client reads: `sent`, `aborted` (the client left) or `error`. |
+| `strata_ssh_commands_total{service,result}`, `strata_ssh_command_duration_seconds{service}` | Commands over SSH (`upload-pack`, `receive-pack`, `other`): `ok`, `refused` or `aborted` (the client left). Their fetches and pushes are counted in the rows around this one too. |
 | `strata_pushes_total{result}`, `strata_push_bytes_total`, `strata_push_wait_seconds` | Pushes `accepted` or `rejected`, the pack data they brought, and how long they were held back for compaction (`--wait-at`). |
 | `strata_compactions_total{result}`, `strata_compaction_duration_seconds`, `strata_compaction_objects_total`, `strata_compactions_pending` | Compaction: runs that `merged` packs, found `nothing` to do or ended in `error`, and the repositories waiting. |
 | `strata_hook_requests_total{hook,result}`, `strata_hook_duration_seconds{hook}`, `strata_authz_cache_total{result}` | The application's `authz` and `pre-receive` hooks, and how often an authorization was answered from memory. |
@@ -361,7 +386,7 @@ row stayed locked for seven trips to the database: 240 a second).
 - **Listing refs reads each tag to find what it points at.** The peeled values are not stored next to the refs. Listing 50,000 annotated tags takes 50 ms.
 - **A fetch can send what the client has by another way.** A change picked onto a release branch brings the same files as the original, and a client that has the original is sent them again unless bitmaps say it has them. With etcd's repository (183k objects, 23 branches, 993 tags), a client holding the default branch that fetches every other branch is sent 3% it already had once the pool has bitmaps, 25% before (git itself, serving the same repository without bitmaps, sends 15%). What is pushed after the last compaction is not covered by bitmaps until the next. Measured on that one repository only.
 - **Pushes at a high rate are measured on one machine only**, with packs on local disk and the database next to the node. In object storage each push is three uploads and each compaction reads what it merges back, so both will be slower there, by how much is not known. Two nodes on the same laptop handled no more than one (840 against 1,110 a second): they share its processors, so this says nothing about adding nodes. Pushes to the same branch were not part of it.
-- **SSH.** Access is over HTTP(S) only.
+- **SSH is narrower than HTTP.** Fetches need protocol version 2 (libgit2 and clients older than git 2.26 fetch over HTTP). Clients are known by plain public keys: no certificates, no passwords. Tested with OpenSSH's client and Ed25519 and RSA keys; not under load, and a large clone over SSH has not been timed against HTTP.
 - **SHA-256 repositories.**
 - **Pruned objects are gone at once.** There is no window in which a force-pushed-away commit can still be fetched by id after the next full compaction.
 - **Indexing a push takes memory in proportion to its objects**: about 180 bytes for each (72 MiB for the 412k objects of git's repository, where the whole server peaked at 142 MiB over that push), for the table of entries, the ids they point at and the index being built. On top come the objects whose deltas are being resolved, up to 64 MiB on each of up to eight threads; beyond that they are dropped and read again when needed. A single object larger than that is still held whole, together with the version made from it. Not measured beyond 412k objects. The spool file needs local disk the size of the push, and is mapped into memory: it counts as the process's memory wherever mapped files do, though the kernel can drop its pages at any time.

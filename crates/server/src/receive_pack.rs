@@ -26,11 +26,19 @@ fn capabilities() -> String {
     format!("report-status delete-refs ofs-delta atomic object-format=sha1 agent={AGENT}")
 }
 
+/// What opens a push over HTTP.
 pub(crate) fn advertise(repo: Option<&RepoState>) -> Vec<u8> {
-    let caps = capabilities();
     let mut out = Vec::new();
     pktline::write(&mut out, "# service=git-receive-pack\n");
     pktline::flush(&mut out);
+    out.extend(advertise_refs(repo));
+    out
+}
+
+/// The refs and capabilities, which is all that opens a push over SSH.
+pub(crate) fn advertise_refs(repo: Option<&RepoState>) -> Vec<u8> {
+    let caps = capabilities();
+    let mut out = Vec::new();
 
     let mut refs = repo.into_iter().flat_map(|r| &r.refs);
     match refs.next() {

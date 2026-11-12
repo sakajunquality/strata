@@ -42,6 +42,25 @@ struct Question<'a> {
     access: &'a str,
     /// The client's `Authorization` header, untouched.
     authorization: Option<&'a str>,
+    /// Over SSH: the public key the client proved to hold, as one
+    /// `authorized_keys` line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssh_key: Option<&'a str>,
+}
+
+/// What a git client showed of itself.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Presented<'a> {
+    /// Over HTTP: the `Authorization` header.
+    pub authorization: Option<&'a str>,
+    /// Over SSH: the public key the client signed with.
+    pub ssh_key: Option<&'a str>,
+}
+
+impl<'a> Presented<'a> {
+    pub(crate) fn by_http(headers: &'a HeaderMap) -> Presented<'a> {
+        Presented { authorization: headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()), ssh_key: None }
+    }
 }
 
 #[derive(Deserialize)]
@@ -62,8 +81,8 @@ fn sha256(parts: &[&str]) -> String {
     hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn presented_secret(headers: &HeaderMap) -> Option<String> {
-    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+fn presented_secret(authorization: Option<&str>) -> Option<String> {
+    let value = authorization?;
     if let Some(token) = value.strip_prefix("Bearer ") {
         return Some(token.trim().to_string());
     }
@@ -75,12 +94,12 @@ fn presented_secret(headers: &HeaderMap) -> Option<String> {
     Some(if password.is_empty() { user } else { password }.to_string())
 }
 
-fn is_admin(app: &App, headers: &HeaderMap) -> Result<bool, HttpError> {
+fn is_admin(app: &App, authorization: Option<&str>) -> Result<bool, HttpError> {
     let Some(admin_token) = &app.options.admin_token else {
         // No admin token configured: authentication is switched off.
         return Ok(true);
     };
-    let Some(secret) = presented_secret(headers) else {
+    let Some(secret) = presented_secret(authorization) else {
         return Err(HttpError::unauthorized());
     };
     // Comparing hashes keeps the comparison independent of where the secrets differ.
@@ -89,25 +108,26 @@ fn is_admin(app: &App, headers: &HeaderMap) -> Result<bool, HttpError> {
 
 /// For the management API.
 pub(crate) fn authorize_admin(app: &App, headers: &HeaderMap) -> Result<(), HttpError> {
-    match is_admin(app, headers)? {
+    match is_admin(app, Presented::by_http(headers).authorization)? {
         true => Ok(()),
         false => Err(HttpError::unauthorized()),
     }
 }
 
 /// For git requests. Runs before anything reveals whether a repository exists.
-pub(crate) async fn authorize_git(app: &App, headers: &HeaderMap, path: &str, access: Access) -> Result<Granted, HttpError> {
+pub(crate) async fn authorize_git(app: &App, presented: Presented<'_>, path: &str, access: Access) -> Result<Granted, HttpError> {
+    let Presented { authorization, ssh_key } = presented;
     let Some(url) = &app.options.authz_url else {
+        // A key says who someone is only to an application that knows whose it is.
         let open = app.options.anonymous_read && access == Access::Read;
-        if open || is_admin(app, headers)? {
+        if open || is_admin(app, authorization)? {
             return Ok(Granted { repo: path.to_string(), actor: None });
         }
         return Err(HttpError::unauthorized());
     };
 
-    let authorization = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
     let access_name = if access == Access::Read { "read" } else { "write" };
-    let key = sha256(&[path, access_name, authorization.unwrap_or("")]);
+    let key = sha256(&[path, access_name, authorization.unwrap_or(""), ssh_key.unwrap_or("")]);
     let remembered = app.decisions.as_ref().and_then(|cache| cache.get(&key));
     app.metrics.authz_cache(remembered.is_some());
     match remembered {
@@ -115,14 +135,15 @@ pub(crate) async fn authorize_git(app: &App, headers: &HeaderMap, path: &str, ac
         Some(Decision::No(status, message)) => return Err(HttpError::new(status, message)),
         None => {}
     }
-    let question = Question { path, access: access_name, authorization };
+    let question = Question { path, access: access_name, authorization, ssh_key };
     let answer: Answer = app.hooks.ask("authz", url, &question).await.map_err(|e| {
         tracing::error!("authorization hook failed: {e:#}");
         HttpError::new(StatusCode::SERVICE_UNAVAILABLE, "authorization is unavailable, try again")
     })?;
     if !answer.allow {
         // Without credentials, "who are you?" makes git ask for them.
-        let fallback = if authorization.is_some() { StatusCode::FORBIDDEN } else { StatusCode::UNAUTHORIZED };
+        let anonymous = authorization.is_none() && ssh_key.is_none();
+        let fallback = if anonymous { StatusCode::UNAUTHORIZED } else { StatusCode::FORBIDDEN };
         let status = match answer.status {
             Some(401) => StatusCode::UNAUTHORIZED,
             Some(403) => StatusCode::FORBIDDEN,
@@ -133,7 +154,7 @@ pub(crate) async fn authorize_git(app: &App, headers: &HeaderMap, path: &str, ac
         // git asks without credentials first, every time. That one "no" is
         // worth remembering; a "no" to someone in particular is not, or they
         // would stay locked out for a while after being let in.
-        if let (Some(cache), None) = (&app.decisions, authorization) {
+        if let (Some(cache), true) = (&app.decisions, anonymous) {
             cache.insert(key, Decision::No(status, message.clone()));
         }
         return Err(HttpError::new(status, message));
@@ -153,4 +174,32 @@ pub(crate) async fn authorize_git(app: &App, headers: &HeaderMap, path: &str, ac
         cache.insert(key, Decision::Yes(granted.clone()));
     }
     Ok(granted)
+}
+
+/// Whether the application knows the key a client offers over SSH. Asked
+/// before the client is let in, so that one with several keys goes on to its
+/// next: the question is `{"access": "identify", "ssh_key"}`, with no path.
+/// Without a hook every key is let in, and what it may do is decided per request.
+pub(crate) async fn knows_key(app: &App, ssh_key: &str) -> bool {
+    let Some(url) = &app.options.authz_url else {
+        return true;
+    };
+    let key = sha256(&["", "identify", "", ssh_key]);
+    if let Some(Decision::Yes(_)) = app.decisions.as_ref().and_then(|cache| cache.get(&key)) {
+        return true;
+    }
+    let question = Question { path: "", access: "identify", authorization: None, ssh_key: Some(ssh_key) };
+    match app.hooks.ask::<_, Answer>("authz", url, &question).await {
+        Ok(answer) if answer.allow => {
+            if let Some(cache) = &app.decisions {
+                cache.insert(key, Decision::Yes(Granted { repo: String::new(), actor: answer.actor }));
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(e) => {
+            tracing::error!("authorization hook failed: {e:#}");
+            false
+        }
+    }
 }

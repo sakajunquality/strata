@@ -8,7 +8,7 @@ use clap::Parser;
 use object_store::local::LocalFileSystem;
 use object_store::prefix::PrefixStore;
 use object_store::ObjectStore;
-use strata_server::{router, spawn_background, App, Metrics, Options};
+use strata_server::{host_key, router, serve_ssh, spawn_background, App, Metrics, Options};
 use strata_store::{open_meta, CacheConfig, PackStore};
 
 #[derive(Parser)]
@@ -30,6 +30,15 @@ struct Args {
     /// AWS_*, GOOGLE_* and AZURE_* environment variables.
     #[arg(long)]
     object_store: Option<String>,
+    /// Also serve git over SSH, on this address (0.0.0.0:22, say). Clients
+    /// are known by their keys, which the authorization hook is shown as
+    /// "ssh_key" in place of "authorization".
+    #[arg(long, env = "STRATA_SSH_LISTEN")]
+    ssh_listen: Option<SocketAddr>,
+    /// The SSH host key, in OpenSSH's format; made if it is not there. Every
+    /// node behind one name needs the same one [default: ssh_host_key in --data-dir].
+    #[arg(long, env = "STRATA_SSH_HOST_KEY")]
+    ssh_host_key: Option<PathBuf>,
     /// Create repositories on first push.
     #[arg(long)]
     auto_create: bool,
@@ -158,11 +167,32 @@ async fn main() -> anyhow::Result<()> {
     let app = Arc::new(App::with_metrics(meta, packs, options, metrics));
     spawn_background(app.clone(), Duration::from_secs(60));
 
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    tracing::info!("listening on http://{}", listener.local_addr()?);
     // On a signal to stop, no new connections are taken and requests in
     // flight are let finish: what a rolling update needs of a node.
-    axum::serve(listener, router(app)).with_graceful_shutdown(stop_signal()).await?;
+    let (stopping, stopped) = tokio::sync::watch::channel(false);
+    let wait = |mut stopped: tokio::sync::watch::Receiver<bool>| async move {
+        let _ = stopped.wait_for(|stop| *stop).await;
+    };
+    let ssh = match args.ssh_listen {
+        None => None,
+        Some(address) => {
+            let key = host_key(&args.ssh_host_key.unwrap_or_else(|| args.data_dir.join("ssh_host_key")))?;
+            let listener = tokio::net::TcpListener::bind(address).await.with_context(|| format!("listening for SSH on {address}"))?;
+            tracing::info!("listening on ssh://{}", listener.local_addr()?);
+            Some(tokio::spawn(serve_ssh(app.clone(), listener, key, wait(stopped.clone()))))
+        }
+    };
+    tokio::spawn(async move {
+        stop_signal().await;
+        let _ = stopping.send(true);
+    });
+
+    let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    tracing::info!("listening on http://{}", listener.local_addr()?);
+    axum::serve(listener, router(app)).with_graceful_shutdown(wait(stopped)).await?;
+    if let Some(ssh) = ssh {
+        ssh.await??;
+    }
     tracing::info!("stopped");
     Ok(())
 }

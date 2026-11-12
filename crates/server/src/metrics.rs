@@ -33,6 +33,8 @@ pub struct Metrics {
     fetches: IntCounterVec,
     fetch_bytes: IntCounter,
     fetch_seconds: Histogram,
+    ssh: IntCounterVec,
+    ssh_seconds: HistogramVec,
     compactions: IntCounterVec,
     compaction_seconds: Histogram,
     compaction_objects: IntCounter,
@@ -105,6 +107,8 @@ impl Metrics {
             fetches: counters("strata_fetches_total", "Fetch responses, by whether they were written to the end.", &["result"]),
             fetch_bytes: counter("strata_fetch_bytes_total", "Bytes sent in fetch responses."),
             fetch_seconds: histogram("strata_fetch_duration_seconds", "Time to produce and send a fetch response, at the pace the client reads it."),
+            ssh: counters("strata_ssh_commands_total", "Commands run over SSH, by service and whether they ran to the end (ok), were turned down (refused) or lost their client (aborted).", &["service", "result"]),
+            ssh_seconds: histograms("strata_ssh_command_duration_seconds", "Time from a command's arrival over SSH to its end, at the pace of the client.", &["service"]),
             compactions: counters("strata_compactions_total", "Compaction runs, by whether they merged packs, found nothing to do, or failed.", &["result"]),
             compaction_seconds: histogram("strata_compaction_duration_seconds", "Time taken by compaction runs."),
             compaction_objects: counter("strata_compaction_objects_total", "Objects written into packs by compaction."),
@@ -151,6 +155,11 @@ impl Metrics {
         self.fetches.with_label_values(&[result]).inc();
         self.fetch_bytes.inc_by(bytes);
         self.fetch_seconds.observe(took.as_secs_f64());
+    }
+
+    pub(crate) fn ssh(&self, service: &str, result: &str, took: Duration) {
+        self.ssh.with_label_values(&[service, result]).inc();
+        self.ssh_seconds.with_label_values(&[service]).observe(took.as_secs_f64());
     }
 
     pub(crate) fn compaction(&self, result: &str, objects: usize, took: Duration) {
