@@ -8,7 +8,7 @@ use clap::Parser;
 use object_store::local::LocalFileSystem;
 use object_store::prefix::PrefixStore;
 use object_store::ObjectStore;
-use strata_server::{router, spawn_background, App, Options};
+use strata_server::{router, spawn_background, App, Metrics, Options};
 use strata_store::{open_meta, CacheConfig, PackStore};
 
 #[derive(Parser)]
@@ -118,8 +118,9 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     std::fs::create_dir_all(&args.data_dir).with_context(|| format!("creating {}", args.data_dir.display()))?;
+    let metrics = Arc::new(Metrics::new());
     let packs = PackStore::new(
-        open_object_store(&args)?,
+        metrics.metered_store(open_object_store(&args)?),
         CacheConfig {
             block_cache_bytes: args.block_cache_mb << 20,
             object_cache_bytes: args.object_cache_mb << 20,
@@ -154,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
         None => open_meta(&args.data_dir.join("meta.sqlite").to_string_lossy()).await,
     }
     .context("opening the metadata store")?;
-    let app = Arc::new(App::new(meta, packs, options));
+    let app = Arc::new(App::with_metrics(meta, packs, options, metrics));
     spawn_background(app.clone(), Duration::from_secs(60));
 
     let listener = tokio::net::TcpListener::bind(args.listen).await?;

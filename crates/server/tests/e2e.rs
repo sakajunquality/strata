@@ -1349,6 +1349,16 @@ async fn a_repository_is_brought_in_from_a_bundle() {
         // The tags it did not name are still there.
         assert_eq!(refs["refs"].as_array().unwrap().len(), 4);
 
+        // A mirror also drops what is gone at its source: asked to, the import
+        // deletes the refs under a prefix that the bundle does not name.
+        git(&work, &["bundle", "create", "-q", &path("trunk.bundle"), "trunk"]);
+        let (status, answer) = api_with("POST", &format!("{repo}/import?actor=mover&prune=refs/heads/"), None, Some(&format!("@{}", path("trunk.bundle"))));
+        assert_eq!((status, json(&answer)["updated"].clone()), (200, serde_json::json!(1)), "{answer}");
+        let refs = json(&api("GET", &format!("{repo}/refs"), None).1);
+        let names: Vec<&str> = refs["refs"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["refs/heads/trunk", "refs/tags/light", "refs/tags/v1"]);
+        assert_eq!(api_with("POST", &format!("{repo}/import?prune=heads"), None, Some(&format!("@{}", path("trunk.bundle")))).0, 400);
+
         // The same bundle where its base is missing is refused, and leaves nothing behind.
         let empty = format!("{base}/api/repos/in-2");
         assert_eq!(api("PUT", &empty, None).0, 201);
@@ -1365,7 +1375,62 @@ async fn a_repository_is_brought_in_from_a_bundle() {
         // The feed tells of each import, without listing its refs.
         let events = json(&api("GET", &format!("{base}/api/events"), None).1);
         let told: Vec<&serde_json::Value> = events["events"].as_array().unwrap().iter().filter(|e| e["repo"] == "in-1").map(|e| &e["event"]).collect();
-        assert_eq!(told, [&serde_json::json!({ "type": "import", "actor": "mover", "refs": 4 }), &serde_json::json!({ "type": "import", "actor": "mover", "refs": 2 })]);
+        assert_eq!(told, [&serde_json::json!({ "type": "import", "actor": "mover", "refs": 4 }), &serde_json::json!({ "type": "import", "actor": "mover", "refs": 2 }), &serde_json::json!({ "type": "import", "actor": "mover", "refs": 1 })]);
+    })
+    .await
+    .unwrap();
+}
+
+/// What the node did can be read at /metrics, by those with the admin token.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_node_tells_prometheus_what_it_does() {
+    let metrics = Arc::new(strata_server::Metrics::new());
+    let packs = PackStore::new(metrics.metered_store(Arc::new(InMemory::new())), CacheConfig::default());
+    let options = Options { auto_create: true, compact_at: usize::MAX, admin_token: Some("root-secret".into()), ..Options::default() };
+    let app = Arc::new(App::with_metrics(Arc::new(MemoryMetaStore::default()), packs, options, metrics));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let served = app.clone();
+    tokio::spawn(async move { axum::serve(listener, router(served)).await.unwrap() });
+    compact(&app, "nothing/here", true).await.unwrap();
+
+    tokio::task::spawn_blocking(move || {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("file.txt"), "one\n").unwrap();
+        commit_on(&work, 1, "one");
+        let remote = format!("{}/acme/app.git", base.replace("http://", "http://git:root-secret@"));
+        git(&work, &["push", "-q", &remote, "main"]);
+        git(tmp.path(), &["clone", "-q", &remote, "clone"]);
+
+        let url = format!("{base}/metrics");
+        assert_eq!(api("GET", &url, None).0, 401);
+        assert_eq!(api("GET", &url, Some("wrong")).0, 401);
+        let (status, text) = api("GET", &url, Some("root-secret"));
+        assert_eq!(status, 200);
+        // The value of the series whose name and labels are exactly these.
+        let value = |series: &str| -> f64 {
+            let line = text.lines().find(|line| line.rsplit_once(' ').is_some_and(|(name, _)| name == series));
+            line.unwrap_or_else(|| panic!("no {series} in:\n{text}")).rsplit_once(' ').unwrap().1.parse().unwrap()
+        };
+        assert_eq!(value(r#"strata_pushes_total{result="accepted"}"#), 1.0);
+        assert!(value("strata_push_bytes_total") > 0.0);
+        assert!(value(r#"strata_http_requests_total{handler="receive-pack",status="200"}"#) >= 1.0);
+        // git asks without credentials first.
+        assert!(value(r#"strata_http_requests_total{handler="info-refs",status="401"}"#) >= 1.0);
+        assert!(value(r#"strata_fetches_total{result="sent"}"#) >= 1.0);
+        assert!(value("strata_fetch_bytes_total") > 0.0);
+        assert!(value(r#"strata_http_request_duration_seconds_count{handler="upload-pack"}"#) >= 1.0);
+        assert!(value(r#"strata_meta_requests_total{op="commit",result="ok"}"#) >= 1.0);
+        assert!(value(r#"strata_object_store_requests_total{op="put",result="ok"}"#) + value(r#"strata_object_store_requests_total{op="complete_multipart",result="ok"}"#) >= 1.0);
+        assert!(value(r#"strata_object_store_bytes_total{direction="written"}"#) > 0.0);
+        assert_eq!(value(r#"strata_compactions_total{result="nothing"}"#), 1.0);
+        assert_eq!(value("strata_compactions_pending"), 0.0);
+        assert!(text.contains("# TYPE strata_http_request_duration_seconds histogram"));
+        // The scrapes themselves are not counted.
+        assert!(!text.contains(r#"handler="other""#), "{text}");
     })
     .await
     .unwrap();

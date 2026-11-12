@@ -80,7 +80,9 @@ fn parse_header(text: &[u8]) -> Result<Bundle, HttpError> {
 
 /// `POST /api/repos/<id>/import`, with a bundle as the body: stores its
 /// objects and sets every ref in it to the value it has there, whatever the
-/// ref was before. Refs the bundle does not name are left alone.
+/// ref was before. Refs the bundle does not name are left alone, except
+/// under the prefixes given as `prune=` (`?prune=refs/heads/&prune=refs/tags/`):
+/// there they are deleted, which is what keeping a mirror takes.
 ///
 /// Answers `{"refs": ..., "updated": ..., "objects": ...}`. Refs are set a few
 /// thousand at a time, so a failure half way leaves some of them set; sending
@@ -88,7 +90,12 @@ fn parse_header(text: &[u8]) -> Result<Bundle, HttpError> {
 /// the event feed gets one `import` event with the number of refs, not a
 /// list of them.
 pub(crate) async fn import(app: &App, name: &str, query: &str, body: Body) -> Result<Response, HttpError> {
-    let actor = url::form_urlencoded::parse(query.as_bytes()).find(|(key, _)| key == "actor").map(|(_, value)| value.into_owned());
+    let params = |name: &str| -> Vec<String> { url::form_urlencoded::parse(query.as_bytes()).filter(|(key, _)| key == name).map(|(_, value)| value.into_owned()).collect() };
+    let actor = params("actor").into_iter().next();
+    let prune = params("prune");
+    if prune.iter().any(|prefix| !prefix.starts_with("refs/")) {
+        return Err(HttpError::bad_request("prune takes prefixes of ref names, like refs/heads/"));
+    }
 
     // The list of refs ends at the first empty line; the pack follows.
     let mut body = body.into_data_stream();
@@ -121,7 +128,7 @@ pub(crate) async fn import(app: &App, name: &str, query: &str, body: Body) -> Re
     // node, and would take this one for theirs.
     let lease = Lease { key: format!("compact/{name}"), holder: format!("import-{}", PackStore::new_pack_id()), held: false };
     let mut lease = lease;
-    let result = apply(app, name, actor.as_deref(), &bundle, pack, &mut lease).await;
+    let result = apply(app, name, actor.as_deref(), &prune, &bundle, pack, &mut lease).await;
     if lease.held {
         if let Err(e) = app.meta.release_lease(&lease.key, &lease.holder).await {
             tracing::warn!(repo = name, "releasing the compaction lease after an import failed: {e}");
@@ -137,7 +144,7 @@ struct Lease {
     held: bool,
 }
 
-async fn apply(app: &App, name: &str, actor: Option<&str>, bundle: &Arc<Bundle>, pack: Option<Arc<dyn PackData>>, lease: &mut Lease) -> Result<Response, HttpError> {
+async fn apply(app: &App, name: &str, actor: Option<&str>, prune: &[String], bundle: &Arc<Bundle>, pack: Option<Arc<dyn PackData>>, lease: &mut Lease) -> Result<Response, HttpError> {
     let mut uploaded: Option<String> = None;
     // What the pack points at outside itself, and how many objects it holds.
     let mut outside: Arc<Vec<Oid>> = Arc::default();
@@ -189,11 +196,14 @@ async fn apply(app: &App, name: &str, actor: Option<&str>, bundle: &Arc<Bundle>,
 
         // A ref named twice ends up as its last line says.
         let wanted: BTreeMap<&str, Oid> = bundle.refs.iter().map(|(name, oid)| (name.as_str(), *oid)).collect();
-        let updates: Vec<RefUpdate> = wanted
-            .into_iter()
-            .filter(|(name, oid)| repo.refs.get(*name) != Some(oid))
-            .map(|(name, oid)| RefUpdate { name: name.to_string(), old: repo.refs.get(name).copied(), new: Some(oid) })
-            .collect();
+        let gone = repo.refs.iter().filter(|(name, _)| !wanted.contains_key(name.as_str()) && prune.iter().any(|prefix| name.starts_with(prefix.as_str())));
+        let mut updates: Vec<RefUpdate> = gone.map(|(name, oid)| RefUpdate { name: name.clone(), old: Some(*oid), new: None }).collect();
+        updates.extend(
+            wanted
+                .into_iter()
+                .filter(|(name, oid)| repo.refs.get(*name) != Some(oid))
+                .map(|(name, oid)| RefUpdate { name: name.to_string(), old: repo.refs.get(name).copied(), new: Some(oid) }),
+        );
         if updates.is_empty() {
             return Ok(done(&uploaded, objects, updated));
         }

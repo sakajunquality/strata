@@ -31,3 +31,10 @@ moka = { version = "0.12", features = ["sync"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 diffy = "0.5.2"
 memmap2 = "0.9.12"
+prometheus = { version = "0.14", default-features = false }
+async-trait.workspace = true
+futures-core = "0.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Adds the process's own CPU, memory and file descriptors to /metrics.
+prometheus = { version = "0.14", default-features = false, features = ["process"] }

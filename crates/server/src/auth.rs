@@ -108,13 +108,15 @@ pub(crate) async fn authorize_git(app: &App, headers: &HeaderMap, path: &str, ac
     let authorization = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
     let access_name = if access == Access::Read { "read" } else { "write" };
     let key = sha256(&[path, access_name, authorization.unwrap_or("")]);
-    match app.decisions.as_ref().and_then(|cache| cache.get(&key)) {
+    let remembered = app.decisions.as_ref().and_then(|cache| cache.get(&key));
+    app.metrics.authz_cache(remembered.is_some());
+    match remembered {
         Some(Decision::Yes(granted)) => return Ok(granted),
         Some(Decision::No(status, message)) => return Err(HttpError::new(status, message)),
         None => {}
     }
     let question = Question { path, access: access_name, authorization };
-    let answer: Answer = app.hooks.ask(url, &question).await.map_err(|e| {
+    let answer: Answer = app.hooks.ask("authz", url, &question).await.map_err(|e| {
         tracing::error!("authorization hook failed: {e:#}");
         HttpError::new(StatusCode::SERVICE_UNAVAILABLE, "authorization is unavailable, try again")
     })?;

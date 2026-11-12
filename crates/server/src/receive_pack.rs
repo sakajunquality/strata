@@ -232,6 +232,7 @@ pub(crate) async fn handle(app: &App, granted: &Granted, body: Body) -> Result<V
     if let Err(Rejection::Unpack(reason) | Rejection::All(reason) | Rejection::Ref { reason, .. }) = &result {
         tracing::info!(repo = name, "push rejected: {reason}");
     }
+    app.metrics.push(if result.is_ok() { "accepted" } else { "rejected" }, pack.as_ref().map_or(0, |pack| pack.size()));
 
     let mut out = Vec::new();
     if caps.iter().any(|c| c == "report-status") {
@@ -264,13 +265,18 @@ const MAX_HOLD: Duration = Duration::from_secs(10);
 /// through, see [`crate::Options::wait_at`]. Leaves `repo` as it is then.
 async fn hold_back(app: &App, scope: &RefScope, repo: &mut RepoState) -> Result<(), HttpError> {
     let limit = app.options.wait_at;
-    let deadline = tokio::time::Instant::now() + MAX_HOLD;
+    let started = tokio::time::Instant::now();
+    let deadline = started + MAX_HOLD;
     let mut pause = Duration::from_millis(5);
     while limit > 0 && repo.packs.len() >= limit && tokio::time::Instant::now() < deadline {
         app.request_compaction(&repo.name);
         tokio::time::sleep(pause).await;
         pause = (pause * 2).min(Duration::from_millis(100));
         *repo = app.meta.get_repo(&repo.name, scope).await?.ok_or(MetaError::NotFound)?;
+    }
+    if limit > 0 {
+        // Pushes that did not wait count too: as waits of no time.
+        app.metrics.push_waited(started.elapsed());
     }
     Ok(())
 }
@@ -432,7 +438,7 @@ async fn apply(
             update["commits_truncated"] = serde_json::Value::Bool(truncated);
         }
         let question = serde_json::json!({ "repo": repo.name, "actor": actor, "updates": asked });
-        match app.hooks.ask::<_, Verdict>(url, &question).await {
+        match app.hooks.ask::<_, Verdict>("pre-receive", url, &question).await {
             Ok(Verdict { allow: true, .. }) => {}
             Ok(Verdict { message, .. }) => {
                 return Ok(Some(Err(Rejection::All(message.unwrap_or_else(|| "rejected by the repository's rules".into())))));

@@ -193,6 +193,7 @@ CI triggers and audit logs are built from this, with whatever retries they need.
 | `GET /api/events` | The feed above. |
 | `GET /healthz` | Liveness, without credentials. |
 | `GET /readyz` | Readiness, without credentials: 503 while the metadata store cannot be reached. |
+| `GET /metrics` | What the node counts and times, for Prometheus. See below. |
 
 A `rev` is a ref (in full, or a branch or tag name) or a commit id, and
 defaults to HEAD. These read calls are what a code browser is built from;
@@ -210,7 +211,9 @@ curl -X POST -T all.bundle -H "Authorization: Bearer $TOKEN" "https://host/api/r
 
 The objects are stored as a push stores them, and every ref in the bundle is
 set to the value it has there, whatever it was before; refs the bundle does
-not name are left alone. A bundle of what came after an earlier one
+not name are left alone, unless they are under a prefix given as `prune`
+(`?prune=refs/heads/&prune=refs/tags/`): those are deleted, which is what
+keeping a mirror of another repository takes. A bundle of what came after an earlier one
 (`git bundle create more.bundle main ^<commit>`) is taken in the same way, as
 long as what it builds on is here. This is the way in for a repository with
 very many refs: git's own push over HTTP compares every ref it sends with
@@ -243,6 +246,33 @@ says whether it would work (`{"mergeable": ..., "conflicts": [...]}`). A
 merge appears in the event feed as a push by `actor`, with a `merge` field.
 The pre-receive hook is not asked: the application is the one calling.
 
+### Metrics
+
+`GET /metrics` answers in the text format Prometheus scrapes. With an admin
+token it takes that token, like the management API:
+
+```yaml
+scrape_configs:
+  - job_name: strata
+    authorization: { credentials: "<admin token>" }
+    static_configs: [{ targets: ["strata:8080"] }]
+```
+
+| | |
+|---|---|
+| `strata_http_requests_total{handler,status}`, `strata_http_request_duration_seconds{handler}`, `strata_http_requests_in_flight` | Requests by what they asked for: `info-refs`, `upload-pack`, `receive-pack`, `content`, `merge`, `import`, `events`, `repos`, `compact`. Timed until the answer starts. |
+| `strata_fetches_total{result}`, `strata_fetch_bytes_total`, `strata_fetch_duration_seconds` | Fetch responses to their end, at the pace the client reads: `sent`, `aborted` (the client left) or `error`. |
+| `strata_pushes_total{result}`, `strata_push_bytes_total`, `strata_push_wait_seconds` | Pushes `accepted` or `rejected`, the pack data they brought, and how long they were held back for compaction (`--wait-at`). |
+| `strata_compactions_total{result}`, `strata_compaction_duration_seconds`, `strata_compaction_objects_total`, `strata_compactions_pending` | Compaction: runs that `merged` packs, found `nothing` to do or ended in `error`, and the repositories waiting. |
+| `strata_hook_requests_total{hook,result}`, `strata_hook_duration_seconds{hook}`, `strata_authz_cache_total{result}` | The application's `authz` and `pre-receive` hooks, and how often an authorization was answered from memory. |
+| `strata_meta_requests_total{op,result}`, `strata_meta_duration_seconds{op}` | Calls to the metadata store. `conflict` is a change that lost to a concurrent one. |
+| `strata_object_store_requests_total{op,result}`, `strata_object_store_duration_seconds{op}`, `strata_object_store_bytes_total{direction}` | Calls to object storage, and the bytes `read` and `written`. |
+| `strata_cache_bytes{cache}` | Memory held by the caches of pack `blocks`, `objects` and `indexes`. |
+| `strata_build_info{version}`, `process_*` | The version, and on Linux the process's CPU time, memory and open files. |
+
+No label names a repository: there may be millions, and each would be a time
+series of its own. Which repository was slow is in the log.
+
 The server speaks plain HTTP: put TLS in front of it.
 
 [`examples/k8s`](examples/k8s) runs several nodes on Kubernetes, as a plain
@@ -251,7 +281,9 @@ a local kind cluster: pods are deleted, replaced and added while pushes go on.
 
 [`examples/hub`](examples/hub) is such an application, small but whole:
 accounts, organizations, private repositories, a protected default branch,
-signed commits, a code browser, pull requests and an activity feed, in Bun, Hono and React.
+signed commits, a code browser, pull requests, an activity feed, mirrors of
+repositories on GitHub, and sign-in with Entra ID, Google Workspace or
+GitHub, in Bun, Hono and React.
 
 ## Test
 

@@ -32,6 +32,10 @@ pub(crate) struct Queue {
 }
 
 impl App {
+    pub(crate) fn compactions_pending(&self) -> usize {
+        self.compactions.pending.lock().unwrap().len()
+    }
+
     pub(crate) fn request_compaction(&self, repo: &str) {
         self.compactions.pending.lock().unwrap().insert(repo.to_string());
         self.compactions.wake.notify_one();
@@ -72,7 +76,14 @@ pub async fn compact(app: &App, name: &str, full: bool) -> anyhow::Result<Option
     if !app.meta.try_lease(&lease, &app.node_id, COMPACTION_LEASE_SECS).await? {
         return Ok(None);
     }
+    let started = std::time::Instant::now();
     let result = compact_leased(app, name, full).await;
+    let (outcome, objects) = match &result {
+        Ok(Some(report)) => ("merged", report.objects),
+        Ok(None) => ("nothing", 0),
+        Err(_) => ("error", 0),
+    };
+    app.metrics.compaction(outcome, objects, started.elapsed());
     if let Err(e) = app.meta.release_lease(&lease, &app.node_id).await {
         tracing::warn!(repo = name, "releasing compaction lease failed: {e}");
     }

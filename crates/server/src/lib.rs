@@ -20,11 +20,13 @@ mod content;
 mod hooks;
 mod import;
 mod merge;
+mod metrics;
 mod receive_pack;
 mod upload_pack;
 
 use auth::Access;
 pub use compaction::{compact, spawn_background, sweep, sweep_orphans, CompactionReport};
+pub use metrics::Metrics;
 
 /// Fetch requests are negotiation only; anything larger is not a git client.
 const MAX_FETCH_REQUEST: usize = 16 << 20;
@@ -114,19 +116,27 @@ pub struct App {
     hooks: hooks::Hooks,
     /// Recent answers of the authorization hook.
     decisions: Option<moka::sync::Cache<String, auth::Decision>>,
+    pub(crate) metrics: Arc<Metrics>,
 }
 
 impl App {
     pub fn new(meta: Arc<dyn MetaStore>, packs: PackStore, options: Options) -> App {
+        App::with_metrics(meta, packs, options, Arc::new(Metrics::new()))
+    }
+
+    /// As [`App::new`], counting into `metrics`: the ones the object storage
+    /// behind `packs` was wrapped with, see [`Metrics::metered_store`].
+    pub fn with_metrics(meta: Arc<dyn MetaStore>, packs: PackStore, options: Options, metrics: Arc<Metrics>) -> App {
         // Two TLS backends are linked in (by different dependencies); the HTTP
         // and gRPC clients need to be told which one to use.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let decisions = (!options.authz_cache.is_zero())
             .then(|| moka::sync::Cache::builder().max_capacity(100_000).time_to_live(options.authz_cache).build());
         App {
-            meta,
+            meta: metrics.metered_meta(meta),
             packs,
-            hooks: hooks::Hooks::new(options.hook_secret.clone()),
+            hooks: hooks::Hooks::new(options.hook_secret.clone(), metrics.clone()),
+            metrics,
             decisions,
             options,
             node_id: PackStore::new_pack_id(),
@@ -188,10 +198,15 @@ pub(crate) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + '
 }
 
 async fn handle(State(app): State<Arc<App>>, method: Method, uri: Uri, headers: HeaderMap, body: Body) -> Response {
-    match route(&app, method, &uri, &headers, body).await {
+    let counted = metrics::handler(uri.path()).map(|handler| (handler, std::time::Instant::now(), app.metrics.begin()));
+    let response = match route(&app, method, &uri, &headers, body).await {
         Ok(response) => response,
         Err(e) => e.into_response(),
+    };
+    if let Some((handler, started, _in_flight)) = counted {
+        app.metrics.request(handler, response.status(), started.elapsed());
     }
+    response
 }
 
 fn method_not_allowed() -> HttpError {
@@ -213,6 +228,15 @@ async fn route(app: &App, method: Method, uri: &Uri, headers: &HeaderMap, body: 
                 Err(HttpError::new(StatusCode::SERVICE_UNAVAILABLE, "the metadata store cannot be reached"))
             }
         };
+    }
+    if path == "metrics" {
+        // What the node is doing is not for everyone: the admin token, as for the management API.
+        auth::authorize_admin(app, headers)?;
+        app.metrics.compactions_pending.set(app.compactions_pending() as i64);
+        for (cache, bytes) in app.packs.cache_bytes() {
+            app.metrics.cache_bytes.with_label_values(&[cache]).set(bytes as i64);
+        }
+        return Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], app.metrics.render()).into_response());
     }
     if path == "api/events" {
         auth::authorize_admin(app, headers)?;

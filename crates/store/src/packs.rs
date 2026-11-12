@@ -184,6 +184,11 @@ impl PackStore {
         }
     }
 
+    /// Bytes each of the caches holds right now, by name.
+    pub fn cache_bytes(&self) -> [(&'static str, u64); 3] {
+        [("blocks", self.blocks.cache.weighted_size()), ("objects", self.objects.0.weighted_size()), ("indexes", self.opened.weighted_size() << 10)]
+    }
+
     /// A fresh id for a pack about to be written.
     pub fn new_pack_id() -> String {
         uuid::Uuid::new_v4().simple().to_string()

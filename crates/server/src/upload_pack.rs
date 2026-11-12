@@ -214,9 +214,18 @@ async fn fetch(app: &App, repo: &RepoState, args: &[&[u8]]) -> Result<Body, Http
     // bounded channel, so a slow client holds back the producer instead of
     // letting the pack pile up in memory.
     let (tx, rx) = mpsc::channel(4);
+    let metrics = app.metrics.clone();
     tokio::task::spawn_blocking(move || {
-        let mut out = ChannelWriter { tx, buf: Vec::with_capacity(CHANNEL_CHUNK) };
-        match fetch_response(&packs, &fetch, &mut out).and_then(|()| out.flush().map_err(io_error)) {
+        let mut out = ChannelWriter { tx, buf: Vec::with_capacity(CHANNEL_CHUNK), sent: 0 };
+        let started = std::time::Instant::now();
+        let result = fetch_response(&packs, &fetch, &mut out).and_then(|()| out.flush().map_err(io_error));
+        let outcome = match &result {
+            Ok(()) => "sent",
+            Err(Error::Io(_)) => "aborted",
+            Err(_) => "error",
+        };
+        metrics.fetch(outcome, out.sent, started.elapsed());
+        match result {
             Ok(()) => {}
             // The client hung up; nobody is left to tell.
             Err(Error::Io(reason)) => tracing::debug!(repo = repo_name, "fetch aborted: {reason}"),
@@ -232,6 +241,8 @@ const CHANNEL_CHUNK: usize = 64 << 10;
 struct ChannelWriter {
     tx: mpsc::Sender<std::io::Result<Bytes>>,
     buf: Vec<u8>,
+    /// Bytes handed to the response so far.
+    sent: u64,
 }
 
 impl Write for ChannelWriter {
@@ -248,6 +259,7 @@ impl Write for ChannelWriter {
             return Ok(());
         }
         let chunk = Bytes::from(std::mem::replace(&mut self.buf, Vec::with_capacity(CHANNEL_CHUNK)));
+        self.sent += chunk.len() as u64;
         self.tx.blocking_send(Ok(chunk)).map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client disconnected"))
     }
 }
@@ -526,9 +538,18 @@ pub(crate) async fn handle_v0(app: &App, repo: RepoState, body: Bytes) -> Result
     let repo_name = repo.name.clone();
     let (fetch, packs) = load_sparse(app, &repo, packs, fetch).await?.map_err(|_| HttpError::bad_request("the sparse filter does not name a file of patterns"))?;
     let (tx, rx) = mpsc::channel(4);
+    let metrics = app.metrics.clone();
     tokio::task::spawn_blocking(move || {
-        let mut out = ChannelWriter { tx, buf: Vec::with_capacity(CHANNEL_CHUNK) };
-        match respond_v0(&packs, &fetch, ack, sideband, negotiating, &mut out).and_then(|()| out.flush().map_err(io_error)) {
+        let mut out = ChannelWriter { tx, buf: Vec::with_capacity(CHANNEL_CHUNK), sent: 0 };
+        let started = std::time::Instant::now();
+        let result = respond_v0(&packs, &fetch, ack, sideband, negotiating, &mut out).and_then(|()| out.flush().map_err(io_error));
+        let outcome = match &result {
+            Ok(()) => "sent",
+            Err(Error::Io(_)) => "aborted",
+            Err(_) => "error",
+        };
+        metrics.fetch(outcome, out.sent, started.elapsed());
+        match result {
             Ok(()) => {}
             Err(Error::Io(reason)) => tracing::debug!(repo = repo_name, "fetch aborted: {reason}"),
             Err(e) => tracing::error!(repo = repo_name, "fetch failed: {e}"),
