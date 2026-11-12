@@ -1,0 +1,7 @@
+# Where the hub's database is copied to, when HUB_DB_REPLICA is set.
+dbs:
+  - path: ${HUB_DB}
+    replica:
+      url: ${HUB_DB_REPLICA}
+      # What a crash can lose. A stop that is asked for loses nothing.
+      sync-interval: 5s

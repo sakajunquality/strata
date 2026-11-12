@@ -14,10 +14,10 @@ use strata_store::{open_meta, CacheConfig, PackStore};
 #[derive(Parser)]
 #[command(about = "Git server with separated storage and compute")]
 struct Args {
-    #[arg(long, default_value = "127.0.0.1:8080")]
+    #[arg(long, env = "STRATA_LISTEN", default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
     /// Holds the metadata (unless --meta is given) and the packs (unless --object-store is given).
-    #[arg(long, default_value = "./data")]
+    #[arg(long, env = "STRATA_DATA_DIR", default_value = "./data")]
     data_dir: PathBuf,
     /// Where refs and pack lists are stored, as a URL. Several nodes need a
     /// shared one: postgres://user:password@host/database or
@@ -28,7 +28,7 @@ struct Args {
     /// Where packs are stored, as a URL: s3://bucket/prefix, gs://bucket/prefix,
     /// az://container/prefix or file:///path. Credentials come from the usual
     /// AWS_*, GOOGLE_* and AZURE_* environment variables.
-    #[arg(long)]
+    #[arg(long, env = "STRATA_OBJECT_STORE")]
     object_store: Option<String>,
     /// Also serve git over SSH, on this address (0.0.0.0:22, say). Clients
     /// are known by their keys, which the authorization hook is shown as
@@ -61,7 +61,7 @@ struct Args {
     authz_url: Option<String>,
     /// Seconds to reuse an answer from the authorization hook: a revoked
     /// permission keeps working that long. 0 asks every time.
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, env = "STRATA_AUTHZ_CACHE_SECS", default_value_t = 10)]
     authz_cache_secs: u64,
     /// The application's push rules. Each push is POSTed to it before it is
     /// committed, as {"repo", "actor", "updates"}; it answers {"allow": true}
@@ -75,7 +75,7 @@ struct Args {
     #[arg(long, default_value_t = 604800)]
     event_retention_secs: u64,
     /// Where incoming packs are spooled while they are validated [default: the system temp directory].
-    #[arg(long)]
+    #[arg(long, env = "STRATA_SCRATCH_DIR")]
     scratch_dir: Option<PathBuf>,
     /// Compact a repository once a push leaves it with this many packs.
     #[arg(long, default_value_t = 8)]
@@ -97,13 +97,13 @@ struct Args {
     #[arg(long, default_value_t = 86400)]
     orphan_grace_secs: u64,
     /// Memory for cached pack blocks, in MiB.
-    #[arg(long, default_value_t = 1024)]
+    #[arg(long, env = "STRATA_BLOCK_CACHE_MB", default_value_t = 1024)]
     block_cache_mb: u64,
     /// Memory for cached commits, trees and small blobs, in MiB.
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, env = "STRATA_OBJECT_CACHE_MB", default_value_t = 256)]
     object_cache_mb: u64,
     /// Memory for loaded pack indexes, commit-graphs and bitmaps, in MiB.
-    #[arg(long, default_value_t = 2048)]
+    #[arg(long, env = "STRATA_INDEX_CACHE_MB", default_value_t = 2048)]
     index_cache_mb: u64,
 }
 

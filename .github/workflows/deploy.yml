@@ -1,0 +1,81 @@
+# Builds the two images and rolls the Cloud Run services of the experiment
+# described in examples/cloud-run. Run by hand: Actions -> deploy -> Run workflow.
+#
+# Everything it deploys to (service accounts, the two services and their
+# settings, Spanner, buckets) is made elsewhere, by Terraform. This workflow
+# only changes which image the services run.
+#
+# It signs in through Workload Identity Federation: no key is stored here.
+# Where it deploys is in the repository's variables (Settings -> Secrets and
+# variables -> Actions -> Variables):
+#
+#   GCP_PROJECT             the project's id
+#   GCP_REGION              the region of the services and the image registry
+#   GCP_WIF_PROVIDER        projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+#   GCP_DEPLOY_SA           the service account to deploy as, by its address
+#   GCP_ARTIFACT_REPO       the Artifact Registry repository the images go to
+name: deploy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+env:
+  REGION: ${{ vars.GCP_REGION }}
+  PROJECT: ${{ vars.GCP_PROJECT }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Name the images
+        env:
+          REPO: ${{ vars.GCP_ARTIFACT_REPO }}
+        run: |
+          for name in REGION PROJECT REPO; do
+            [ -n "${!name}" ] || { echo "::error::the repository variable for $name is not set"; exit 1; }
+          done
+          echo "REGISTRY=$REGION-docker.pkg.dev/$PROJECT/$REPO" >> "$GITHUB_ENV"
+          echo "TAG=${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Configure docker for Artifact Registry
+        run: gcloud auth configure-docker "$REGION-docker.pkg.dev" --quiet
+
+      - name: Build and push strata
+        run: |
+          docker build -t "$REGISTRY/strata:$TAG" .
+          docker push "$REGISTRY/strata:$TAG"
+
+      - name: Build and push the hub
+        run: |
+          docker build -t "$REGISTRY/strata-hub:$TAG" examples/hub
+          docker push "$REGISTRY/strata-hub:$TAG"
+
+      # Terraform owns the services' settings and ignores their image, so
+      # this never fights an apply. strata first: the hub of a new version
+      # may ask it for something an old one does not know.
+      - name: Roll strata
+        run: gcloud run services update strata --project "$PROJECT" --region "$REGION" --image "$REGISTRY/strata:$TAG"
+
+      - name: Roll the hub
+        run: gcloud run services update strata-hub --project "$PROJECT" --region "$REGION" --image "$REGISTRY/strata-hub:$TAG"
+
+      - name: Where they are
+        run: |
+          for service in strata strata-hub; do
+            gcloud run services describe "$service" --project "$PROJECT" --region "$REGION" --format 'value(metadata.name,status.url)'
+          done

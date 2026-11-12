@@ -41,6 +41,13 @@ To run the hub against a Strata started elsewhere, `bun run server` with:
 
 and Strata with `--authz-url http://<hub>/hooks/authz --pre-receive-url http://<hub>/hooks/pre-receive`.
 
+As a container: `docker build -t strata-hub examples/hub`. It listens on
+0.0.0.0:8080 and keeps its SQLite file at `/data/hub.sqlite`. Where the
+container's disk does not outlive it, set `HUB_DB_REPLICA` (`gs://bucket/path`
+or `s3://bucket/path`): the hub then runs under [Litestream](https://litestream.io),
+which fetches the file from there on start and copies every change back. One
+instance only. [examples/cloud-run](../cloud-run) uses it.
+
 ## Signing in elsewhere
 
 Each of these is switched on by giving its client id, and then shows as a

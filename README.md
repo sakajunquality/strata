@@ -111,6 +111,13 @@ the schema, once).
 
 Node clocks time leases and grace periods; keep them within seconds of each other.
 
+Where arguments are awkward (a container platform that only sets variables),
+the same choices can be made in the environment: `STRATA_LISTEN`,
+`STRATA_DATA_DIR`, `STRATA_META`, `STRATA_OBJECT_STORE`, `STRATA_SCRATCH_DIR`
+and `STRATA_BLOCK_CACHE_MB`, `STRATA_OBJECT_CACHE_MB`, `STRATA_INDEX_CACHE_MB`.
+[examples/cloud-run](examples/cloud-run) runs the server and the hub that way
+on Cloud Run, with Spanner and Cloud Storage.
+
 ## Building on it
 
 Strata talks to one application, which owns everything about people. There
