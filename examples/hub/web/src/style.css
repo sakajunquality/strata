@@ -106,3 +106,10 @@ pre { font-family: var(--mono); font-size: 13px; line-height: 20px; margin: 0; }
 
 .full { width: 100%; }
 .mirror-note { margin-bottom: 16px; }
+
+.standing { list-style: none; margin: 0; padding: 0; }
+.standing li { display: flex; align-items: baseline; gap: 6px; padding: 3px 0; flex-wrap: wrap; }
+.check-success { color: #1a7f37; }
+.check-pending { color: #9a6700; }
+.check-failure { color: #cf222e; }
+.clone code + p { margin-bottom: 10px; }

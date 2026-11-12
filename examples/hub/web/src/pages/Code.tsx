@@ -35,16 +35,22 @@ function Crumbs({ root, repo, rev, path }: { root: string; repo: string; rev: st
   );
 }
 
-function CloneButton({ url }: { url: string }) {
+function CloneButton({ url, sshUrl }: { url: string; sshUrl: string | null }) {
   return (
     <Popover
       trigger="click"
       placement="bottomRight"
-      title="Clone over HTTP"
+      title="Clone"
       content={
         <div className="clone">
           <Typography.Text code copyable>{url}</Typography.Text>
-          <p className="muted small">Sign in with your user name and an access token or your password.</p>
+          <p className="muted small">Over HTTP: sign in with your user name and an access token or your password.</p>
+          {sshUrl && (
+            <>
+              <Typography.Text code copyable>{sshUrl}</Typography.Text>
+              <p className="muted small">Over SSH: with a key you have <Link to="/settings/keys">registered</Link>.</p>
+            </>
+          )}
         </div>
       }
     >
@@ -112,7 +118,7 @@ export function CodePage(context: RepoContext) {
         <RevSelect repo={repo} rev={rev} to={(next) => `${root}/tree/${urlPath(next)}${path ? `/${urlPath(path)}` : ""}`} />
         <Crumbs root={root} repo={repo.name} rev={rev} path={path} />
         <span className="grow" />
-        <CloneButton url={repo.cloneUrl} />
+        <CloneButton url={repo.cloneUrl} sshUrl={repo.sshUrl} />
       </div>
       <Loaded from={tree}>
         {(data) => {

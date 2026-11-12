@@ -29,10 +29,10 @@ export function Keys() {
   };
 
   return (
-    <Card title="Signing keys" className="medium wide">
+    <Card title="SSH and signing keys" className="medium wide">
       <Typography.Paragraph className="muted">
-        Commits signed with a key listed here are shown as verified, and are let into branches that take signed commits only.
-        Add the public half of the key git signs with: an SSH key (<code>git config gpg.format ssh</code>) or an OpenPGP key (<code>gpg --armor --export</code>).
+        An SSH key listed here lets git in over SSH as you, where the server offers that. Commits signed with a key listed here are shown as verified, and are let into branches that take signed commits only.
+        Add the public half: an SSH key (as in <code>~/.ssh/id_ed25519.pub</code>; to sign with it, <code>git config gpg.format ssh</code>) or an OpenPGP key (<code>gpg --armor --export</code>), which only signs.
       </Typography.Paragraph>
       <Form form={form} layout="vertical" onFinish={add} requiredMark={false} className="form-alert">
         <Form.Item name="title" label="Name">
@@ -59,7 +59,7 @@ export function Keys() {
                 key: "remove",
                 align: "right",
                 render: (_, key) => (
-                  <Popconfirm title="Remove this key? Commits signed with it stop being verified." okText="Remove" onConfirm={() => remove(key.id)}>
+                  <Popconfirm title="Remove this key? Commits signed with it stop being verified, and git can no longer sign in with it." okText="Remove" onConfirm={() => remove(key.id)}>
                     <Button danger size="small">Remove</Button>
                   </Popconfirm>
                 ),

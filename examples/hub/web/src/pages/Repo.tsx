@@ -52,7 +52,7 @@ function Branches({ repo, root }: RepoContext) {
             <>
               <Link to={`${root}/tree/${urlPath(name)}`}>{name}</Link>
               {name === repo.defaultBranch && names === repo.branches && <Tag className="tag-gap">default</Tag>}
-              {name === repo.defaultBranch && names === repo.branches && repo.protectDefault && <Tag icon={<LockOutlined />}>protected</Tag>}
+              {names === repo.branches && repo.branches.find((branch) => branch.name === name)?.protected && <Tag icon={<LockOutlined />}>protected</Tag>}
             </>
           ),
         },

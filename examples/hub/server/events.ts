@@ -4,6 +4,7 @@
 import { db, repoById } from "./db";
 import { followPush } from "./pulls";
 import { strata, type StrataEvent } from "./strata";
+import { emit, repoJson } from "./webhooks";
 
 const CURSOR = "events_cursor";
 
@@ -22,7 +23,10 @@ async function record(event: StrataEvent) {
   const updates = event.event.updates ?? [];
   db.run("INSERT INTO activity (repo_id, actor, time, updates) VALUES (?, ?, ?, ?)", [repo.id, event.event.actor ?? null, event.time, JSON.stringify(updates)]);
   db.run("UPDATE repos SET pushed_at = ? WHERE id = ?", [event.time, repo.id]);
-  await followPush(repo, updates);
+  for (const update of updates) {
+    emit(repo, "push", { ref: update.ref, before: update.old, after: update.new, change: update.change, created: !update.old, deleted: !update.new, forced: update.change === "forced", repository: repoJson(repo), sender: event.event.actor ?? null });
+  }
+  await followPush(repo, updates, event.event.actor ?? null);
 
   // HEAD names "main" until told otherwise. If that branch is not there but
   // another is (a first push of "master", say), make the other the default.

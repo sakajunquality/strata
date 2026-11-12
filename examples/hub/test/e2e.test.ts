@@ -13,6 +13,7 @@ const hubPort = strataPort + 1000;
 const hub = `http://127.0.0.1:${hubPort}`;
 const elsewherePort = strataPort + 2000;
 const elsewhere = `http://127.0.0.1:${elsewherePort}`;
+const sshPort = strataPort + 3000;
 const tmp = mkdtempSync(join(tmpdir(), "strata-hub-"));
 const children: Bun.Subprocess[] = [];
 // gpg talks to its agent over a socket in here, and socket paths have to be short.
@@ -34,7 +35,9 @@ async function up(url: string) {
  */
 const outside = {
   /** Who signs in next. */
-  person: { sub: "", preferred_username: "", name: "", id: 0, login: "" },
+  person: { sub: "", preferred_username: "", name: "", id: 0, login: "", groups: null as string[] | null, teams: [] as string[] },
+  /** What webhooks delivered to /webhook. */
+  delivered: [] as { event: string; signature: string; body: string }[],
   /** Sign-ins under way, by the code handed out: what the token has to answer. */
   codes: new Map<string, { nonce: string; challenge: string }>(),
 };
@@ -72,7 +75,7 @@ async function startElsewhere() {
           const asked = await redeem(request, "oidc-secret");
           if (!asked) return Response.json({ error: "invalid_grant" }, { status: 400 });
           const { sub, preferred_username, name } = outside.person;
-          const token = new SignJWT({ nonce: asked.nonce, preferred_username, name }).setProtectedHeader({ alg: "RS256", kid: "k1" }).setIssuer(`${elsewhere}/oidc`).setAudience("hub-at-oidc").setSubject(sub).setIssuedAt().setExpirationTime("5m");
+          const token = new SignJWT({ nonce: asked.nonce, preferred_username, name, ...(outside.person.groups ? { groups: outside.person.groups } : {}) }).setProtectedHeader({ alg: "RS256", kid: "k1" }).setIssuer(`${elsewhere}/oidc`).setAudience("hub-at-oidc").setSubject(sub).setIssuedAt().setExpirationTime("5m");
           return Response.json({ id_token: await token.sign(privateKey), token_type: "Bearer", access_token: "unused" });
         }
         case "/login/oauth/access_token":
@@ -80,6 +83,13 @@ async function startElsewhere() {
         case "/api/user":
           if (request.headers.get("authorization") !== "Bearer gho_test") return new Response("", { status: 401 });
           return Response.json({ id: outside.person.id, login: outside.person.login, name: outside.person.name });
+      }
+      if (url.pathname === "/api/user/teams") {
+        return Response.json(outside.person.teams.map((team) => ({ slug: team.split("/")[1], organization: { login: team.split("/")[0] } })));
+      }
+      if (url.pathname === "/webhook") {
+        outside.delivered.push({ event: request.headers.get("x-hub-event") ?? "", signature: request.headers.get("x-hub-signature-256") ?? "", body: await request.text() });
+        return new Response("ok");
       }
       // Anything else is a repository being fetched.
       const headers = new Headers(request.headers);
@@ -105,6 +115,9 @@ beforeAll(async () => {
     HUB_GITHUB_CLIENT_SECRET: "github-secret",
     HUB_MIRROR_DIR: join(tmp, "mirrors"),
     HUB_MIRROR_MINUTES: "0",
+    // What stands in for a webhook's receiver is on this machine.
+    HUB_WEBHOOKS_INSIDE: "1",
+    STRATA_SSH_URL: `ssh://git@127.0.0.1:${sshPort}`,
     HUB_PORT: String(hubPort),
     HUB_DB: join(tmp, "hub.sqlite"),
     STRATA_URL: `http://127.0.0.1:${strataPort}`,
@@ -115,6 +128,7 @@ beforeAll(async () => {
   spawn([
     strataBin,
     "--listen", `127.0.0.1:${strataPort}`,
+    "--ssh-listen", `127.0.0.1:${sshPort}`,
     "--data-dir", join(tmp, "strata"),
     "--authz-url", `${hub}/hooks/authz`,
     "--pre-receive-url", `${hub}/hooks/pre-receive`,
@@ -153,9 +167,20 @@ function browser() {
 }
 
 function git(dir: string, ...args: string[]) {
+  return gitWith({}, dir, ...args);
+}
+
+/** git over SSH, as whoever holds the key in that file. */
+function gitAs(key: string, dir: string, ...args: string[]) {
+  const ssh = `ssh -F /dev/null -i ${key} -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o BatchMode=yes`;
+  return gitWith({ GIT_SSH_COMMAND: ssh }, dir, ...args);
+}
+
+function gitWith(more: Record<string, string>, dir: string, ...args: string[]) {
   const result = Bun.spawnSync(["git", ...args], {
     cwd: dir,
     env: {
+      ...more,
       PATH: process.env.PATH!,
       HOME: tmp,
       GNUPGHOME: gnupg,
@@ -264,14 +289,17 @@ test("a small code host, end to end", async () => {
   expect(git(work, "push", "-q", remote("bob:battery%20staple", "acme/widget"), "trunk").err).toBe("");
 
   // Rules for the default branch are the hub's, enforced before the push commits.
-  expect((await alice("PATCH", "/repos/acme/widget", { protectDefault: true })).status).toBe(200);
+  const guarded = await alice("POST", "/repos/acme/widget/rules", { pattern: "tr*" });
+  expect(guarded.data.rules).toMatchObject([{ pattern: "tr*", noForce: true, noDelete: true, requirePulls: false }]);
+  expect((await bob("POST", "/repos/acme/widget/rules", { pattern: "x" })).status).toBe(403);
+  expect((await alice("GET", "/repos/acme/widget")).data.branches).toMatchObject([{ name: "trunk", protected: true }]);
   git(work, "commit", "-q", "--amend", "-m", "Say hi, rewritten");
   const forced = git(work, "push", "-q", "--force", remote(`bob:${bobToken}`, "acme/widget"), "trunk");
   expect(forced.ok).toBe(false);
   expect(forced.err).toContain("trunk is protected and does not accept force pushes");
   expect(git(work, "push", "-q", remote(`bob:${bobToken}`, "acme/widget"), ":trunk").err).toContain("cannot be deleted");
   expect(git(work, "push", "-q", "--force", remote(`bob:${bobToken}`, "acme/widget"), "trunk:topic/x").err).toBe("");
-  expect((await alice("PATCH", "/repos/acme/widget", { protectDefault: false })).status).toBe(200);
+  expect((await alice("DELETE", `/repos/acme/widget/rules/${guarded.data.rules[0].id}`)).status).toBe(200);
   expect(git(work, "push", "-q", "--force", remote(`bob:${bobToken}`, "acme/widget"), "trunk").err).toBe("");
   const head = git(work, "rev-parse", "HEAD").out;
 
@@ -350,7 +378,7 @@ test("pull requests", async () => {
 
   let pull = (await dave("GET", `${pulls}/1`)).data;
   expect(pull).toMatchObject({ mergeable: true, conflicts: [], can: { change: true, merge: false }, compare: { ahead: 1 } });
-  expect((await anyone("GET", `${pulls}/1`)).data.can).toEqual({ change: false, merge: false });
+  expect((await anyone("GET", `${pulls}/1`)).data.can).toMatchObject({ change: false, merge: false });
   expect((await anyone("POST", `${pulls}/1/comments`, { body: "hello" })).status).toBe(401);
   expect((await dave("POST", `${pulls}/1/comments`, { body: "  " })).status).toBe(400);
   expect((await dave("POST", `${pulls}/1/comments`, { body: "Ready when you are." })).status).toBe(201);
@@ -375,7 +403,7 @@ test("pull requests", async () => {
   expect((await carol("GET", `${pulls}/1`)).data).toMatchObject({ mergeable: true, compare: { head: settled, behind: 0 } });
 
   // With pull requests required, the default branch takes nothing else.
-  expect((await carol("PATCH", "/repos/carol/site", { requirePulls: true })).status).toBe(200);
+  const viaPulls = (await carol("POST", "/repos/carol/site/rules", { pattern: "main", requirePulls: true })).data.rules[0];
   git(work, "checkout", "-q", "main");
   commit("direct.txt", "direct\n", "Straight to main");
   expect(git(work, "push", "-q", origin, "main").err).toContain("main only takes changes through pull requests");
@@ -416,7 +444,7 @@ test("pull requests", async () => {
   expect(git(work, "diff", "--stat", "FETCH_HEAD", "second").out).toBe("");
 
   // Merged by hand and pushed: the hub notices.
-  expect((await carol("PATCH", "/repos/carol/site", { requirePulls: false })).status).toBe(200);
+  expect((await carol("DELETE", `/repos/carol/site/rules/${viaPulls.id}`)).status).toBe(200);
   git(work, "checkout", "-q", "-B", "main", "FETCH_HEAD");
   git(work, "checkout", "-q", "-b", "third");
   const third = commit("d.txt", "d\n", "Add d");
@@ -493,8 +521,8 @@ test("signed commits", async () => {
   expect(listed[0].signature).toBeUndefined();
 
   // Required: the default branch takes nothing else, anywhere in a push.
-  expect((await erin("PATCH", "/repos/erin/sealed", { requireSigned: true })).status).toBe(200);
-  expect((await anyone("GET", "/repos/erin/sealed")).data.requireSigned).toBe(true);
+  expect((await erin("POST", "/repos/erin/sealed/rules", { pattern: "main", requireSigned: true })).status).toBe(200);
+  expect((await anyone("GET", "/repos/erin/sealed/rules")).data.rules).toMatchObject([{ pattern: "main", requireSigned: true }]);
   const unsigned = commit("Unsigned again");
   let refused = git(work, "push", "-q", origin, "main");
   expect(refused.err).toContain(`main takes signed commits only, and ${unsigned.slice(0, 7)} is not signed`);
@@ -670,7 +698,7 @@ test("mirrors of repositories on GitHub", async () => {
   await Bun.sleep(1100);
   expect((await mia("POST", "/repos/mia/copy/mirror/sync")).status).toBe(202);
   copy = await eventually(() => synced("/repos/mia/copy", asked + 1));
-  expect(copy.branches).toEqual([{ name: "next", oid: first }, { name: "trunk", oid: second }]);
+  expect(copy.branches).toMatchObject([{ name: "next", oid: first }, { name: "trunk", oid: second }]);
   expect(copy.tags.map((tag: { name: string }) => tag.name)).toEqual(["light", "v1"]);
   expect(git(clone, "pull", "-q").ok).toBe(true);
   expect(git(clone, "rev-parse", "HEAD").out).toBe(second);
@@ -691,7 +719,7 @@ test("mirrors of repositories on GitHub", async () => {
   expect(failed.error).toBe("mia/source is not there, or is private: a private repository needs an access token");
   expect((await mia("POST", "/repos", { name: "lit", mirror: "mia/source", mirrorToken: token, mirrorPulls: true })).status).toBe(201);
   const lit = await eventually(() => synced("/repos/mia/lit"));
-  expect(lit.branches).toEqual(copy.branches);
+  expect(lit.branches).toMatchObject(copy.branches);
   expect(JSON.stringify(lit)).not.toContain(token);
 
   // Let go of its source, it is a repository like any other.
@@ -699,3 +727,185 @@ test("mirrors of repositories on GitHub", async () => {
   expect((await mia("GET", "/repos/mia/copy")).data.mirror).toBeNull();
   expect(git(work, "push", "-q", remote(`mia:${token}`, "mia/copy"), "trunk:other").ok).toBe(true);
 });
+
+test("teams, SSH, branch rules, reviews, checks and webhooks", async () => {
+  const [olga, pat, quin] = [browser(), browser(), browser()];
+  for (const [who, name] of [[olga, "olga"], [pat, "pat"], [quin, "quin"]] as const) expect((await who("POST", "/signup", { username: name, password: "correct horse" })).status).toBe(201);
+  expect((await olga("POST", "/orgs", { name: "orbit" })).status).toBe(201);
+  expect((await olga("POST", "/repos", { owner: "orbit", name: "core", private: true })).status).toBe(201);
+  expect((await olga("POST", "/repos", { owner: "orbit", name: "docs", private: true })).status).toBe(201);
+  const core = "/repos/orbit/core";
+
+  // ---- Teams: members get what the organization gives everyone, and what their teams add.
+  expect((await olga("PUT", "/owners/orbit/members/pat", { role: "member" })).status).toBe(200);
+  expect((await pat("GET", core)).data.permission).toBe("write");
+  expect((await pat("PATCH", "/owners/orbit", { basePermission: "none" })).status).toBe(403);
+  expect((await olga("PATCH", "/owners/orbit", { basePermission: "none" })).status).toBe(200);
+  expect((await pat("GET", core)).status).toBe(404);
+  expect((await pat("POST", "/owners/orbit/teams", { name: "engine" })).status).toBe(403);
+  expect((await olga("POST", "/owners/orbit/teams", { name: "engine", description: "Those who build it" })).status).toBe(201);
+  expect((await olga("POST", "/owners/orbit/teams", { name: "Engine" })).status).toBe(409);
+  expect((await olga("PUT", "/owners/orbit/teams/engine/repos/core", { level: "write" })).status).toBe(200);
+  expect((await olga("PUT", "/owners/orbit/teams/engine/repos/nope", { level: "write" })).status).toBe(404);
+  expect((await pat("GET", core)).status).toBe(404);
+  expect((await olga("PUT", "/owners/orbit/teams/engine/members/pat")).status).toBe(200);
+  expect((await pat("GET", core)).data.permission).toBe("write");
+  expect((await pat("GET", "/repos/orbit/docs")).status).toBe(404);
+  expect((await pat("GET", "/owners/orbit/teams")).data.teams).toMatchObject([{ name: "engine", members: 1, repos: 1 }]);
+  expect((await olga("GET", core)).data.access).toEqual({ base: "none", teams: [{ name: "engine", level: "write" }] });
+  // Not the business of those outside; joining a team is joining the organization.
+  expect((await quin("GET", "/owners/orbit/teams")).status).toBe(404);
+  expect((await olga("PUT", "/owners/orbit/teams/engine/members/quin")).status).toBe(200);
+  expect((await quin("GET", "/owners/orbit/teams/engine")).data).toMatchObject({ members: ["pat", "quin"], repos: [{ name: "core", level: "write" }], canChange: false });
+  // Out of the organization is out of its teams.
+  expect((await olga("DELETE", "/owners/orbit/members/quin")).status).toBe(200);
+  expect((await quin("GET", core)).status).toBe(404);
+  expect((await olga("GET", "/owners/orbit/teams/engine")).data.members).toEqual(["pat"]);
+
+  // A team that follows a group at a sign-in provider is filled by signing in.
+  expect((await olga("POST", "/owners/orbit/teams", { name: "readers", ssoProvider: "oidc" })).status).toBe(400);
+  expect((await olga("POST", "/owners/orbit/teams", { name: "readers", ssoProvider: "oidc", ssoGroup: "Docs-Readers" })).status).toBe(201);
+  expect((await olga("PUT", "/owners/orbit/teams/readers/repos/docs", { level: "read" })).status).toBe(200);
+  expect((await olga("POST", "/owners/orbit/teams", { name: "octo", ssoProvider: "github", ssoGroup: "octo/devs" })).status).toBe(201);
+  const as = (cookie: string) => async (path: string) => {
+    const response = await fetch(`${hub}/api${path}`, { headers: { cookie } });
+    return { status: response.status, data: (await response.json()) as any };
+  };
+  outside.person = { ...outside.person, sub: "subject-rita", preferred_username: "rita", name: "Rita", groups: ["everyone", "docs-readers"] };
+  let rita = await signInAt("oidc");
+  expect((await as(rita.cookie)("/repos/orbit/docs")).data.permission).toBe("read");
+  expect((await as(rita.cookie)(core)).status).toBe(404);
+  expect((await olga("GET", "/owners/orbit")).data.members.map((member: any) => member.name)).toEqual(["olga", "pat", "rita"]);
+  // The provider not saying is not the same as saying "none".
+  outside.person.groups = null;
+  rita = await signInAt("oidc");
+  expect((await as(rita.cookie)("/repos/orbit/docs")).status).toBe(200);
+  outside.person.groups = ["everyone"];
+  rita = await signInAt("oidc");
+  expect((await as(rita.cookie)("/repos/orbit/docs")).status).toBe(404);
+  expect((await olga("GET", "/owners/orbit")).data.members.map((member: any) => member.name)).toEqual(["olga", "pat"]);
+  // GitHub says which teams someone is in there.
+  outside.person = { ...outside.person, id: 777, login: "sam", name: "Sam", teams: ["octo/devs", "octo/other"] };
+  await signInAt("github");
+  expect((await olga("GET", "/owners/orbit/teams/octo")).data.members).toEqual(["sam"]);
+  outside.person.teams = [];
+  await signInAt("github");
+  expect((await olga("GET", "/owners/orbit/teams/octo")).data.members).toEqual([]);
+
+  // ---- SSH: git is let in with a key registered here, as whoever registered it.
+  const key = (name: string) => {
+    const path = join(tmp, `ssh-${name}`);
+    expect(Bun.spawnSync(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", name, "-f", path]).exitCode).toBe(0);
+    return { path, public: readFileSync(`${path}.pub`, "utf8") };
+  };
+  const [olgaKey, patKey] = [key("olga"), key("pat")];
+  expect((await olga("POST", "/keys", { title: "Laptop", key: olgaKey.public })).status).toBe(201);
+  const detail = (await olga("GET", core)).data;
+  expect(detail.sshUrl).toBe(`ssh://git@127.0.0.1:${sshPort}/orbit/core.git`);
+  const work = join(tmp, "orbit");
+  git(tmp, "init", "-q", "-b", "main", work);
+  const commit = (file: string, text: string, message: string) => {
+    writeFileSync(join(work, file), text);
+    git(work, "add", ".");
+    git(work, "commit", "-q", "-m", message);
+    return git(work, "rev-parse", "HEAD").out;
+  };
+  const first = commit("a.txt", "a\n", "First");
+  expect(gitAs(patKey.path, work, "push", "-q", detail.sshUrl, "main").err).toContain("Permission denied");
+  expect(gitAs(olgaKey.path, work, "push", "-q", detail.sshUrl, "main").err).toBe("");
+  expect((await pat("POST", "/keys", { key: patKey.public })).status).toBe(201);
+  expect(gitAs(patKey.path, tmp, "ls-remote", detail.sshUrl, "refs/heads/main").out).toStartWith(first);
+  expect(gitAs(patKey.path, tmp, "ls-remote", `ssh://git@127.0.0.1:${sshPort}/orbit/docs.git`).err).toContain("repository not found");
+  await eventually(async () => (await olga("GET", `${core}/activity`)).data.activity[0]?.actor === "olga");
+
+  // ---- Webhooks: told of what happens from here on, each delivery signed.
+  const everything = ["push", "pull_request", "pull_request_review", "status"];
+  expect((await pat("GET", `${core}/hooks`)).status).toBe(403);
+  expect((await olga("POST", `${core}/hooks`, { url: "ftp://example.com/x", events: everything })).status).toBe(400);
+  expect((await olga("POST", `${core}/hooks`, { url: `${elsewhere}/webhook`, events: ["issues"] })).status).toBe(400);
+  outside.delivered.length = 0;
+  expect((await olga("POST", `${core}/hooks`, { url: `${elsewhere}/webhook`, secret: "s3cret", events: everything })).status).toBe(201);
+  const received = (event: string) => outside.delivered.filter((delivery) => delivery.event === event).map((delivery) => JSON.parse(delivery.body));
+  await eventually(async () => received("ping").length === 1);
+  const ping = outside.delivered[0]!;
+  expect(ping.signature).toBe(`sha256=${new Bun.CryptoHasher("sha256", "s3cret").update(ping.body).digest("hex")}`);
+  const hooks = (await olga("GET", `${core}/hooks`)).data.hooks;
+  expect(hooks).toMatchObject([{ url: `${elsewhere}/webhook`, hasSecret: true, active: true, last: { state: "delivered", status: 200 } }]);
+  expect(JSON.stringify(hooks)).not.toContain("s3cret");
+
+  // ---- A rule: main changes through pull requests that were approved and passed their check.
+  const ruled = (await olga("POST", `${core}/rules`, { pattern: "main", approvals: 1, checks: ["ci/build"] })).data.rules;
+  expect(ruled).toMatchObject([{ pattern: "main", requirePulls: true, approvals: 1, checks: ["ci/build"], noForce: true, noDelete: true }]);
+  commit("direct.txt", "direct\n", "Straight to main");
+  expect(gitAs(olgaKey.path, work, "push", "-q", detail.sshUrl, "main").err).toContain("main only takes changes through pull requests");
+  git(work, "reset", "-q", "--hard", first);
+  git(work, "checkout", "-q", "-b", "feature");
+  const second = commit("b.txt", "b\n", "Add b");
+  expect(gitAs(patKey.path, work, "push", "-q", detail.sshUrl, "feature").err).toBe("");
+  expect((await pat("POST", `${core}/pulls`, { title: "Add b", base: "main", head: "feature" })).data).toEqual({ number: 1 });
+  const pull = async () => (await olga("GET", `${core}/pulls/1`)).data;
+  expect((await pull()).blocked).toEqual(["needs 1 approving review of its latest commit, and has 0", "the check ci/build has not reported"]);
+  expect((await pull()).rule).toEqual({ pattern: "main", approvals: 1, checks: ["ci/build"] });
+  expect((await olga("POST", `${core}/pulls/1/merge`, {})).data.error).toContain("cannot merge yet");
+
+  // Reviews: not one's own, and not of a commit one has not seen.
+  expect((await pat("POST", `${core}/pulls/1/reviews`, { state: "approved" })).status).toBe(403);
+  expect((await olga("POST", `${core}/pulls/1/reviews`, { state: "approved", head: first })).status).toBe(409);
+  expect((await olga("POST", `${core}/pulls/1/reviews`, { state: "changes_requested" })).status).toBe(400);
+  expect((await olga("POST", `${core}/pulls/1/reviews`, { state: "approved", body: "Looks right", head: second })).status).toBe(201);
+  expect((await pull()).blocked).toEqual(["the check ci/build has not reported"]);
+
+  // Checks: reported by a program, which comes with an access token.
+  const token: string = (await pat("POST", "/tokens", { name: "ci" })).data.token;
+  const report = async (oid: string, body: unknown, bearer = token) => {
+    const response = await fetch(`${hub}/api${core}/statuses/${oid}`, { method: "POST", headers: { authorization: `Bearer ${bearer}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+    return { status: response.status, data: (await response.json()) as any };
+  };
+  expect((await report(second, { state: "success", context: "ci/build" }, "hub_made-up")).status).toBe(404);
+  expect((await report(second, { state: "green", context: "ci/build" })).status).toBe(400);
+  expect((await report("f".repeat(40), { state: "success", context: "ci/build" })).status).toBe(404);
+  expect((await report(second, { state: "pending", context: "ci/build", description: "Building" })).data).toEqual({ state: "pending" });
+  expect((await pull()).blocked).toEqual(["the check ci/build has not finished"]);
+  expect((await report(second, { state: "success", context: "ci/build", description: "Built", targetUrl: "https://ci.example.com/1" })).data).toEqual({ state: "success" });
+  expect((await pull()).blocked).toEqual([]);
+  expect((await pull()).checks).toMatchObject([{ context: "ci/build", state: "success", description: "Built", creator: "pat" }]);
+
+  // A new commit is one nobody has approved or checked.
+  const third = commit("c.txt", "c\n", "Add c");
+  expect(gitAs(patKey.path, work, "push", "-q", detail.sshUrl, "feature").err).toBe("");
+  expect((await pull()).blocked).toEqual(["needs 1 approving review of its latest commit, and has 0", "the check ci/build has not reported"]);
+  expect((await pull()).reviewers).toEqual([{ author: "olga", state: "approved", stale: true, counts: true }]);
+  // The hub hears of the push from Strata's feed, a moment later.
+  await eventually(async () => received("pull_request").some((event) => event.action === "synchronize" && event.pull_request.head_oid === third));
+  expect((await olga("POST", `${core}/pulls/1/reviews`, { state: "changes_requested", body: "Why c?" })).status).toBe(201);
+  expect((await report(third, { state: "success", context: "ci/build" })).status).toBe(201);
+  expect((await pull()).blocked).toEqual(["olga asked for changes", "needs 1 approving review of its latest commit, and has 0"]);
+  expect((await olga("POST", `${core}/pulls/1/reviews`, { state: "approved" })).status).toBe(201);
+  expect((await pull()).blocked).toEqual([]);
+  const merged = await pat("POST", `${core}/pulls/1/merge`, { head: third });
+  expect(merged.status).toBe(200);
+  expect((await pull()).state).toBe("merged");
+
+  // What the webhook heard, in the order it happened.
+  await eventually(async () => received("push").some((push) => push.after === merged.data.oid));
+  expect(received("push").map((push) => [push.ref, push.after, push.sender])).toEqual([
+    ["refs/heads/feature", second, "pat"],
+    ["refs/heads/feature", third, "pat"],
+    ["refs/heads/main", merged.data.oid, "pat"],
+  ]);
+  expect(received("push")[0]).toMatchObject({ created: true, repository: { full_name: "orbit/core", private: true } });
+  expect(received("pull_request").map((event) => event.action)).toEqual(["opened", "synchronize", "merged"]);
+  expect(received("pull_request_review").map((event) => event.review.state)).toEqual(["approved", "changes_requested", "approved"]);
+  expect(received("status").map((event) => [event.sha, event.state])).toEqual([[second, "pending"], [second, "success"], [third, "success"]]);
+  for (const delivery of outside.delivered) expect(delivery.signature).toBe(`sha256=${new Bun.CryptoHasher("sha256", "s3cret").update(delivery.body).digest("hex")}`);
+  const hook = (await olga("GET", `${core}/hooks`)).data.hooks[0];
+  const log = (await olga("GET", `${core}/hooks/${hook.id}/deliveries`)).data.deliveries;
+  expect(log.length).toBe(outside.delivered.length);
+  expect(log.every((delivery: any) => delivery.state === "delivered" && delivery.status === 200)).toBe(true);
+  // Switched off, it hears no more.
+  expect((await olga("PATCH", `${core}/hooks/${hook.id}`, { active: false })).status).toBe(200);
+  const before = outside.delivered.length;
+  expect((await report(third, { state: "success", context: "lint" })).status).toBe(201);
+  await Bun.sleep(300);
+  expect(outside.delivered.length).toBe(before);
+}, 60_000);

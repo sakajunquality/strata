@@ -1,11 +1,12 @@
 // The two questions Strata asks the hub: may this git request go ahead, and
 // may this push move these refs.
 import { Hono } from "hono";
-import { gitUser, sha256 } from "./auth";
+import { gitUser, sha256, sshUser } from "./auth";
 import { config } from "./config";
 import { canRead, canWrite, mirrorOf, permission, repoById, repoByPath } from "./db";
+import { ruleFor, rulesOf } from "./rules";
 import { verify } from "./signing";
-import { strata, type StrataCommit } from "./strata";
+import type { StrataCommit } from "./strata";
 
 export const hooks = new Hono();
 
@@ -16,8 +17,11 @@ hooks.use("*", async (c, next) => {
 });
 
 hooks.post("/authz", async (c) => {
-  const { path, access, authorization } = await c.req.json<{ path: string; access: "read" | "write"; authorization?: string | null }>();
-  const user = await gitUser(authorization);
+  const { path, access, authorization, ssh_key: sshKey } = await c.req.json<{ path: string; access: "read" | "write" | "identify"; authorization?: string | null; ssh_key?: string | null }>();
+  // Over SSH a client is known by its key, and is asked about before it is let in at all.
+  const user = sshKey ? sshUser(sshKey) : await gitUser(authorization);
+  if (access === "identify") return c.json(user ? { allow: true, actor: user.name } : { allow: false });
+  if (sshKey && !user) return c.json({ allow: false, status: 401, message: "that SSH key is not registered here" });
   if (authorization && !user) return c.json({ allow: false, status: 401, message: "wrong user name, password or access token" });
 
   const [owner, name, ...rest] = path.split("/");
@@ -40,29 +44,26 @@ hooks.post("/pre-receive", async (c) => {
   const { repo: id, updates } = await c.req.json<{ repo: string; actor?: string; updates: { ref: string; change: string; commits?: StrataCommit[]; commits_truncated?: boolean }[] }>();
   const repo = repoById(id);
   if (!repo) return c.json({ allow: false, message: "repository not found" });
-  if (repo.protect_default || repo.require_pulls || repo.require_signed) {
-    const { head } = await strata.refs(id);
-    const branch = head.replace("refs/heads/", "");
-    if (repo.require_signed) {
+  const rules = await rulesOf(repo);
+  for (const update of rules.length ? updates : []) {
+    if (!update.ref.startsWith("refs/heads/")) continue;
+    const branch = update.ref.slice("refs/heads/".length);
+    const rule = ruleFor(rules, branch);
+    if (!rule) continue;
+    if (rule.noDelete && update.change === "delete") return c.json({ allow: false, message: `${branch} is protected and cannot be deleted` });
+    if (rule.noForce && update.change === "forced") return c.json({ allow: false, message: `${branch} is protected and does not accept force pushes` });
+    if (rule.requireSigned && update.change !== "delete") {
       // Every commit the push brings to the branch, not just its tip.
-      for (const update of updates.filter((update) => update.ref === head)) {
-        if (update.commits_truncated) return c.json({ allow: false, message: `too many commits to check the signatures of in one push to ${branch}` });
-        for (const commit of update.commits ?? []) {
-          const checked = await verify(commit.signature);
-          if (checked?.state === "verified") continue;
-          return c.json({ allow: false, message: `${branch} takes signed commits only, and ${commit.oid.slice(0, 7)} ${checked ? checked.reason : "is not signed"}` });
-        }
+      if (update.commits_truncated) return c.json({ allow: false, message: `too many commits to check the signatures of in one push to ${branch}` });
+      for (const commit of update.commits ?? []) {
+        const checked = await verify(commit.signature);
+        if (checked?.state === "verified") continue;
+        return c.json({ allow: false, message: `${branch} takes signed commits only, and ${commit.oid.slice(0, 7)} ${checked ? checked.reason : "is not signed"}` });
       }
     }
     // Merging a pull request is the hub's own doing and does not come through here.
-    if (repo.require_pulls && updates.some((update) => update.ref === head && update.change !== "create")) {
-      return c.json({ allow: false, message: `${branch} only takes changes through pull requests` });
-    }
-    const broken = repo.protect_default && updates.find((update) => update.ref === head && (update.change === "forced" || update.change === "delete"));
-    if (broken) {
-      const what = broken.change === "delete" ? "cannot be deleted" : "does not accept force pushes";
-      return c.json({ allow: false, message: `${branch} is protected and ${what}` });
-    }
+    // A branch may be started by a push: there is nothing yet to propose changes to.
+    if (rule.requirePulls && update.change !== "create" && update.change !== "delete") return c.json({ allow: false, message: `${branch} only takes changes through pull requests` });
   }
   return c.json({ allow: true });
 });

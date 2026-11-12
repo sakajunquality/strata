@@ -3,15 +3,18 @@
 import { Hono, type Context } from "hono";
 import { csrf } from "hono/csrf";
 import { HTTPException } from "hono/http-exception";
-import { checkPassword, createToken, endSession, sessionUser, startSession } from "./auth";
+import { apiUser, checkPassword, createToken, endSession, sessionUser, startSession } from "./auth";
 import { fail, REPO, signedIn, text, type Env } from "./common";
 import { config, signInAt } from "./config";
 import { canRead, canWrite, db, mirrorOf, now, ownerByName, permission, REPO_COLUMNS, repoByPath, roleIn, type Mirror, type Owner, type Repo } from "./db";
 import { forget, requestSync, sourceName, sourceUrl } from "./mirror";
 import { addPullRoutes, openPullCount } from "./pulls";
+import { addRuleRoutes, ruleFor, rulesOf } from "./rules";
 import { addKey, keysOf, removeKey, withVerification } from "./signing";
 import { addSignInRoutes } from "./sso";
 import { strata, StrataError } from "./strata";
+import { addTeamRoutes, removeMember, teamsWithAccess } from "./teams";
+import { addWebhookRoutes } from "./webhooks";
 
 export const api = new Hono<Env>();
 
@@ -35,7 +38,8 @@ function repoName(raw: unknown): string {
 
 api.use("*", csrf());
 api.use("*", async (c, next) => {
-  c.set("user", sessionUser(c));
+  // A browser comes with its session; a program with an access token.
+  c.set("user", sessionUser(c) ?? apiUser(c.req.header("authorization")));
   await next();
 });
 
@@ -115,7 +119,7 @@ api.post("/keys", async (c) => {
   const user = signedIn(c);
   const body = await c.req.json();
   try {
-    await addKey(user.id, text(body.title, 100) || "Signing key", String(body.key ?? ""));
+    await addKey(user.id, text(body.title, 100) || "Key", String(body.key ?? ""));
   } catch (error) {
     throw fail(400, (error as Error).message);
   }
@@ -166,7 +170,7 @@ api.get("/owners/:name", (c) => {
   const members = db
     .query("SELECT owners.name, members.role FROM members JOIN owners ON owners.id = members.user_id WHERE members.org_id = ? ORDER BY owners.name")
     .all(owner.id);
-  return c.json({ ...base, members, role: user ? roleIn(owner.id, user.id) : null });
+  return c.json({ ...base, members, role: user ? roleIn(owner.id, user.id) : null, basePermission: owner.base_permission });
 });
 
 function ownedOrg(c: Context<Env>): Owner {
@@ -185,7 +189,8 @@ api.put("/owners/:name/members/:username", async (c) => {
   if (!member || member.kind !== "user") throw fail(404, "no such user");
   const role = (await c.req.json()).role === "owner" ? "owner" : "member";
   if (role === "member" && roleIn(org.id, member.id) === "owner" && ownerCount(org.id) === 1) throw fail(409, "an organization needs at least one owner");
-  db.run("INSERT INTO members (org_id, user_id, role) VALUES (?, ?, ?) ON CONFLICT (org_id, user_id) DO UPDATE SET role = excluded.role", [org.id, member.id, role]);
+  // Set by hand, it is no longer a sign-in group's to take away.
+  db.run("INSERT INTO members (org_id, user_id, role) VALUES (?, ?, ?) ON CONFLICT (org_id, user_id) DO UPDATE SET role = excluded.role, synced = 0", [org.id, member.id, role]);
   return c.json({});
 });
 
@@ -194,9 +199,11 @@ api.delete("/owners/:name/members/:username", (c) => {
   const member = ownerByName(c.req.param("username"));
   if (!member) throw fail(404, "no such user");
   if (roleIn(org.id, member.id) === "owner" && ownerCount(org.id) === 1) throw fail(409, "an organization needs at least one owner");
-  db.run("DELETE FROM members WHERE org_id = ? AND user_id = ?", [org.id, member.id]);
+  removeMember(org.id, member.id);
   return c.json({});
 });
+
+addTeamRoutes(api);
 
 // ---- repositories ----
 
@@ -270,16 +277,17 @@ api.get(REPO, async (c) => {
   const [{ head, refs }, info] = await Promise.all([listed(), strata.info(found.id)]);
   const mirror = mirrorOf(found.id);
   const named = (prefix: string) => refs.filter((ref) => ref.name.startsWith(prefix)).map((ref) => ({ name: ref.name.slice(prefix.length), oid: ref.oid }));
-  const branches = named("refs/heads/");
+  const rules = await rulesOf(found);
+  const branches = named("refs/heads/").map((branch) => ({ ...branch, protected: !!ruleFor(rules, branch.name) }));
   return c.json({
     ...repoSummary(found),
     ownerKind: found.owner_kind,
-    protectDefault: !!found.protect_default,
-    requirePulls: !!found.require_pulls,
-    requireSigned: !!found.require_signed,
     openPulls: openPullCount(found.id),
     permission: c.get("level"),
     cloneUrl: `${config.strataPublicUrl}/${found.owner_name}/${found.name}.git`,
+    sshUrl: config.sshUrl ? `${config.sshUrl}/${found.owner_name}/${found.name}.git` : null,
+    // Who reaches it besides its owners, for those who can change that.
+    access: found.owner_kind === "org" && c.get("level") === "admin" ? { base: found.owner_base, teams: teamsWithAccess(found.id) } : null,
     defaultBranch: short(head),
     // Nothing to show until the default branch exists.
     empty: !branches.some((branch) => branch.name === short(head)),
@@ -321,13 +329,10 @@ api.patch(REPO, async (c) => {
     if (other && other.id !== found.id) throw fail(409, `${found.owner_name}/${name} already exists`);
   }
   // A rename happens here and nowhere else: Strata keeps serving the same id.
-  db.run("UPDATE repos SET name = ?, description = ?, private = ?, protect_default = ?, require_pulls = ?, require_signed = ? WHERE id = ?", [
+  db.run("UPDATE repos SET name = ?, description = ?, private = ? WHERE id = ?", [
     name,
     body.description === undefined ? found.description : text(body.description, 300),
     body.private === undefined ? found.private : body.private ? 1 : 0,
-    body.protectDefault === undefined ? found.protect_default : body.protectDefault ? 1 : 0,
-    body.requirePulls === undefined ? found.require_pulls : body.requirePulls ? 1 : 0,
-    body.requireSigned === undefined ? found.require_signed : body.requireSigned ? 1 : 0,
     found.id,
   ]);
   return c.json({ owner: found.owner_name, name });
@@ -377,3 +382,5 @@ api.get(`${REPO}/activity`, (c) => {
 });
 
 addPullRoutes(api);
+addRuleRoutes(api);
+addWebhookRoutes(api);

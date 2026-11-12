@@ -33,6 +33,7 @@ To run the hub against a Strata started elsewhere, `bun run server` with:
 |---|---|
 | `STRATA_URL` | Where the hub reaches Strata. |
 | `STRATA_PUBLIC_URL` | Where git clients reach it, for clone URLs. Defaults to `STRATA_URL`. |
+| `STRATA_SSH_URL` | Where git clients reach Strata over SSH, if it was started with `--ssh-listen`: `ssh://git@host:port`. Clone URLs then come in both kinds. |
 | `STRATA_ADMIN_TOKEN` | Strata's `--admin-token`. |
 | `STRATA_HOOK_SECRET` | Strata's `--hook-secret`. |
 | `HUB_PORT`, `HUB_HOST`, `HUB_DB` | Where the hub listens (127.0.0.1:3000) and keeps its SQLite file. |
@@ -78,13 +79,102 @@ very many refs. A private source takes an access token, which is stored in
 the hub's database as it is. A mirror refuses pushes and merges until it is
 told to let go of its source in its settings.
 
+## SSH
+
+`bun run start` has Strata listen for SSH on :2222. Add the public half of a
+key under "SSH and signing keys", and git is let in with it as you:
+
+```sh
+git clone ssh://git@127.0.0.1:2222/<you>/<repo>.git
+```
+
+The same keys verify signed commits. A key belongs to one account.
+
+## Teams
+
+An organization's owners can do anything with its repositories. Its other
+members get what the organization gives every member (read and push, read,
+or nothing: set on the organization's page), and what their teams add: a
+team is given repositories, each to read, to push to, or to administer.
+
+A team can follow a group at a sign-in provider. Whoever signs in as part of
+that group joins the team, and its organization; whoever signs in without it
+leaves the team, and the organization too if a group is what brought them
+in. Where the groups come from:
+
+| Provider | The group is named by | Needs |
+|---|---|---|
+| Entra ID | the group's object id | The app registration's token configuration to include the `groups` claim. Someone in more than 200 groups gets no list from Entra; their teams are then left as they are. |
+| Other OpenID Connect | a value of the token's `groups` claim | The provider to send that claim. |
+| GitHub | `organization/team` | The `read:org` scope, which the hub asks for. |
+| Google | (not supported) | Google's ID token does not say which groups someone is in. |
+
+Memberships change at sign-in, not in between: someone removed from a group
+keeps what the team gave them until their session here ends and they sign in
+again (sessions last 30 days), and their access tokens and SSH keys keep
+working until then.
+
+## Branch rules, reviews and checks
+
+A repository's settings hold rules for branches, by name or by pattern
+(`release/*`). A rule can refuse force pushes and deletion, refuse pushes
+that are not a merged pull request, refuse commits not signed with a
+registered key, and ask of a pull request, before it merges:
+
+- **Approvals**: so many approving reviews of its latest commit, from people
+  other than its author who can push to the repository. A new commit makes
+  earlier approvals stale. A request for changes blocks until the same
+  reviewer approves.
+- **Checks**: named commit statuses that must have succeeded on its latest
+  commit.
+
+A status is reported by a program, with an access token of someone who can
+push:
+
+```sh
+curl -X POST http://127.0.0.1:3000/api/repos/<owner>/<repo>/statuses/<commit id> \
+  -H "authorization: Bearer hub_..." -H "content-type: application/json" \
+  -d '{"state": "success", "context": "ci/build", "description": "Built", "targetUrl": "https://ci.example.com/1"}'
+```
+
+`state` is `pending`, `success`, `failure` or `error`. Every route of the
+API takes an access token this way.
+
+## Webhooks
+
+A repository's settings also hold webhooks: addresses that get a POST with a
+JSON body for the events they asked for.
+
+| `X-Hub-Event` | When | In the body |
+|---|---|---|
+| `push` | A ref moved, by push or merge. One per ref. | `ref`, `before`, `after`, `change`, `created`, `deleted`, `forced` |
+| `pull_request` | `action`: `opened`, `synchronize` (its branch moved), `closed`, `reopened`, `merged` | `number`, `pull_request` |
+| `pull_request_review` | A review was given | `number`, `review` |
+| `status` | A commit status was reported | `sha`, `context`, `state`, `description`, `target_url` |
+| `ping` | The webhook was made, or asked to | `hook` |
+
+All carry `repository` and `sender`. With a secret, `X-Hub-Signature-256` is
+`sha256=` and the body's HMAC-SHA256 under it. An answer other than 2xx, or
+none within 10 seconds, is tried again after 10 s, 1 min, 5 min and 30 min;
+the settings page lists the last deliveries and can send one again.
+Deliveries are made one at a time in the order things happened, so one slow
+receiver holds up the rest. Pushes are heard of from Strata's event feed, a
+moment after they happen.
+
+Webhooks to loopback and private addresses are refused unless
+`HUB_WEBHOOKS_INSIDE=1` (`bun run start` sets it): whoever owns a repository
+could otherwise have the hub call into its own network. The address is
+looked up again at each delivery and redirects are not followed; a name that
+changes where it points between the lookup and the request is not guarded
+against.
+
 ## What uses what
 
 | The hub does | through Strata's |
 |---|---|
-| Decides who may fetch and push, and maps `owner/name` to a repository id (`server/hooks.ts`) | authorization hook |
-| Protects the default branch: from force pushes and deletion, from pushes that are not a merged pull request, from commits not signed with a registered key (`server/hooks.ts`, `server/signing.ts`) | pre-receive hook |
-| Records pushes and imports as activity; picks a default branch on a first push; closes pull requests whose branch went and marks those merged by a push (`server/events.ts`, `server/pulls.ts`) | event feed |
+| Decides who may fetch and push, by password, access token or SSH key, and maps `owner/name` to a repository id (`server/hooks.ts`) | authorization hook |
+| Holds branches to their rules: no force pushes or deletion, nothing but merged pull requests, only commits signed with a registered key (`server/hooks.ts`, `server/rules.ts`, `server/signing.ts`) | pre-receive hook |
+| Records pushes and imports as activity; picks a default branch on a first push; closes pull requests whose branch went and marks those merged by a push; tells webhooks (`server/events.ts`, `server/pulls.ts`, `server/webhooks.ts`) | event feed |
 | Creates and deletes repositories, sets the default branch (`server/api.ts`) | management API |
 | Shows files, history, what a commit changed and whether its signature is from a key a user registered (`server/api.ts`, `server/signing.ts`, `web/`) | content API |
 | Shows what a pull request holds and whether it merges, and merges it (`server/pulls.ts`) | compare and merge |
@@ -97,13 +187,19 @@ see it, is a row updated in the hub's database and nothing else.
 
 It is an example, not a product:
 
-- No issues, forks, search, webhooks or email.
-- Pull requests are between branches of one repository, with a conversation
-  and a merge button (merge commit, squash or rebase). No reviews or
-  approvals, no comments on lines, and conflicts are settled on your machine.
-  Merged branches are not deleted for you.
-- Permissions are per owner: a user's repositories are theirs alone, and an
-  organization's members can push to all of its repositories.
+- No issues, forks, search or email.
+- Pull requests are between branches of one repository, with a conversation,
+  reviews and a merge button (merge commit, squash or rebase). No comments
+  on lines, no asking someone in particular for a review, no code owners,
+  and conflicts are settled on your machine. Merged branches are not deleted
+  for you.
+- Branch rules bind everyone, owners included: there is no bypass. A rule
+  that asks for signed commits does not hold for the commits the hub makes
+  when it merges.
+- A user's repositories are theirs alone: no collaborators from outside.
+  Teams do not nest.
+- Webhook secrets are kept as given in the hub's database, as mirror tokens
+  are. There are no webhooks for a whole organization.
 - Signatures are checked against the SSH and OpenPGP keys users register;
   X.509 is not. A key's expiry or revocation is not looked at, and the signer
   is not required to be the committer. Commits the hub makes when it merges

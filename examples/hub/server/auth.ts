@@ -50,6 +50,26 @@ export async function checkPassword(username: string, password: string): Promise
   return (await Bun.password.verify(password, user.password_hash)) ? user : null;
 }
 
+const tokenUser = (token: string): Owner | null => {
+  const hash = sha256(token);
+  const user = db.query<Owner, [string]>("SELECT owners.* FROM tokens JOIN owners ON owners.id = tokens.user_id WHERE tokens.hash = ?").get(hash);
+  if (user) db.run("UPDATE tokens SET last_used_at = ? WHERE hash = ?", [now(), hash]);
+  return user;
+};
+
+/** Who a program calling the API is: it sends an access token as `Authorization: Bearer <token>`. */
+export function apiUser(authorization: string | null | undefined): Owner | null {
+  const token = authorization?.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
+  return token.startsWith(TOKEN_PREFIX) ? tokenUser(token) : null;
+}
+
+/** Whose SSH key this is: the one a git client proved to hold, as Strata passes it on (`ssh-ed25519 AAAA…`). */
+export function sshUser(key: string): Owner | null {
+  const material = key.trim().split(/\s+/)[1] ?? "";
+  if (!material) return null;
+  return db.query<Owner, [string]>("SELECT owners.* FROM signing_keys JOIN owners ON owners.id = signing_keys.user_id WHERE signing_keys.kind = 'ssh' AND signing_keys.material = ?").get(material);
+}
+
 /**
  * Who a git client is, from its `Authorization` header: Basic credentials
  * with an access token (under any user name) or the account's password.
@@ -67,11 +87,6 @@ export async function gitUser(authorization: string | null | undefined): Promise
   const password = colon < 0 ? "" : decoded.slice(colon + 1);
   // Some tools put the token in the user name and leave the password empty.
   const secret = password || username;
-  if (secret.startsWith(TOKEN_PREFIX)) {
-    const hash = sha256(secret);
-    const user = db.query<Owner, [string]>("SELECT owners.* FROM tokens JOIN owners ON owners.id = tokens.user_id WHERE tokens.hash = ?").get(hash);
-    if (user) db.run("UPDATE tokens SET last_used_at = ? WHERE hash = ?", [now(), hash]);
-    return user;
-  }
+  if (secret.startsWith(TOKEN_PREFIX)) return tokenUser(secret);
   return password && config.passwords ? checkPassword(username, password) : null;
 }

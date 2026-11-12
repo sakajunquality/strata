@@ -1,10 +1,12 @@
-import { App, Button, Card, Form, Input, Modal, Radio, Select, Switch, Typography } from "antd";
+import { App, Button, Card, Form, Input, Modal, Radio, Select, Typography } from "antd";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api";
 import type { RepoContext } from "./Repo";
+import { Access, BranchRules, Webhooks } from "./RepoRules";
 
-export function RepoSettings({ repo, base, reload }: RepoContext) {
+export function RepoSettings(context: RepoContext) {
+  const { repo, base, reload } = context;
   const { message } = App.useApp();
   const navigate = useNavigate();
   const [deleting, setDeleting] = useState(false);
@@ -48,27 +50,17 @@ export function RepoSettings({ repo, base, reload }: RepoContext) {
       </Card>
 
       <Card title="Default branch" className="stack">
-        <Form layout="vertical" onFinish={save} initialValues={{ defaultBranch: repo.empty ? undefined : repo.defaultBranch, protectDefault: repo.protectDefault, requirePulls: repo.requirePulls, requireSigned: repo.requireSigned }}>
+        <Form layout="vertical" onFinish={save} initialValues={{ defaultBranch: repo.empty ? undefined : repo.defaultBranch }}>
           <Form.Item name="defaultBranch" label="Branch" extra="What a clone checks out, and what the Code tab shows first.">
             <Select disabled={repo.branches.length === 0} placeholder="No branches yet" options={repo.branches.map(({ name }) => ({ value: name, label: name }))} />
-          </Form.Item>
-          <Form.Item name="protectDefault" label="Protect it" valuePropName="checked" extra="Refuses force pushes to the default branch, and its deletion.">
-            <Switch />
-          </Form.Item>
-          <Form.Item name="requirePulls" label="Require pull requests" valuePropName="checked" extra="Refuses pushes straight to the default branch. Changes arrive by merging pull requests.">
-            <Switch />
-          </Form.Item>
-          <Form.Item
-            name="requireSigned"
-            label="Require signed commits"
-            valuePropName="checked"
-            extra="Refuses pushes to the default branch that bring a commit not signed with a key one of the users here has registered. Commits made by merging a pull request here are not signed, and are let in."
-          >
-            <Switch />
           </Form.Item>
           <Button type="primary" htmlType="submit">Save</Button>
         </Form>
       </Card>
+
+      <BranchRules {...context} />
+      <Access {...context} />
+      <Webhooks {...context} />
 
       {repo.mirror && (
         <Card title="Mirror" className="stack">

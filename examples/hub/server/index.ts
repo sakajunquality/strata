@@ -5,6 +5,7 @@ import { config } from "./config";
 import { followEvents } from "./events";
 import { hooks } from "./hooks";
 import { followSources } from "./mirror";
+import { followDeliveries } from "./webhooks";
 
 const app = new Hono();
 app.route("/api", api);
@@ -19,6 +20,7 @@ if (!config.adminToken || !config.hookSecret) {
 }
 followEvents();
 followSources();
+followDeliveries();
 console.log(`hub listening on http://127.0.0.1:${config.port}, git backend at ${config.strataUrl}`);
 
 export default { port: config.port, hostname: process.env.HUB_HOST || "127.0.0.1", fetch: app.fetch };

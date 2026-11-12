@@ -13,6 +13,7 @@ if (!existsSync(strataBin)) {
 
 const strataPort = process.env.STRATA_PORT ?? "8080";
 const hubPort = process.env.HUB_PORT ?? "3000";
+const sshPort = process.env.STRATA_SSH_PORT ?? "2222";
 const secret = () => crypto.randomUUID().replaceAll("-", "");
 const env = {
   ...process.env,
@@ -20,6 +21,9 @@ const env = {
   // Where a sign-in elsewhere comes back to: the address the UI is open at.
   HUB_PUBLIC_URL: process.env.HUB_PUBLIC_URL ?? `http://127.0.0.1:${built ? hubPort : "5173"}`,
   STRATA_URL: `http://127.0.0.1:${strataPort}`,
+  STRATA_SSH_URL: `ssh://git@127.0.0.1:${sshPort}`,
+  // Webhooks to this machine are what one tries first.
+  HUB_WEBHOOKS_INSIDE: process.env.HUB_WEBHOOKS_INSIDE ?? "1",
   STRATA_ADMIN_TOKEN: process.env.STRATA_ADMIN_TOKEN ?? secret(),
   STRATA_HOOK_SECRET: process.env.STRATA_HOOK_SECRET ?? secret(),
 };
@@ -29,6 +33,7 @@ const children = [
   run([
     strataBin,
     "--listen", `127.0.0.1:${strataPort}`,
+    "--ssh-listen", `127.0.0.1:${sshPort}`,
     "--data-dir", resolve(root, ".data/strata"),
     "--authz-url", `http://127.0.0.1:${hubPort}/hooks/authz`,
     "--pre-receive-url", `http://127.0.0.1:${hubPort}/hooks/pre-receive`,
@@ -39,7 +44,7 @@ const children = [
   ...(built ? [] : [run(["bunx", "--bun", "vite"])]),
 ];
 
-console.log(`\n  UI:  http://127.0.0.1:${built ? hubPort : "5173"}\n  git: http://127.0.0.1:${strataPort}/<owner>/<repo>.git\n`);
+console.log(`\n  UI:  http://127.0.0.1:${built ? hubPort : "5173"}\n  git: http://127.0.0.1:${strataPort}/<owner>/<repo>.git\n       ssh://git@127.0.0.1:${sshPort}/<owner>/<repo>.git\n`);
 
 let stopping = false;
 const stop = () => {

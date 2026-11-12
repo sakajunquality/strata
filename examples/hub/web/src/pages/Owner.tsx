@@ -4,6 +4,7 @@ import { api, useLoad, type OwnerPage as Data } from "../api";
 import { RepoList } from "../RepoList";
 import { useSession } from "../session";
 import { Loaded } from "../util";
+import { Teams } from "./Team";
 
 export function OwnerPage() {
   const { owner = "" } = useParams();
@@ -92,9 +93,22 @@ export function OwnerPage() {
                     <Button htmlType="submit">Add member</Button>
                   </Form>
                 )}
-                <Typography.Paragraph className="muted stack">Members can push to every repository of the organization. Owners can also change settings and members.</Typography.Paragraph>
+                <Space className="stack" wrap>
+                  <span>Every member may</span>
+                  <Select
+                    size="small"
+                    value={data.basePermission}
+                    disabled={!isOwner}
+                    popupMatchSelectWidth={false}
+                    aria-label="What every member may do with the organization's repositories"
+                    options={[{ value: "write", label: "read and push to every repository" }, { value: "read", label: "read every repository" }, { value: "none", label: "do nothing beyond what anyone may" }]}
+                    onChange={(basePermission) => change(() => api(`/owners/${data.name}`, "PATCH", { basePermission }))}
+                  />
+                </Space>
+                <Typography.Paragraph className="muted stack">Teams add to that for the repositories they are given. Owners can do anything, and change settings, members and teams.</Typography.Paragraph>
               </Card>
             )}
+            {data.kind === "org" && data.role && <Teams org={data.name} canChange={isOwner} />}
           </>
         );
       }}

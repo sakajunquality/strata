@@ -40,7 +40,7 @@ export function Shell() {
                   ...(me?.orgs ?? []).map((org) => ({ key: `org-${org.name}`, label: <Link to={`/${org.name}`}>{org.name}</Link> })),
                   { type: "divider" as const },
                   { key: "tokens", label: <Link to="/settings/tokens">Access tokens</Link> },
-                  { key: "keys", label: <Link to="/settings/keys">Signing keys</Link> },
+                  { key: "keys", label: <Link to="/settings/keys">SSH and signing keys</Link> },
                   { key: "out", label: "Sign out", onClick: signOut },
                 ],
               }}

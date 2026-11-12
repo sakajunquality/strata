@@ -8,13 +8,20 @@ import { startSession } from "./auth";
 import type { Env } from "./common";
 import { config, signInAt, type Provider } from "./config";
 import { db, now, ownerByName } from "./db";
+import { syncTeams } from "./teams";
 
 const COOKIE = "hub_signin";
 const random = () => Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
 const s256 = (text: string) => new Bun.CryptoHasher("sha256").update(text).digest("base64url");
 
 /** Someone as a provider knows them. */
-type Arrival = { subject: string; username: string; displayName: string };
+type Arrival = {
+  subject: string;
+  username: string;
+  displayName: string;
+  /** The groups they are in there, for teams that follow one. Null if the provider did not say. */
+  groups: string[] | null;
+};
 
 class Refused extends Error {}
 
@@ -42,7 +49,8 @@ const redirectUri = (provider: Provider) => `${config.publicUrl}/api/auth/${prov
 async function authorizeUrl(provider: Provider, state: string, nonce: string, verifier: string): Promise<string> {
   const params = new URLSearchParams({ client_id: provider.clientId, redirect_uri: redirectUri(provider), state, code_challenge: s256(verifier), code_challenge_method: "S256" });
   if (provider.kind === "github") {
-    params.set("scope", "read:user");
+    // read:org to see which teams they are in, for teams here that follow one.
+    params.set("scope", "read:user read:org");
     return `${config.githubUrl}/login/oauth/authorize?${params}`;
   }
   params.set("response_type", "code");
@@ -71,7 +79,7 @@ async function arrive(provider: Provider, code: string, nonce: string, verifier:
     const response = await fetch(`${config.githubApiUrl}/user`, { headers: { authorization: `Bearer ${access_token}`, accept: "application/vnd.github+json", "user-agent": "strata-hub" } });
     if (!response.ok) throw new Refused("GitHub did not say who signed in");
     const user = (await response.json()) as { id: number; login: string; name?: string | null };
-    return { subject: String(user.id), username: user.login, displayName: user.name ?? "" };
+    return { subject: String(user.id), username: user.login, displayName: user.name ?? "", groups: await githubTeams(String(access_token)) };
   }
 
   const known = await discover(provider);
@@ -91,7 +99,24 @@ async function arrive(provider: Provider, code: string, nonce: string, verifier:
     if (typeof claims.hd !== "string" || !provider.domains.includes(claims.hd.toLowerCase())) throw new Refused(`only accounts of ${provider.domains.join(", ")} can sign in`);
   }
   const preferred = typeof claims.preferred_username === "string" ? claims.preferred_username : "";
-  return { subject: claims.sub, username: (preferred || email).split("@")[0] || String(claims.name ?? ""), displayName: typeof claims.name === "string" ? claims.name : "" };
+  // The `groups` claim, where the provider is set up to send one. Entra ID
+  // leaves it out for someone in too many groups to list, and points
+  // elsewhere instead: that is not knowing, not being in none.
+  const groups = Array.isArray(claims.groups) && !("_claim_names" in claims) ? claims.groups.filter((group): group is string => typeof group === "string") : null;
+  return { subject: claims.sub, username: (preferred || email).split("@")[0] || String(claims.name ?? ""), displayName: typeof claims.name === "string" ? claims.name : "", groups };
+}
+
+/** The teams someone is in on GitHub, as "organization/team". Null if GitHub would not say. */
+async function githubTeams(token: string): Promise<string[] | null> {
+  const teams: string[] = [];
+  for (let page = 1; page <= 10; page++) {
+    const response = await fetch(`${config.githubApiUrl}/user/teams?per_page=100&page=${page}`, { headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "user-agent": "strata-hub" } });
+    if (!response.ok) return null;
+    const found = (await response.json()) as { slug: string; organization: { login: string } }[];
+    teams.push(...found.map((team) => `${team.organization.login}/${team.slug}`));
+    if (found.length < 100) return teams;
+  }
+  return null;
 }
 
 /** A free account name as close to `wanted` as the rules for names allow. */
@@ -151,7 +176,9 @@ export function addSignInRoutes(api: Hono<Env>, reserved: Set<string>) {
     if (!code || !state || !asked.state || asked.provider !== provider.id || state !== asked.state) return back(c, "the sign-in was not started here, or took too long: try again");
     try {
       const arrival = await arrive(provider, code, asked.nonce ?? "", asked.verifier ?? "");
-      startSession(c, accountFor(provider, arrival, reserved));
+      const userId = accountFor(provider, arrival, reserved);
+      syncTeams(userId, provider.id, arrival.groups);
+      startSession(c, userId);
     } catch (error) {
       if (error instanceof Refused) return back(c, error.message);
       console.error(`sign-in with ${provider.name}:`, error);

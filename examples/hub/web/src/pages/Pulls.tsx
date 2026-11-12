@@ -1,6 +1,6 @@
-import { CommentOutlined, PullRequestOutlined } from "@ant-design/icons";
+import { CheckCircleFilled, ClockCircleFilled, CloseCircleFilled, CommentOutlined, PullRequestOutlined } from "@ant-design/icons";
 import { Alert, App, Button, Card, Empty, Form, Input, Segmented, Select, Space, Tabs, Tag, Typography } from "antd";
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import Markdown from "react-markdown";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import remarkGfm from "remark-gfm";
@@ -164,13 +164,57 @@ export function NewPullPage({ repo, root, base, reload }: RepoContext) {
   );
 }
 
-function Note({ author, time, body, opening }: { author: string; time: number; body: string; opening?: boolean }) {
+function Note({ author, time, body, did = "commented", tag }: { author: string; time: number; body: string; did?: string; tag?: ReactNode }) {
   return (
-    <Card size="small" className="stack" title={<span className="note-head"><strong>{author}</strong> <span className="muted">{opening ? "opened this" : "commented"} <When time={time} /></span></span>}>
-      {body ? <div className="markdown"><Markdown remarkPlugins={[remarkGfm]}>{body}</Markdown></div> : <span className="muted">No description.</span>}
+    <Card size="small" className="stack" title={<span className="note-head"><strong>{author}</strong> <span className="muted">{did} <When time={time} /></span> {tag}</span>}>
+      {body ? <div className="markdown"><Markdown remarkPlugins={[remarkGfm]}>{body}</Markdown></div> : <span className="muted">{did === "opened this" ? "No description." : "Nothing more to say."}</span>}
     </Card>
   );
 }
+
+const CHECK_ICONS = {
+  success: <CheckCircleFilled className="check-success" aria-label="passed" />,
+  pending: <ClockCircleFilled className="check-pending" aria-label="running" />,
+  failure: <CloseCircleFilled className="check-failure" aria-label="failed" />,
+  error: <CloseCircleFilled className="check-failure" aria-label="could not run" />,
+};
+
+/** What reviewers and checks say about an open pull request, and what its base branch asks. */
+function Standing({ pull }: { pull: PullDetail }) {
+  // Checks the rule asks for that nobody has reported on yet are part of the picture.
+  const awaited = (pull.rule?.checks ?? []).filter((name) => !pull.checks.some((check) => check.context === name));
+  if (pull.reviewers.length === 0 && pull.checks.length === 0 && !pull.rule) return null;
+  return (
+    <Card size="small" className="stack" title="Reviews and checks">
+      {pull.rule && (pull.rule.approvals > 0 || pull.rule.checks.length > 0) && (
+        <p className="muted">
+          <Branch name={pull.base} /> asks for{" "}
+          {[pull.rule.approvals > 0 && plural(pull.rule.approvals, "approval"), pull.rule.checks.length > 0 && `the ${pull.rule.checks.length === 1 ? "check" : "checks"} ${pull.rule.checks.join(", ")}`].filter(Boolean).join(" and ")}.
+        </p>
+      )}
+      <ul className="standing">
+        {pull.reviewers.map((review) => (
+          <li key={review.author}>
+            {review.state === "approved" ? (review.stale ? CHECK_ICONS.pending : CHECK_ICONS.success) : CHECK_ICONS.failure}
+            <strong>{review.author}</strong> {review.state === "approved" ? (review.stale ? "approved an earlier commit" : "approved") : "asked for changes"}
+            {!review.counts && <span className="muted"> · cannot push here, so this does not count towards the rule</span>}
+          </li>
+        ))}
+        {pull.checks.map((check) => (
+          <li key={check.context}>
+            {CHECK_ICONS[check.state]}
+            <strong>{check.context}</strong> {check.description && <span className="muted">{check.description}</span>} {check.targetUrl && <a href={check.targetUrl} rel="noreferrer">Details</a>}
+          </li>
+        ))}
+        {awaited.map((name) => (
+          <li key={name}>{CHECK_ICONS.pending}<strong>{name}</strong> <span className="muted">has not reported</span></li>
+        ))}
+      </ul>
+    </Card>
+  );
+}
+
+const VERDICTS = { approved: ["approved", <Tag color="green" key="tag">Approved</Tag>], changes_requested: ["asked for changes", <Tag color="red" key="tag">Changes requested</Tag>], commented: ["reviewed", null] } as const;
 
 /** Where an open pull request stands, and the button that merges it. */
 function MergeBox({ pull, base, act }: { pull: PullDetail; base: string; act: (what: () => Promise<unknown>) => Promise<void> }) {
@@ -191,6 +235,17 @@ function MergeBox({ pull, base, act }: { pull: PullDetail; base: string; act: (w
             Merge <Branch name={pull.base} /> into <Branch name={pull.head} /> on your machine, settle them there and push.
           </>
         }
+      />
+    );
+  }
+  if (pull.blocked.length > 0) {
+    return (
+      <Alert
+        className="stack"
+        type="warning"
+        showIcon
+        title="Not ready to merge"
+        description={<ul className="conflicts">{pull.blocked.map((reason) => <li key={reason}>{reason}</li>)}</ul>}
       />
     );
   }
@@ -248,10 +303,24 @@ export function PullPage({ root, base, reload }: RepoContext) {
     <Loaded from={detail}>
       {(pull) => {
         const open = pull.state === "open";
+        // Comments and reviews, in the order they were made.
+        const said = [
+          ...pull.discussion.map((comment) => ({ key: `c${comment.id}`, time: comment.createdAt, note: <Note key={`c${comment.id}`} author={comment.author} time={comment.createdAt} body={comment.body} /> })),
+          ...pull.reviews.map((review) => ({
+            key: `r${review.id}`,
+            time: review.createdAt,
+            note: <Note key={`r${review.id}`} author={review.author} time={review.createdAt} body={review.body} did={VERDICTS[review.state][0]} tag={<>{VERDICTS[review.state][1]}{review.stale && review.state !== "commented" && <Tag>earlier commit</Tag>}</>} />,
+          })),
+        ].sort((a, b) => a.time - b.time || a.key.localeCompare(b.key));
+        const review = (state: string) => act(async () => {
+          await api(`${base}/pulls/${number}/reviews`, "POST", { state, body: form.getFieldValue("body") ?? "", head: pull.compare?.head });
+          form.resetFields();
+        });
         const conversation = (
           <div className="medium wide">
-            <Note author={pull.author} time={pull.createdAt} body={pull.body} opening />
-            {pull.discussion.map((comment) => <Note key={comment.id} author={comment.author} time={comment.createdAt} body={comment.body} />)}
+            <Note author={pull.author} time={pull.createdAt} body={pull.body} did="opened this" />
+            {said.map((entry) => entry.note)}
+            {open && <Standing pull={pull} />}
             {open && <MergeBox pull={pull} base={base} act={act} />}
             {pull.state === "merged" && (
               <Alert
@@ -269,6 +338,8 @@ export function PullPage({ root, base, reload }: RepoContext) {
                 </Form.Item>
                 <Space>
                   <Button type="primary" htmlType="submit">Comment</Button>
+                  {pull.can.judge && <Button onClick={() => review("approved")}>Approve</Button>}
+                  {pull.can.judge && <Button onClick={() => review("changes_requested")}>Request changes</Button>}
                   {pull.can.change && open && <Button onClick={() => change({ state: "closed" })}>Close pull request</Button>}
                   {pull.can.change && pull.state === "closed" && <Button onClick={() => change({ state: "open" })}>Reopen</Button>}
                 </Space>

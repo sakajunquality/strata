@@ -49,15 +49,32 @@ export function useLoad<T>(load: () => Promise<T>, key: string) {
 export type User = { name: string; displayName: string };
 export type Me = { user: User | null; orgs: { name: string; role: string }[]; signIn: { passwords: boolean; providers: { id: string; name: string }[] } };
 export type RepoSummary = { owner: string; name: string; description: string; private: boolean; createdAt: number; pushedAt: number | null };
-export type Named = { name: string; oid: string };
+export type Named = { name: string; oid: string; /** For a branch: whether a rule protects it. */ protected?: boolean };
+export type Rule = { id: number; pattern: string; noForce: boolean; noDelete: boolean; requirePulls: boolean; approvals: number; requireSigned: boolean; checks: string[] };
+export type Webhook = { id: number; url: string; events: string[]; active: boolean; hasSecret: boolean; createdAt: number; last: { state: "pending" | "delivered" | "failed"; status: number | null; error: string | null; time: number } | null };
+export type Status = { context: string; state: "pending" | "success" | "failure" | "error"; description: string; targetUrl: string; createdAt: number; creator: string | null };
+export type TeamSummary = { name: string; description: string; members: number; repos: number; ssoProvider: string | null; ssoGroup: string | null };
+export type TeamDetail = {
+  org: string;
+  name: string;
+  description: string;
+  ssoProvider: string | null;
+  ssoGroup: string | null;
+  members: string[];
+  repos: { name: string; level: string }[];
+  orgRepos: string[];
+  providers: { id: string; name: string }[];
+  canChange: boolean;
+};
 export type RepoDetail = RepoSummary & {
   ownerKind: "user" | "org";
-  protectDefault: boolean;
-  requirePulls: boolean;
-  requireSigned: boolean;
   openPulls: number;
   permission: "read" | "write" | "admin";
   cloneUrl: string;
+  /** Set if git is served over SSH too. */
+  sshUrl: string | null;
+  /** An organization's repository, for those who can change its settings: who reaches it. */
+  access: { base: "none" | "read" | "write"; teams: { name: string; level: string }[] } | null;
   defaultBranch: string;
   empty: boolean;
   branches: Named[];
@@ -95,7 +112,16 @@ export type PullDetail = Pull & {
   /** Null when there is nothing to ask: it is not open, or has nothing to merge. */
   mergeable: boolean | null;
   conflicts: string[];
-  can: { change: boolean; merge: boolean };
+  reviews: { id: number; author: string; state: "approved" | "changes_requested" | "commented"; body: string; createdAt: number; stale: boolean }[];
+  /** Each reviewer's last verdict. */
+  reviewers: { author: string; state: "approved" | "changes_requested"; stale: boolean; counts: boolean }[];
+  /** What was reported about its latest commit. */
+  checks: Status[];
+  /** What the base branch asks of it. */
+  rule: { pattern: string; approvals: number; checks: string[] } | null;
+  /** Why it may not merge yet. */
+  blocked: string[];
+  can: { change: boolean; merge: boolean; review: boolean; judge: boolean };
 };
 export type TreeEntry = { name: string; mode: string; type: "tree" | "blob" | "commit"; oid: string };
 export type Tree = { commit: string; path: string; entries: TreeEntry[] };
@@ -110,4 +136,5 @@ export type OwnerPage = {
   orgs?: string[];
   members?: { name: string; role: "owner" | "member" }[];
   role?: "owner" | "member" | null;
+  basePermission?: "none" | "read" | "write";
 };

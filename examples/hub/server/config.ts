@@ -8,6 +8,8 @@ export const config = {
   strataUrl: env("STRATA_URL", "http://127.0.0.1:8080").replace(/\/$/, ""),
   /** Where git clients reach Strata: what clone URLs are built from. */
   strataPublicUrl: env("STRATA_PUBLIC_URL", env("STRATA_URL", "http://127.0.0.1:8080")).replace(/\/$/, ""),
+  /** Where git clients reach Strata over SSH, if it listens there: ssh://git@host:port. */
+  sshUrl: env("STRATA_SSH_URL", "").replace(/\/$/, ""),
   /** Strata's --admin-token. */
   adminToken: env("STRATA_ADMIN_TOKEN", ""),
   /** Strata's --hook-secret: proves that a hook call comes from Strata. */
@@ -25,6 +27,8 @@ export const config = {
   mirrorDir: env("HUB_MIRROR_DIR", ".data/mirrors"),
   /** Minutes between two fetches of a mirror. 0: only when asked. */
   mirrorMinutes: Number(env("HUB_MIRROR_MINUTES", "60")),
+  /** Whether webhooks may go to addresses of the hub's own network. Off, they are refused: anyone who owns a repository can set one. */
+  webhooksInside: env("HUB_WEBHOOKS_INSIDE", "") === "1",
 };
 
 export type Provider = {

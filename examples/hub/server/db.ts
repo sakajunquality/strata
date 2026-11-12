@@ -123,7 +123,106 @@ CREATE TABLE IF NOT EXISTS signing_keys (
   created_at INTEGER NOT NULL,
   UNIQUE (kind, fingerprint)
 );
+-- What a branch asks of the changes that reach it. The pattern is a branch's name, where * stands for anything.
+CREATE TABLE IF NOT EXISTS branch_rules (
+  id INTEGER PRIMARY KEY,
+  repo_id TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+  pattern TEXT NOT NULL,
+  no_force INTEGER NOT NULL DEFAULT 1,
+  no_delete INTEGER NOT NULL DEFAULT 1,
+  require_pulls INTEGER NOT NULL DEFAULT 0,
+  -- Approving reviews of its latest commit that a pull request needs before it merges.
+  approvals INTEGER NOT NULL DEFAULT 0,
+  require_signed INTEGER NOT NULL DEFAULT 0,
+  -- The checks that must have passed on a pull request's latest commit: a JSON list of their names.
+  checks TEXT NOT NULL DEFAULT '[]',
+  UNIQUE (repo_id, pattern)
+);
+CREATE TABLE IF NOT EXISTS reviews (
+  id INTEGER PRIMARY KEY,
+  pull_id INTEGER NOT NULL REFERENCES pulls(id) ON DELETE CASCADE,
+  author_id INTEGER NOT NULL REFERENCES owners(id),
+  state TEXT NOT NULL CHECK (state IN ('approved', 'changes_requested', 'commented')),
+  body TEXT NOT NULL DEFAULT '',
+  -- The commit that was looked at: an approval is of that one, not of what came after.
+  head_oid TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS reviews_by_pull ON reviews (pull_id, id);
+-- What something outside (a CI system, say) found out about a commit.
+CREATE TABLE IF NOT EXISTS statuses (
+  id INTEGER PRIMARY KEY,
+  repo_id TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+  oid TEXT NOT NULL,
+  context TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'success', 'failure', 'error')),
+  description TEXT NOT NULL DEFAULT '',
+  target_url TEXT NOT NULL DEFAULT '',
+  creator_id INTEGER REFERENCES owners(id) ON DELETE SET NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS statuses_by_commit ON statuses (repo_id, oid, id);
+-- Addresses that are told what happens to a repository.
+CREATE TABLE IF NOT EXISTS webhooks (
+  id INTEGER PRIMARY KEY,
+  repo_id TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+  url TEXT NOT NULL,
+  -- Signs each delivery, so that the receiver knows it comes from here. Kept as given: it is used at every delivery.
+  secret TEXT NOT NULL DEFAULT '',
+  -- A JSON list of event names.
+  events TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS deliveries (
+  id INTEGER PRIMARY KEY,
+  webhook_id INTEGER NOT NULL REFERENCES webhooks(id) ON DELETE CASCADE,
+  event TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'delivered', 'failed')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  -- The receiver's last answer, or why there was none.
+  status INTEGER,
+  error TEXT,
+  created_at INTEGER NOT NULL,
+  -- When it is next tried, while pending.
+  next_at INTEGER NOT NULL,
+  delivered_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS deliveries_due ON deliveries (state, next_at);
+CREATE INDEX IF NOT EXISTS deliveries_by_hook ON deliveries (webhook_id, id);
+-- Groups of an organization's members, given access to repositories together.
+CREATE TABLE IF NOT EXISTS teams (
+  id INTEGER PRIMARY KEY,
+  org_id INTEGER NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
+  name TEXT NOT NULL COLLATE NOCASE,
+  description TEXT NOT NULL DEFAULT '',
+  -- Set for a team that follows a group at a sign-in provider: its members are whoever signs in as part of that group.
+  sso_provider TEXT,
+  sso_group TEXT,
+  UNIQUE (org_id, name)
+);
+CREATE TABLE IF NOT EXISTS team_members (
+  team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
+  PRIMARY KEY (team_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS team_repos (
+  team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+  repo_id TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+  level TEXT NOT NULL CHECK (level IN ('read', 'write', 'admin')),
+  PRIMARY KEY (team_id, repo_id)
+);
 `);
+
+const hasColumn = (table: string, column: string) => db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all().some((found) => found.name === column);
+// The commit of its branch that webhooks were last told of: a push is only news if it brings another.
+if (!hasColumn("pulls", "told_oid")) db.exec("ALTER TABLE pulls ADD COLUMN told_oid TEXT");
+// What every member of an organization may do with each of its repositories, before teams add to it.
+if (!hasColumn("owners", "base_permission")) db.exec("ALTER TABLE owners ADD COLUMN base_permission TEXT NOT NULL DEFAULT 'write'");
+// Set for a membership that a sign-in provider's group brought, and that goes when the group does.
+if (!hasColumn("members", "synced")) db.exec("ALTER TABLE members ADD COLUMN synced INTEGER NOT NULL DEFAULT 0");
+
 // Databases made before these settings existed.
 for (const setting of ["require_pulls", "require_signed"]) {
   if (!db.query<{ name: string }, []>("PRAGMA table_info(repos)").all().some((column) => column.name === setting)) {
@@ -137,7 +236,7 @@ if (!db.query<{ name: string }, []>("PRAGMA table_info(activity)").all().some((c
 
 export const now = () => Math.floor(Date.now() / 1000);
 
-export type Owner = { id: number; name: string; kind: "user" | "org"; display_name: string; password_hash: string | null; created_at: number };
+export type Owner = { id: number; name: string; kind: "user" | "org"; display_name: string; password_hash: string | null; created_at: number; base_permission: Permission };
 export type Repo = {
   id: string;
   owner_id: number;
@@ -151,9 +250,11 @@ export type Repo = {
   pushed_at: number | null;
   owner_name: string;
   owner_kind: "user" | "org";
+  /** For an organization's repository: what each member may do with it. */
+  owner_base: Permission;
 };
 
-export const REPO_COLUMNS = "repos.*, owners.name AS owner_name, owners.kind AS owner_kind";
+export const REPO_COLUMNS = "repos.*, owners.name AS owner_name, owners.kind AS owner_kind, owners.base_permission AS owner_base";
 
 export function ownerByName(name: string): Owner | null {
   return db.query<Owner, [string]>("SELECT * FROM owners WHERE name = ?").get(name);
@@ -176,12 +277,21 @@ export function roleIn(orgId: number, userId: number): "owner" | "member" | null
 /** What a user (or nobody) may do with a repository. */
 export type Permission = "none" | "read" | "write" | "admin";
 
+const LEVELS: Permission[] = ["none", "read", "write", "admin"];
+const most = (levels: Permission[]) => LEVELS[Math.max(...levels.map((level) => LEVELS.indexOf(level)))]!;
+
 export function permission(repo: Repo, userId: number | null): Permission {
   const open: Permission = repo.private ? "none" : "read";
   if (userId === null) return open;
   if (repo.owner_kind === "user") return repo.owner_id === userId ? "admin" : open;
   const role = roleIn(repo.owner_id, userId);
-  return role === "owner" ? "admin" : role === "member" ? "write" : open;
+  if (role === "owner") return "admin";
+  if (role === null) return open;
+  // A member: what every member may do, and what the teams they are in add to that.
+  const teams = db
+    .query<{ level: Permission }, [string, number]>("SELECT team_repos.level FROM team_repos JOIN team_members ON team_members.team_id = team_repos.team_id WHERE team_repos.repo_id = ? AND team_members.user_id = ?")
+    .all(repo.id, userId);
+  return most([open, repo.owner_base, ...teams.map((team) => team.level)]);
 }
 
 export type Mirror = { repo_id: string; source: string; pulls: number; token: string | null; state: "waiting" | "syncing" | "synced" | "failed"; error: string | null; checked_at: number | null; synced_at: number | null };
