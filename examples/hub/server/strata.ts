@@ -21,7 +21,7 @@ async function call(method: string, path: string, body?: string | Blob): Promise
   if (!response.ok) {
     const message = (await response.text()).trim();
     // Only "not there" and "bad request" are the caller's doing.
-    throw new StrataError([400, 404, 409].includes(response.status) ? response.status : 502, message || "the git backend failed");
+    throw new StrataError([400, 404, 409, 422].includes(response.status) ? response.status : 502, message || "the git backend failed");
   }
   return response;
 }
@@ -66,7 +66,13 @@ export const strata = {
   info: async (id: string) => (await call("GET", repo(id))).json() as Promise<{ packs: number; objects: number; bytes: number }>,
   /** All refs, or those whose names start with `prefix`. */
   refs: async (id: string, prefix?: string) => (await call("GET", `${repo(id)}/refs${query({ prefix })}`)).json() as Promise<Refs>,
-  commits: async (id: string, rev: string, skip: number, limit: number) => (await call("GET", `${repo(id)}/commits${query({ rev, skip, limit })}`)).json() as Promise<{ commits: StrataCommit[]; next: number | null }>,
+  /** History, newest first. With a path: only the commits that changed what is there. */
+  commits: async (id: string, rev: string, skip: number, limit: number, path?: string) =>
+    (await call("GET", `${repo(id)}/commits${query({ rev, skip, limit, path })}`)).json() as Promise<{ commits: StrataCommit[]; next: number | null; truncated: boolean }>,
+  blame: async (id: string, rev: string, path: string) => (await call("GET", `${repo(id)}/blame${query({ rev, path })}`)).json(),
+  search: async (id: string, params: Record<string, string | undefined>) => (await call("GET", `${repo(id)}/search${query(params)}`)).json(),
+  /** A large file (Git LFS), by the SHA-256 of its content. */
+  lfs: (id: string, oid: string) => call("GET", `${repo(id)}/lfs/${oid}`),
   commit: async (id: string, rev: string) => (await call("GET", `${repo(id)}/commit${query({ rev })}`)).json() as Promise<StrataCommit>,
   tree: async (id: string, rev: string, path: string) => (await call("GET", `${repo(id)}/tree${query({ rev, path })}`)).json(),
   blob: (id: string, params: { rev?: string; path?: string; oid?: string }) => call("GET", `${repo(id)}/blob${query(params)}`),

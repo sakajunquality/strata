@@ -2,6 +2,7 @@
 // The hub keeps the conversation; what differs and whether it merges is asked
 // of Strata each time, so a pull request follows its branches as they move.
 import type { Hono } from "hono";
+import { auditRepo } from "./audit";
 import { fail, REPO, signedIn, text, type Env } from "./common";
 import { canWrite, db, mirrorOf, now, permission, type Owner, type Permission, type Repo } from "./db";
 import { ruleFor, rulesOf, statusesOf, type Rule, type Status } from "./rules";
@@ -32,7 +33,8 @@ type PullRow = {
 
 const PULLS = `
   SELECT pulls.*, author.name AS author_name, closer.name AS closed_by_name,
-    (SELECT COUNT(*) FROM comments WHERE comments.pull_id = pulls.id) AS comments
+    (SELECT COUNT(*) FROM comments WHERE comments.pull_id = pulls.id)
+      + (SELECT COUNT(*) FROM thread_comments WHERE thread_id IN (SELECT id FROM threads WHERE threads.pull_id = pulls.id)) AS comments
   FROM pulls JOIN owners author ON author.id = pulls.author_id LEFT JOIN owners closer ON closer.id = pulls.closed_by`;
 
 const pullJson = (row: PullRow) => ({
@@ -90,6 +92,37 @@ function blockers(rule: Rule | null, reviewers: ReturnType<typeof verdicts>, sta
     if (state !== "success") reasons.push(`the check ${check} ${state === "pending" ? "has not finished" : state ? "failed" : "has not reported"}`);
   }
   return reasons;
+}
+
+type ThreadRow = { id: number; path: string; side: "old" | "new"; line: number; blob_oid: string; resolved_at: number | null; resolved_by: string | null; author_id: number };
+type Sides = { path: string; old: { oid: string } | null; new: { oid: string } | null };
+
+/**
+ * The conversations on lines of a pull request's files. Each is tied to a
+ * line of one version of a file; once the pull request holds another
+ * version there, the conversation is outdated: kept, but no longer shown
+ * on the line.
+ */
+function threadsOf(pullId: number, files: Compare["files"] | null) {
+  const rows = db
+    .query<ThreadRow, [number]>("SELECT threads.*, owners.name AS resolved_by FROM threads LEFT JOIN owners ON owners.id = threads.resolved_by_id WHERE threads.pull_id = ? ORDER BY threads.id")
+    .all(pullId);
+  const comments = db
+    .query<{ id: number; thread_id: number; author: string; body: string; createdAt: number }, [number]>(
+      "SELECT thread_comments.id, thread_comments.thread_id, owners.name AS author, thread_comments.body, thread_comments.created_at AS createdAt FROM thread_comments JOIN owners ON owners.id = thread_comments.author_id WHERE thread_comments.thread_id IN (SELECT id FROM threads WHERE pull_id = ?) ORDER BY thread_comments.id",
+    )
+    .all(pullId);
+  const current = new Map((files as Sides[] | null)?.map((file) => [file.path, file]));
+  return rows.map((row) => ({
+    id: row.id,
+    path: row.path,
+    side: row.side,
+    line: row.line,
+    outdated: current.get(row.path)?.[row.side]?.oid !== row.blob_oid,
+    resolved: row.resolved_at !== null,
+    resolvedBy: row.resolved_by,
+    comments: comments.filter((comment) => comment.thread_id === row.id).map(({ thread_id: _, ...comment }) => comment),
+  }));
 }
 
 export const openPullCount = (repoId: string) => db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM pulls WHERE repo_id = ? AND state = 'open'").get(repoId)!.n;
@@ -249,6 +282,7 @@ export function addPullRoutes(api: Hono<Env>) {
       ...pullJson(pull),
       discussion: comments,
       reviews,
+      threads: threadsOf(pull.id, compared?.files ?? null),
       reviewers,
       checks,
       rule: rule && { pattern: rule.pattern, approvals: rule.approvals, checks: rule.checks },
@@ -297,6 +331,57 @@ export function addPullRoutes(api: Hono<Env>) {
     return c.json({}, 201);
   });
 
+  /** Starts a conversation on a line of one of the pull request's files, as the file stands now. */
+  api.post(`${REPO}/pulls/:number/threads`, async (c) => {
+    const user = signedIn(c);
+    const repo = c.get("repo");
+    const pull = find(repo, c.req.param("number"));
+    if (pull.state !== "open") throw fail(409, `this pull request is ${pull.state}`);
+    const body = await c.req.json();
+    const remark = text(body.body, 20000);
+    if (!remark) throw fail(400, "write something first");
+    const side = body.side === "old" ? "old" : "new";
+    const line = Math.floor(Number(body.line));
+    if (!(line >= 1)) throw fail(400, "name the line");
+    const compared = await strata.compare(repo.id, pull.base, pull.head);
+    const file = (compared.files as Sides[]).find((file) => file.path === String(body.path ?? ""));
+    const blob = file?.[side]?.oid;
+    if (!blob) throw fail(404, "this pull request does not change that file, or not on that side");
+    const id = db.transaction(() => {
+      const { lastInsertRowid } = db.run("INSERT INTO threads (pull_id, author_id, path, side, line, blob_oid, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", [pull.id, user.id, file!.path, side, line, blob, now()]);
+      db.run("INSERT INTO thread_comments (thread_id, author_id, body, created_at) VALUES (?, ?, ?, ?)", [Number(lastInsertRowid), user.id, remark, now()]);
+      return Number(lastInsertRowid);
+    })();
+    return c.json({ id }, 201);
+  });
+
+  const thread = (pullId: number, raw: string) => {
+    const found = db.query<ThreadRow, [number, number]>("SELECT threads.*, NULL AS resolved_by FROM threads WHERE id = ? AND pull_id = ?").get(Number(raw), pullId);
+    if (!found) throw fail(404, "no such conversation");
+    return found;
+  };
+
+  api.post(`${REPO}/pulls/:number/threads/:thread/comments`, async (c) => {
+    const user = signedIn(c);
+    const pull = find(c.get("repo"), c.req.param("number"));
+    const found = thread(pull.id, c.req.param("thread"));
+    const remark = text((await c.req.json()).body, 20000);
+    if (!remark) throw fail(400, "write something first");
+    db.run("INSERT INTO thread_comments (thread_id, author_id, body, created_at) VALUES (?, ?, ?, ?)", [found.id, user.id, remark, now()]);
+    return c.json({}, 201);
+  });
+
+  /** Marks a conversation settled, or opens it again: for whoever started it, the pull request's author, and those who can push. */
+  api.patch(`${REPO}/pulls/:number/threads/:thread`, async (c) => {
+    const user = signedIn(c);
+    const pull = find(c.get("repo"), c.req.param("number"));
+    const found = thread(pull.id, c.req.param("thread"));
+    if (found.author_id !== user.id && !mayChange(pull, user, c.get("level"))) throw fail(403, "only whoever started it, the pull request's author and those who can push here can settle a conversation");
+    const resolved = !!(await c.req.json()).resolved;
+    db.run("UPDATE threads SET resolved_at = ?, resolved_by_id = ? WHERE id = ?", [resolved ? now() : null, resolved ? user.id : null, found.id]);
+    return c.json({});
+  });
+
   /** A verdict on a pull request as it stands: approve it, ask for changes, or only remark on it. */
   api.post(`${REPO}/pulls/:number/reviews`, async (c) => {
     const user = signedIn(c);
@@ -342,6 +427,7 @@ export function addPullRoutes(api: Hono<Env>) {
       actor: user.name,
     });
     finish(pull, "merged", user, merged, merged.oid);
+    auditRepo(c, "pull.merge", repo, { number: pull.number, base: pull.base, head: pull.head, method, oid: merged.oid, approvedBy: verdicts(repo, pull, compared.head).filter((review) => review.state === "approved" && !review.stale).map((review) => review.author) });
     pullEvent(repo, pull, "merged", user.name, { merge_oid: merged.oid });
     return c.json({ oid: merged.oid });
   });

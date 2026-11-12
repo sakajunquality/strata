@@ -2,6 +2,7 @@
 // repositories together. A team can follow a group at a sign-in provider;
 // its members are then whoever signs in as part of that group.
 import type { Context, Hono } from "hono";
+import { audit } from "./audit";
 import { fail, signedIn, text, type Env } from "./common";
 import { signInAt } from "./config";
 import { db, ownerByName, repoByPath, roleIn, type Owner } from "./db";
@@ -41,11 +42,14 @@ export function syncTeams(userId: number, providerId: string, groups: string[] |
     const touched = new Set<number>();
     for (const team of following) {
       touched.add(team.org_id);
+      const name = db.query<{ name: string }, [number]>("SELECT name FROM owners WHERE id = ?").get(userId)?.name ?? "";
       if (has.has(team.sso_group!.toLowerCase())) {
         db.run("INSERT OR IGNORE INTO members (org_id, user_id, role, synced) VALUES (?, ?, 'member', 1)", [team.org_id, userId]);
-        db.run("INSERT OR IGNORE INTO team_members (team_id, user_id) VALUES (?, ?)", [team.id, userId]);
+        const { changes } = db.run("INSERT OR IGNORE INTO team_members (team_id, user_id) VALUES (?, ?)", [team.id, userId]);
+        if (changes) audit(null, "team.member-add", { owner: team.org_id, subject: `team ${team.name}` }, { user: name, group: team.sso_group, provider: providerId });
       } else {
-        db.run("DELETE FROM team_members WHERE team_id = ? AND user_id = ?", [team.id, userId]);
+        const { changes } = db.run("DELETE FROM team_members WHERE team_id = ? AND user_id = ?", [team.id, userId]);
+        if (changes) audit(null, "team.member-remove", { owner: team.org_id, subject: `team ${team.name}` }, { user: name, group: team.sso_group, provider: providerId });
       }
     }
     for (const orgId of touched) {
@@ -92,6 +96,7 @@ export function addTeamRoutes(api: Hono<Env>) {
     const base = body.basePermission === undefined ? found.base_permission : String(body.basePermission);
     if (!BASES.includes(base)) throw fail(400, `basePermission is one of ${BASES.join(", ")}`);
     db.run("UPDATE owners SET base_permission = ?, display_name = ? WHERE id = ?", [base, body.displayName === undefined ? found.display_name : text(body.displayName, 100), found.id]);
+    if (base !== found.base_permission) audit(c, "org.base-permission", { owner: found.id, subject: found.name }, { from: found.base_permission, to: base });
     return c.json({});
   });
 
@@ -111,6 +116,7 @@ export function addTeamRoutes(api: Hono<Env>) {
     if (db.query("SELECT 1 FROM teams WHERE org_id = ? AND name = ?").get(found.id, name)) throw fail(409, `there is a team ${name} already`);
     const [provider, group] = followed(body);
     db.run("INSERT INTO teams (org_id, name, description, sso_provider, sso_group) VALUES (?, ?, ?, ?, ?)", [found.id, name, text(body.description, 300), provider, group]);
+    audit(c, "team.create", { owner: found.id, subject: `team ${name}` }, group ? { provider, group } : {});
     return c.json({ name }, 201);
   });
 
@@ -140,12 +146,15 @@ export function addTeamRoutes(api: Hono<Env>) {
     const body = await c.req.json();
     const [provider, group] = body.ssoProvider === undefined && body.ssoGroup === undefined ? [row.sso_provider, row.sso_group] : followed(body);
     db.run("UPDATE teams SET description = ?, sso_provider = ?, sso_group = ? WHERE id = ?", [body.description === undefined ? row.description : text(body.description, 300), provider, group, row.id]);
+    if (provider !== row.sso_provider || group !== row.sso_group) audit(c, "team.follow", { owner: found.id, subject: `team ${row.name}` }, { provider, group });
     return c.json({});
   });
 
   api.delete("/owners/:name/teams/:team", (c) => {
     const found = org(c, true);
-    db.run("DELETE FROM teams WHERE id = ?", [team(c, found.id).id]);
+    const row = team(c, found.id);
+    db.run("DELETE FROM teams WHERE id = ?", [row.id]);
+    audit(c, "team.delete", { owner: found.id, subject: `team ${row.name}` });
     return c.json({});
   });
 
@@ -159,6 +168,7 @@ export function addTeamRoutes(api: Hono<Env>) {
       db.run("INSERT OR IGNORE INTO members (org_id, user_id, role) VALUES (?, ?, 'member')", [found.id, member.id]);
       db.run("INSERT OR IGNORE INTO team_members (team_id, user_id) VALUES (?, ?)", [row.id, member.id]);
     })();
+    audit(c, "team.member-add", { owner: found.id, subject: `team ${row.name}` }, { user: member.name });
     return c.json({});
   });
 
@@ -166,7 +176,9 @@ export function addTeamRoutes(api: Hono<Env>) {
     const found = org(c, true);
     const row = team(c, found.id);
     const member = ownerByName(c.req.param("username"));
-    if (member) db.run("DELETE FROM team_members WHERE team_id = ? AND user_id = ?", [row.id, member.id]);
+    if (member && db.run("DELETE FROM team_members WHERE team_id = ? AND user_id = ?", [row.id, member.id]).changes) {
+      audit(c, "team.member-remove", { owner: found.id, subject: `team ${row.name}` }, { user: member.name });
+    }
     return c.json({});
   });
 
@@ -178,6 +190,7 @@ export function addTeamRoutes(api: Hono<Env>) {
     const level = String((await c.req.json()).level ?? "");
     if (!LEVELS.includes(level)) throw fail(400, `level is one of ${LEVELS.join(", ")}`);
     db.run("INSERT INTO team_repos (team_id, repo_id, level) VALUES (?, ?, ?) ON CONFLICT (team_id, repo_id) DO UPDATE SET level = excluded.level", [row.id, repo.id, level]);
+    audit(c, "team.repo-set", { owner: found.id, repo, subject: `team ${row.name}` }, { repo: repo.name, level });
     return c.json({});
   });
 
@@ -185,7 +198,9 @@ export function addTeamRoutes(api: Hono<Env>) {
     const found = org(c, true);
     const row = team(c, found.id);
     const repo = repoByPath(found.name, c.req.param("repo"));
-    if (repo) db.run("DELETE FROM team_repos WHERE team_id = ? AND repo_id = ?", [row.id, repo.id]);
+    if (repo && db.run("DELETE FROM team_repos WHERE team_id = ? AND repo_id = ?", [row.id, repo.id]).changes) {
+      audit(c, "team.repo-remove", { owner: found.id, repo, subject: `team ${row.name}` }, { repo: repo.name });
+    }
     return c.json({});
   });
 }

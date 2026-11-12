@@ -140,6 +140,39 @@ curl -X POST http://127.0.0.1:3000/api/repos/<owner>/<repo>/statuses/<commit id>
 `state` is `pending`, `success`, `failure` or `error`. Every route of the
 API takes an access token this way.
 
+**Comments on lines.** In a pull request's changed files, a line takes a
+comment, which starts a conversation others answer in and anyone in the pull
+request can mark settled. A conversation belongs to a line of one version of
+a file: when the branch brings another version, it is kept as outdated and
+shown in the pull request's conversation, no longer on the line.
+
+## Search, blame and history
+
+The box at the top finds repositories by a word in their name or
+description. Inside a repository, "Search code" looks through the files of
+one branch for text or a regular expression; a file's page has Blame (who
+last changed each line) and History (the commits that changed it). All
+three are answered by Strata from the objects each time, without an index:
+fine for a repository of some thousands of files, slow for a very large one.
+
+## Large files
+
+git-lfs works against the clone URL as it is, over HTTP and SSH: Strata
+serves the LFS API and keeps the files. For SSH, Strata needs
+`--public-url` (`bun run start` sets it). A file kept this way is shown
+with its real size, and Raw and Download give its content.
+
+## Audit log
+
+Changes to access and settings are written down with who made them: sign-ins
+(failed ones too), tokens and keys, members and teams (also when a sign-in
+group moves someone), repositories made, deleted, renamed or hidden, branch
+rules, webhooks, and merged pull requests with who had approved them. An
+organization's owners read its log on its page, a repository's on its
+settings page, and everyone their own under "Audit log". Entries are kept
+when what they are about is deleted, and are never removed. Pushes are not
+in it: they are each repository's activity.
+
 ## Webhooks
 
 A repository's settings also hold webhooks: addresses that get a POST with a
@@ -189,8 +222,8 @@ It is an example, not a product:
 
 - No issues, forks, search or email.
 - Pull requests are between branches of one repository, with a conversation,
-  reviews and a merge button (merge commit, squash or rebase). No comments
-  on lines, no asking someone in particular for a review, no code owners,
+  reviews and a merge button (merge commit, squash or rebase). No asking
+  someone in particular for a review, no code owners,
   and conflicts are settled on your machine. Merged branches are not deleted
   for you.
 - Branch rules bind everyone, owners included: there is no bypass. A rule
@@ -210,6 +243,13 @@ It is an example, not a product:
   their account there is closed, and their access tokens keep working.
 - Mirrors go one way, from github.com or one GitHub Enterprise Server, one
   at a time. The hub keeps a full copy of each source on its own disk.
-- File history and blame are not there; diffs are
-  computed in the browser and skip large and binary files.
+- Diffs are computed in the browser and skip large and binary files.
+  Search is of one repository's one branch at a time, not across
+  repositories, and not of pull requests.
+- Comments on lines do not hold up a merge when left unsettled, are not
+  sent to webhooks, and cannot be attached to a review or span several
+  lines.
+- The audit log has no export, no retention setting and no record of who
+  read what. It lives in the hub's database, so whoever can write there can
+  change it.
 - The directory listing shows the branch's latest commit, not each entry's.

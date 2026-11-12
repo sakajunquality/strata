@@ -14,6 +14,8 @@ import { Keys } from "./pages/Keys";
 import { Tokens } from "./pages/Tokens";
 import { Repo } from "./pages/Repo";
 import { TeamPage } from "./pages/Team";
+import { AuditPage } from "./pages/Audit";
+import { SearchPage } from "./pages/Search";
 
 const theme = {
   token: { colorPrimary: "#1f6f5c", borderRadius: 6, fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" },
@@ -35,6 +37,8 @@ createRoot(document.getElementById("root")!).render(
                 <Route path="orgs/:org/teams/:team" element={<TeamPage />} />
                 <Route path="settings/tokens" element={<Tokens />} />
                 <Route path="settings/keys" element={<Keys />} />
+                <Route path="settings/audit" element={<AuditPage />} />
+                <Route path="search" element={<SearchPage />} />
                 <Route path=":owner" element={<OwnerPage />} />
                 <Route path=":owner/:repo/*" element={<Repo />} />
               </Route>

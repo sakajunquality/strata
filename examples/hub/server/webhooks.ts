@@ -5,6 +5,7 @@ import { createHmac } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import type { Hono } from "hono";
+import { auditRepo } from "./audit";
 import { fail, REPO, text, type Env } from "./common";
 import { config } from "./config";
 import { db, now, type Repo } from "./db";
@@ -140,6 +141,7 @@ export function addWebhookRoutes(api: Hono<Env>) {
     if (db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM webhooks WHERE repo_id = ?").get(repo.id)!.n >= 20) throw fail(409, "a repository has at most 20 webhooks");
     const { lastInsertRowid } = db.run("INSERT INTO webhooks (repo_id, url, secret, events, created_at) VALUES (?, ?, ?, ?, ?)", [repo.id, url, text(body.secret, 200), events(body.events ?? ["push"]), now()]);
     emit(repo, "ping", { hook: Number(lastInsertRowid), repository: repoJson(repo) }, Number(lastInsertRowid));
+    auditRepo(c, "webhook.create", repo, { url, events: JSON.parse(events(body.events ?? ["push"])) });
     return c.json({ id: Number(lastInsertRowid) }, 201);
   });
 
@@ -157,12 +159,15 @@ export function addWebhookRoutes(api: Hono<Env>) {
       body.active === undefined ? hook.active : body.active ? 1 : 0,
       hook.id,
     ]);
+    auditRepo(c, "webhook.change", c.get("repo"), { url, changed: Object.keys(body).filter((key) => ["url", "secret", "events", "active"].includes(key)) });
     return c.json({});
   });
 
   api.delete(`${REPO}/hooks/:id`, (c) => {
     admin(c.get("level"));
-    db.run("DELETE FROM webhooks WHERE id = ?", [find(c.get("repo"), c.req.param("id")).id]);
+    const hook = find(c.get("repo"), c.req.param("id"));
+    db.run("DELETE FROM webhooks WHERE id = ?", [hook.id]);
+    auditRepo(c, "webhook.remove", c.get("repo"), { url: hook.url });
     return c.json({});
   });
 

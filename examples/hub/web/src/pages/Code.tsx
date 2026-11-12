@@ -1,9 +1,9 @@
 import { FileOutlined, FolderFilled, LinkOutlined } from "@ant-design/icons";
-import { Alert, Button, Card, Popover, Segmented, Space, Typography } from "antd";
-import { useState } from "react";
+import { Alert, Button, Card, Input, Popover, Segmented, Space, Tag, Typography } from "antd";
+import { useEffect, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Link, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { api, query, useLoad, type Commit, type Tree } from "../api";
 import { blobUrl, CodeView, loadBlob } from "../blob";
 import { useSession } from "../session";
@@ -103,6 +103,7 @@ function Readme({ base, oid, name }: { base: string; oid: string; name: string }
 
 export function CodePage(context: RepoContext) {
   const { repo, root, base } = context;
+  const navigate = useNavigate();
   const { rev, path } = usePlace(repo);
   const atRoot = !useParams()["*"];
   const tree = useLoad(
@@ -118,6 +119,7 @@ export function CodePage(context: RepoContext) {
         <RevSelect repo={repo} rev={rev} to={(next) => `${root}/tree/${urlPath(next)}${path ? `/${urlPath(path)}` : ""}`} />
         <Crumbs root={root} repo={repo.name} rev={rev} path={path} />
         <span className="grow" />
+        <Input.Search placeholder="Search code" aria-label="Search code" allowClear className="search-box" onSearch={(q) => q.trim() && navigate(`${root}/search${query({ q: q.trim(), rev })}`)} />
         <CloneButton url={repo.cloneUrl} sshUrl={repo.sshUrl} />
       </div>
       <Loaded from={tree}>
@@ -157,12 +159,27 @@ export function CodePage(context: RepoContext) {
   );
 }
 
+/** What a Git LFS pointer says: the file's content is kept apart, under this id. */
+function lfsPointer(text: string | null): { oid: string; size: number } | null {
+  if (!text?.startsWith("version https://git-lfs.github.com/spec/v1\n")) return null;
+  const oid = /^oid sha256:([0-9a-f]{64})$/m.exec(text)?.[1];
+  const size = /^size (\d+)$/m.exec(text)?.[1];
+  return oid && size ? { oid, size: Number(size) } : null;
+}
+
 export function BlobPage({ repo, root, base }: RepoContext) {
   const { rev, path } = usePlace(repo);
   const [raw, setRaw] = useState(false);
   const image = IMAGE.test(path);
   const blob = useLoad(() => (image ? Promise.resolve({ size: -1, text: null }) : loadBlob(base, { rev, path })), `blob:${base}:${rev}:${path}`);
   const markdown = MARKDOWN.test(path);
+  const large = lfsPointer(blob.data?.text ?? null);
+  // "#L12" names a line: bring it into view once the file is shown.
+  const { hash } = useLocation();
+  const marked = /^#L(\d+)$/.exec(hash)?.[1];
+  useEffect(() => {
+    if (marked && blob.data) document.getElementById("marked-line")?.scrollIntoView({ block: "center" });
+  }, [marked, blob.data]);
   return (
     <>
       <div className="toolbar">
@@ -173,26 +190,30 @@ export function BlobPage({ repo, root, base }: RepoContext) {
         {(data) => (
           <Card
             size="small"
-            title={<span className="muted small">{data.size >= 0 ? bytes(data.size) : path.split("/").pop()}</span>}
+            title={<span className="muted small">{large ? <>{bytes(large.size)} <Tag className="tag-gap">Git LFS</Tag></> : data.size >= 0 ? bytes(data.size) : path.split("/").pop()}</span>}
             extra={
               <Space>
                 {markdown && data.text !== null && (
                   <Segmented size="small" value={raw ? "Code" : "Preview"} options={["Preview", "Code"]} onChange={(value) => setRaw(value === "Code")} />
                 )}
-                <Button size="small" href={blobUrl(base, { rev, path })} target="_blank">Raw</Button>
-                <Button size="small" href={blobUrl(base, { rev, path, download: 1 })}>Download</Button>
+                {!image && data.text !== null && !large && <Link to={`${root}/blame/${urlPath(rev)}/${urlPath(path)}`}><Button size="small">Blame</Button></Link>}
+                <Link to={`${root}/commits/${urlPath(rev)}${query({ path })}`}><Button size="small">History</Button></Link>
+                <Button size="small" href={blobUrl(base, { rev, path, resolve: 1 })} target="_blank">Raw</Button>
+                <Button size="small" href={blobUrl(base, { rev, path, resolve: 1, download: 1 })}>Download</Button>
               </Space>
             }
             styles={{ body: { padding: 0 } }}
           >
             {image ? (
-              <div className="center"><img src={blobUrl(base, { rev, path })} alt={path} className="preview" /></div>
+              <div className="center"><img src={blobUrl(base, { rev, path, resolve: 1 })} alt={path} className="preview" /></div>
+            ) : large ? (
+              <Alert type="info" banner title="This file is kept with Git LFS: git holds a note of where its content is. Download it to see it." />
             ) : data.text === null ? (
               <Alert type="info" banner title="This file is binary or too large to show. Download it to see it." />
             ) : markdown && !raw ? (
               <div className="markdown padded"><Markdown remarkPlugins={[remarkGfm]}>{data.text}</Markdown></div>
             ) : (
-              <CodeView text={data.text} path={path} />
+              <CodeView text={data.text} path={path} marked={marked ? Number(marked) : undefined} />
             )}
           </Card>
         )}

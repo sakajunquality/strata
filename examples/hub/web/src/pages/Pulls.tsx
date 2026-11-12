@@ -7,7 +7,7 @@ import remarkGfm from "remark-gfm";
 import { api, query, useLoad, type Compare, type Pull, type PullDetail } from "../api";
 import { useSession } from "../session";
 import { Loaded, shortOid, subject, When } from "../util";
-import { CommitRows, FileCard } from "./History";
+import { CommitRows, FileCard, ThreadBox, type Review } from "./History";
 import type { RepoContext } from "./Repo";
 
 const STATES = { open: ["green", "Open"], merged: ["purple", "Merged"], closed: ["red", "Closed"] } as const;
@@ -65,7 +65,7 @@ export function PullsPage({ repo, root, base }: RepoContext) {
 }
 
 /** The commits and files of a comparison. */
-function Changes({ compare, root, base, only }: { compare: Compare; root: string; base: string; only?: "commits" | "files" }) {
+function Changes({ compare, root, base, only, review }: { compare: Compare; root: string; base: string; only?: "commits" | "files"; review?: Review }) {
   return (
     <>
       {only !== "files" && (
@@ -78,7 +78,7 @@ function Changes({ compare, root, base, only }: { compare: Compare; root: string
         <>
           {!only && <Typography.Paragraph className="stack muted">{plural(compare.files.length, "changed file")}</Typography.Paragraph>}
           {compare.truncated && <Alert type="warning" showIcon title="Too many files changed to list them all." />}
-          {compare.files.map((file, i) => <FileCard key={file.path} base={base} root={root} commit={compare.head} file={file} open={i < 20} />)}
+          {compare.files.map((file, i) => <FileCard key={file.path} base={base} root={root} commit={compare.head} file={file} open={i < 20} review={review} />)}
         </>
       )}
     </>
@@ -312,14 +312,30 @@ export function PullPage({ root, base, reload }: RepoContext) {
             note: <Note key={`r${review.id}`} author={review.author} time={review.createdAt} body={review.body} did={VERDICTS[review.state][0]} tag={<>{VERDICTS[review.state][1]}{review.stale && review.state !== "commented" && <Tag>earlier commit</Tag>}</>} />,
           })),
         ].sort((a, b) => a.time - b.time || a.key.localeCompare(b.key));
-        const review = (state: string) => act(async () => {
+        const judge = (state: string) => act(async () => {
           await api(`${base}/pulls/${number}/reviews`, "POST", { state, body: form.getFieldValue("body") ?? "", head: pull.compare?.head });
           form.resetFields();
         });
+        // Conversations on lines: started and answered by anyone signed in, while the pull request is open.
+        const threads = `${base}/pulls/${number}/threads`;
+        const review: Review = {
+          threads: pull.threads,
+          start: pull.can.review ? (at, body) => act(() => api(threads, "POST", { ...at, body })) : null,
+          reply: me?.user ? (thread, body) => act(() => api(`${threads}/${thread}/comments`, "POST", { body })) : null,
+          settle: me?.user ? (thread, resolved) => act(() => api(`${threads}/${thread}`, "PATCH", { resolved })) : null,
+        };
+        const unsettled = pull.threads.filter((thread) => !thread.resolved).length;
         const conversation = (
           <div className="medium wide">
             <Note author={pull.author} time={pull.createdAt} body={pull.body} did="opened this" />
             {said.map((entry) => entry.note)}
+            {pull.threads.length > 0 && (
+              <Card size="small" className="stack" title={`Comments on lines (${unsettled} open, ${pull.threads.length - unsettled} settled)`}>
+                {pull.threads.map((thread) => (
+                  <ThreadBox key={thread.id} thread={thread} review={review} where={<span className="mono">{thread.path}:{thread.line}</span>} />
+                ))}
+              </Card>
+            )}
             {open && <Standing pull={pull} />}
             {open && <MergeBox pull={pull} base={base} act={act} />}
             {pull.state === "merged" && (
@@ -338,8 +354,8 @@ export function PullPage({ root, base, reload }: RepoContext) {
                 </Form.Item>
                 <Space>
                   <Button type="primary" htmlType="submit">Comment</Button>
-                  {pull.can.judge && <Button onClick={() => review("approved")}>Approve</Button>}
-                  {pull.can.judge && <Button onClick={() => review("changes_requested")}>Request changes</Button>}
+                  {pull.can.judge && <Button onClick={() => judge("approved")}>Approve</Button>}
+                  {pull.can.judge && <Button onClick={() => judge("changes_requested")}>Request changes</Button>}
                   {pull.can.change && open && <Button onClick={() => change({ state: "closed" })}>Close pull request</Button>}
                   {pull.can.change && pull.state === "closed" && <Button onClick={() => change({ state: "open" })}>Reopen</Button>}
                 </Space>
@@ -366,7 +382,7 @@ export function PullPage({ root, base, reload }: RepoContext) {
               items={[
                 { key: "conversation", label: "Conversation", children: conversation },
                 { key: "commits", label: `Commits${pull.compare ? ` (${pull.compare.ahead})` : ""}`, children: pull.compare ? <Changes compare={pull.compare} root={root} base={base} only="commits" /> : gone },
-                { key: "files", label: `Files changed${pull.compare ? ` (${pull.compare.files.length})` : ""}`, children: pull.compare ? <Changes compare={pull.compare} root={root} base={base} only="files" /> : gone },
+                { key: "files", label: `Files changed${pull.compare ? ` (${pull.compare.files.length})` : ""}`, children: pull.compare ? <Changes compare={pull.compare} root={root} base={base} only="files" review={review} /> : gone },
               ]}
             />
           </>

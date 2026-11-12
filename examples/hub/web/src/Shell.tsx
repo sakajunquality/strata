@@ -1,5 +1,5 @@
 import { DownOutlined, PlusOutlined } from "@ant-design/icons";
-import { Button, Dropdown, Space } from "antd";
+import { Button, Dropdown, Input, Space } from "antd";
 import { Link, Outlet, useNavigate } from "react-router-dom";
 import { api } from "./api";
 import { useSession } from "./session";
@@ -20,6 +20,7 @@ export function Shell() {
           <span className="brand-mark" aria-hidden />
           Strata Hub
         </Link>
+        <Input.Search placeholder="Find a repository" aria-label="Find a repository" allowClear className="top-search" onSearch={(q) => q.trim() && navigate(`/search?q=${encodeURIComponent(q.trim())}`)} />
         <span className="grow" />
         {user && (
           <Space>
@@ -41,6 +42,7 @@ export function Shell() {
                   { type: "divider" as const },
                   { key: "tokens", label: <Link to="/settings/tokens">Access tokens</Link> },
                   { key: "keys", label: <Link to="/settings/keys">SSH and signing keys</Link> },
+                  { key: "audit", label: <Link to="/settings/audit">Audit log</Link> },
                   { key: "out", label: "Sign out", onClick: signOut },
                 ],
               }}

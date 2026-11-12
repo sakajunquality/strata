@@ -149,6 +149,30 @@ CREATE TABLE IF NOT EXISTS reviews (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS reviews_by_pull ON reviews (pull_id, id);
+-- Conversations on lines of a pull request's files.
+CREATE TABLE IF NOT EXISTS threads (
+  id INTEGER PRIMARY KEY,
+  pull_id INTEGER NOT NULL REFERENCES pulls(id) ON DELETE CASCADE,
+  author_id INTEGER NOT NULL REFERENCES owners(id),
+  path TEXT NOT NULL,
+  -- Which version of the file the line is counted in: the base's (old) or the branch's (new).
+  side TEXT NOT NULL CHECK (side IN ('old', 'new')),
+  line INTEGER NOT NULL,
+  -- That version, by its id: the line means something only in it.
+  blob_oid TEXT NOT NULL,
+  resolved_at INTEGER,
+  resolved_by_id INTEGER REFERENCES owners(id) ON DELETE SET NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS threads_by_pull ON threads (pull_id, id);
+CREATE TABLE IF NOT EXISTS thread_comments (
+  id INTEGER PRIMARY KEY,
+  thread_id INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+  author_id INTEGER NOT NULL REFERENCES owners(id),
+  body TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS thread_comments_by_thread ON thread_comments (thread_id, id);
 -- What something outside (a CI system, say) found out about a commit.
 CREATE TABLE IF NOT EXISTS statuses (
   id INTEGER PRIMARY KEY,

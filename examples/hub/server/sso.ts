@@ -4,6 +4,7 @@
 import type { Context, Hono } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { createRemoteJWKSet, jwtVerify, type JWTPayload } from "jose";
+import { audit } from "./audit";
 import { startSession } from "./auth";
 import type { Env } from "./common";
 import { config, signInAt, type Provider } from "./config";
@@ -138,6 +139,7 @@ function accountFor(provider: Provider, arrival: Arrival, reserved: Set<string>)
     const name = freeName(arrival.username, (name) => reserved.has(name.toLowerCase()) || !!ownerByName(name));
     const { lastInsertRowid } = db.run("INSERT INTO owners (name, kind, display_name, created_at) VALUES (?, 'user', ?, ?)", [name, arrival.displayName.slice(0, 100), now()]);
     db.run("INSERT INTO identities (provider, subject, user_id, created_at) VALUES (?, ?, ?, ?)", [provider.id, arrival.subject, Number(lastInsertRowid), now()]);
+    audit(name, "account.create", { owner: Number(lastInsertRowid), subject: name }, { by: provider.id });
     return Number(lastInsertRowid);
   })();
 }
@@ -179,6 +181,8 @@ export function addSignInRoutes(api: Hono<Env>, reserved: Set<string>) {
       const userId = accountFor(provider, arrival, reserved);
       syncTeams(userId, provider.id, arrival.groups);
       startSession(c, userId);
+      const name = db.query<{ name: string }, [number]>("SELECT name FROM owners WHERE id = ?").get(userId)!.name;
+      audit(name, "account.sign-in", { owner: userId, subject: name }, { by: provider.id });
     } catch (error) {
       if (error instanceof Refused) return back(c, error.message);
       console.error(`sign-in with ${provider.name}:`, error);

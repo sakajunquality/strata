@@ -34,6 +34,8 @@ const children = [
     strataBin,
     "--listen", `127.0.0.1:${strataPort}`,
     "--ssh-listen", `127.0.0.1:${sshPort}`,
+    // Where large files (Git LFS) are fetched from, for clients that came in over SSH.
+    "--public-url", `http://127.0.0.1:${strataPort}`,
     "--data-dir", resolve(root, ".data/strata"),
     "--authz-url", `http://127.0.0.1:${hubPort}/hooks/authz`,
     "--pre-receive-url", `http://127.0.0.1:${hubPort}/hooks/pre-receive`,

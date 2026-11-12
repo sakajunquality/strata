@@ -7,7 +7,7 @@ export const MAX_SHOWN = 1024 * 1024;
 
 export type Blob = { size: number; text: string | null };
 
-export const blobUrl = (base: string, params: { rev?: string; path?: string; oid?: string; download?: number }) => `/api${base}/blob${query(params)}`;
+export const blobUrl = (base: string, params: { rev?: string; path?: string; oid?: string; download?: number; resolve?: number }) => `/api${base}/blob${query(params)}`;
 
 /** A file's content. `text` is null for what cannot be shown: binary or too big. */
 export async function loadBlob(base: string, params: { rev?: string; path?: string; oid?: string }): Promise<Blob> {
@@ -28,7 +28,8 @@ function language(path: string): string | undefined {
 
 const escape = (text: string) => text.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]!);
 
-export function CodeView({ text, path }: { text: string; path: string }) {
+/** A file as code. `marked` is a line to point out. */
+export function CodeView({ text, path, marked }: { text: string; path: string; marked?: number }) {
   const html = useMemo(() => {
     const lang = language(path);
     // Highlighting a very large file would stall the page.
@@ -37,6 +38,7 @@ export function CodeView({ text, path }: { text: string; path: string }) {
   const lines = text.endsWith("\n") ? text.split("\n").length - 1 : text.split("\n").length;
   return (
     <div className="code">
+      {marked !== undefined && marked >= 1 && marked <= lines && <div id="marked-line" className="marked-line" style={{ top: `calc(12px + ${marked - 1} * var(--code-line))` }} />}
       <pre className="gutter" aria-hidden>{Array.from({ length: lines }, (_, i) => i + 1).join("\n")}</pre>
       <pre className="source"><code className="hljs" dangerouslySetInnerHTML={{ __html: html }} /></pre>
     </div>

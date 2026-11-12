@@ -10,6 +10,7 @@ import { BlobPage, CodePage } from "./Code";
 import { CommitPage, CommitsPage } from "./History";
 import { NewPullPage, PullPage, PullsPage } from "./Pulls";
 import { RepoSettings } from "./RepoSettings";
+import { BlamePage, CodeSearchPage } from "./Search";
 
 /** What the pages of one repository share. */
 export type RepoContext = { repo: RepoDetail; root: string; base: string; reload: () => void };
@@ -127,7 +128,7 @@ export function Repo() {
   const detail = useLoad(() => api<RepoDetail>(base), `repo:${base}:${me?.user?.name}`);
   const root = `/${owner}/${name}`;
   const section = location.pathname.slice(root.length + 1).split("/")[0];
-  const tab = { "": "code", tree: "code", blob: "code", commits: "commits", commit: "commits", branches: "branches", pulls: "pulls", activity: "activity", settings: "settings" }[section] ?? "code";
+  const tab = { "": "code", tree: "code", blob: "code", blame: "code", search: "code", commits: "commits", commit: "commits", branches: "branches", pulls: "pulls", activity: "activity", settings: "settings" }[section] ?? "code";
 
   return (
     <Loaded from={detail}>
@@ -160,6 +161,8 @@ export function Repo() {
               <Route index element={<CodePage {...context} />} />
               <Route path="tree/*" element={<CodePage {...context} />} />
               <Route path="blob/*" element={<BlobPage {...context} />} />
+              <Route path="blame/*" element={<BlamePage {...context} />} />
+              <Route path="search" element={<CodeSearchPage {...context} />} />
               <Route path="commits/*" element={<CommitsPage {...context} />} />
               <Route path="commit/:oid" element={<CommitPage {...context} />} />
               <Route path="pulls" element={<PullsPage {...context} />} />

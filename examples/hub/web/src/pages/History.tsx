@@ -1,8 +1,11 @@
-import { Alert, Button, Card, Space, Tag, Tooltip, Typography } from "antd";
+import { PlusOutlined } from "@ant-design/icons";
+import { Alert, Button, Card, Input, Space, Tag, Tooltip, Typography } from "antd";
 import { structuredPatch } from "diff";
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { api, query, useLoad, type Commit, type CommitDetail, type FileChange, type Verification } from "../api";
+import { api, query, useLoad, type Commit, type CommitDetail, type FileChange, type Thread, type Verification } from "../api";
 import { loadBlob } from "../blob";
 import { Loaded, shortOid, splitRev, subject, urlPath, When } from "../util";
 import { RevSelect, type RepoContext } from "./Repo";
@@ -42,23 +45,27 @@ export function CommitsPage({ repo, root, base }: RepoContext) {
   const [params] = useSearchParams();
   const rev = rest ? splitRev(rest, [...repo.branches, ...repo.tags]).rev : repo.defaultBranch;
   const skip = Number(params.get("skip")) || 0;
+  // With a path: the history of that file or directory alone.
+  const path = params.get("path") ?? undefined;
   const page = useLoad(
-    () => (repo.empty && !rest ? Promise.resolve({ commits: [], next: null }) : api<{ commits: Commit[]; next: number | null }>(`${base}/commits${query({ rev, skip })}`)),
-    `commits:${base}:${rev}:${skip}`,
+    () => (repo.empty && !rest ? Promise.resolve({ commits: [] as Commit[], next: null as number | null, truncated: false }) : api<{ commits: Commit[]; next: number | null; truncated?: boolean }>(`${base}/commits${query({ rev, skip, path })}`)),
+    `commits:${base}:${rev}:${skip}:${path}`,
   );
   const here = `${root}/commits/${urlPath(rev)}`;
   return (
     <>
       <div className="toolbar">
-        <RevSelect repo={repo} rev={rev} to={(next) => `${root}/commits/${urlPath(next)}`} />
+        <RevSelect repo={repo} rev={rev} to={(next) => `${root}/commits/${urlPath(next)}${query({ path })}`} />
+        {path && <span>History of <Link to={`${root}/blob/${urlPath(rev)}/${urlPath(path)}`} className="mono">{path}</Link> · <Link to={here}>all commits</Link></span>}
       </div>
       <Loaded from={page}>
         {(data) => (
           <>
             <CommitRows root={root} commits={data.commits} />
+            {data.truncated && <Alert type="warning" showIcon className="stack" title="The history is long: the search for older commits that changed this path was given up." />}
             <Space className="stack">
-              {skip > 0 && <Link to={`${here}${query({ skip: Math.max(0, skip - 30) || undefined })}`}><Button>Newer</Button></Link>}
-              {data.next !== null && <Link to={`${here}?skip=${data.next}`}><Button>Older</Button></Link>}
+              {skip > 0 && <Link to={`${here}${query({ skip: Math.max(0, skip - 30) || undefined, path })}`}><Button>Newer</Button></Link>}
+              {data.next !== null && <Link to={`${here}${query({ skip: data.next, path })}`}><Button>Older</Button></Link>}
             </Space>
           </>
         )}
@@ -76,7 +83,77 @@ async function sideText(base: string, side: FileChange["old"]): Promise<string |
   return blob.text !== null && blob.size <= MAX_DIFFED ? blob.text : null;
 }
 
-function Diff({ base, file }: { base: string; file: FileChange }) {
+/** What lets the lines of a diff be talked about: the conversations there are, and how to add to them. */
+export type Review = {
+  threads: Thread[];
+  /** Null for someone who may not comment. */
+  start: ((at: { path: string; side: "old" | "new"; line: number }, body: string) => Promise<void>) | null;
+  reply: ((thread: number, body: string) => Promise<void>) | null;
+  settle: ((thread: number, resolved: boolean) => Promise<void>) | null;
+};
+
+function Composer({ placeholder, send, cancel }: { placeholder: string; send: (body: string) => Promise<void>; cancel?: () => void }) {
+  const [body, setBody] = useState("");
+  const [busy, setBusy] = useState(false);
+  return (
+    <div className="composer">
+      <Input.TextArea value={body} onChange={(e) => setBody(e.target.value)} autoSize={{ minRows: 2, maxRows: 10 }} placeholder={placeholder} aria-label={placeholder} />
+      <Space>
+        <Button
+          size="small"
+          type="primary"
+          loading={busy}
+          disabled={!body.trim()}
+          onClick={async () => {
+            setBusy(true);
+            await send(body);
+            setBusy(false);
+            setBody("");
+          }}
+        >
+          Comment
+        </Button>
+        {cancel && <Button size="small" onClick={cancel}>Cancel</Button>}
+      </Space>
+    </div>
+  );
+}
+
+/** One conversation: what was said, a box to answer in, and the button that settles it. */
+export function ThreadBox({ thread, review, where }: { thread: Thread; review: Review; where?: ReactNode }) {
+  const [open, setOpen] = useState(!thread.resolved);
+  return (
+    <div className="thread">
+      <div className="thread-head">
+        <span className="muted small">
+          {where}
+          {thread.resolved && <Tag className="tag-gap">Settled{thread.resolvedBy ? ` by ${thread.resolvedBy}` : ""}</Tag>}
+          {thread.outdated && <Tag className="tag-gap">On an earlier version of the file</Tag>}
+        </span>
+        <Space size={4}>
+          {thread.resolved && <Button size="small" type="text" onClick={() => setOpen(!open)}>{open ? "Hide" : "Show"}</Button>}
+          {review.settle && <Button size="small" type="text" onClick={() => review.settle!(thread.id, !thread.resolved)}>{thread.resolved ? "Reopen" : "Settle"}</Button>}
+        </Space>
+      </div>
+      {open && (
+        <>
+          {thread.comments.map((comment) => (
+            <div key={comment.id} className="thread-comment">
+              <div className="small"><strong>{comment.author}</strong> <span className="muted"><When time={comment.createdAt} /></span></div>
+              <div className="markdown"><Markdown remarkPlugins={[remarkGfm]}>{comment.body}</Markdown></div>
+            </div>
+          ))}
+          {review.reply && <Composer placeholder="Reply" send={(body) => review.reply!(thread.id, body)} />}
+        </>
+      )}
+    </div>
+  );
+}
+
+function Diff({ base, file, review }: { base: string; file: FileChange; review?: Review }) {
+  // The line a new conversation is being started on, as "side:line".
+  const [writing, setWriting] = useState("");
+  const here = (review?.threads ?? []).filter((thread) => thread.path === file.path && !thread.outdated);
   const patch = useLoad(async () => {
     const [before, after] = await Promise.all([sideText(base, file.old), sideText(base, file.new)]);
     if (before === null || after === null) return null;
@@ -102,13 +179,28 @@ function Diff({ base, file }: { base: string; file: FileChange }) {
                     if (mark === "\\") return <tr key={`${h}-${i}`}><td /><td /><td className="muted">{line}</td></tr>;
                     const left = mark === "+" ? "" : before++;
                     const right = mark === "-" ? "" : after++;
-                    return (
+                    // A removed line is one of the old file; any other is one of the new.
+                    const at = mark === "-" ? { side: "old" as const, line: Number(left) } : { side: "new" as const, line: Number(right) };
+                    const key = `${at.side}:${at.line}`;
+                    const said = here.filter((thread) => thread.side === at.side && thread.line === at.line);
+                    return [
                       <tr key={`${h}-${i}`} className={mark === "+" ? "add" : mark === "-" ? "del" : undefined}>
                         <td className="n">{left}</td>
                         <td className="n">{right}</td>
-                        <td>{mark}{line.slice(1)}</td>
-                      </tr>
-                    );
+                        <td>
+                          {review?.start && <button type="button" className="add-comment" aria-label={`Comment on line ${at.line}`} onClick={() => setWriting(key)}><PlusOutlined /></button>}
+                          {mark}{line.slice(1)}
+                        </td>
+                      </tr>,
+                      (said.length > 0 || writing === key) && (
+                        <tr key={`${h}-${i}-said`} className="said">
+                          <td colSpan={3}>
+                            {said.map((thread) => <ThreadBox key={thread.id} thread={thread} review={review!} />)}
+                            {writing === key && <Composer placeholder="Comment on this line" cancel={() => setWriting("")} send={async (body) => { await review!.start!({ path: file.path, ...at }, body); setWriting(""); }} />}
+                          </td>
+                        </tr>
+                      ),
+                    ];
                   }),
                 ];
               })}
@@ -122,7 +214,7 @@ function Diff({ base, file }: { base: string; file: FileChange }) {
 
 const COLORS = { added: "green", deleted: "red", modified: "gold" } as const;
 
-export function FileCard({ base, root, commit, file, open }: { base: string; root: string; commit: string; file: FileChange; open: boolean }) {
+export function FileCard({ base, root, commit, file, open, review }: { base: string; root: string; commit: string; file: FileChange; open: boolean; review?: Review }) {
   const [shown, setShown] = useState(open);
   const submodule = (file.new ?? file.old)!.mode === "160000";
   return (
@@ -140,7 +232,7 @@ export function FileCard({ base, root, commit, file, open }: { base: string; roo
       {submodule ? (
         <div className="diff-note muted">Submodule {file.old ? shortOid(file.old.oid) : "(none)"} → {file.new ? shortOid(file.new.oid) : "(removed)"}</div>
       ) : shown ? (
-        <Diff base={base} file={file} />
+        <Diff base={base} file={file} review={review} />
       ) : (
         <div className="diff-note"><Button size="small" onClick={() => setShown(true)}>Show changes</Button></div>
       )}

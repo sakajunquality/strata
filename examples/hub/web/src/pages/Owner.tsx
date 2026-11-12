@@ -4,6 +4,7 @@ import { api, useLoad, type OwnerPage as Data } from "../api";
 import { RepoList } from "../RepoList";
 import { useSession } from "../session";
 import { Loaded } from "../util";
+import { AuditCard } from "./Audit";
 import { Teams } from "./Team";
 
 export function OwnerPage() {
@@ -109,6 +110,7 @@ export function OwnerPage() {
               </Card>
             )}
             {data.kind === "org" && data.role && <Teams org={data.name} canChange={isOwner} />}
+            {data.kind === "org" && isOwner && <AuditCard path={`/owners/${data.name}/audit`} about="this organization, its members, teams and repositories" />}
           </>
         );
       }}

@@ -129,6 +129,7 @@ beforeAll(async () => {
     strataBin,
     "--listen", `127.0.0.1:${strataPort}`,
     "--ssh-listen", `127.0.0.1:${sshPort}`,
+    "--public-url", `http://127.0.0.1:${strataPort}`,
     "--data-dir", join(tmp, "strata"),
     "--authz-url", `${hub}/hooks/authz`,
     "--pre-receive-url", `${hub}/hooks/pre-receive`,
@@ -909,3 +910,147 @@ test("teams, SSH, branch rules, reviews, checks and webhooks", async () => {
   await Bun.sleep(300);
   expect(outside.delivered.length).toBe(before);
 }, 60_000);
+
+test("comments on lines, the audit log, search, blame and large files", async () => {
+  const [uma, vic, anyone] = [browser(), browser(), browser()];
+  for (const [who, name] of [[uma, "uma"], [vic, "vic"]] as const) expect((await who("POST", "/signup", { username: name, password: "correct horse" })).status).toBe(201);
+  expect((await uma("POST", "/orgs", { name: "quay" })).status).toBe(201);
+  expect((await uma("POST", "/repos", { owner: "quay", name: "dock", description: "Where ships tie up" })).status).toBe(201);
+  expect((await uma("PUT", "/owners/quay/members/vic", { role: "member" })).status).toBe(200);
+  const dock = "/repos/quay/dock";
+  const token: string = (await uma("POST", "/tokens", { name: "laptop" })).data.token;
+  const origin = remote(`uma:${token}`, "quay/dock");
+
+  const work = join(tmp, "dock");
+  git(tmp, "init", "-q", "-b", "main", work);
+  const commit = (file: string, text: string, message: string) => {
+    writeFileSync(join(work, file), text);
+    git(work, "add", ".");
+    git(work, "commit", "-q", "-m", message);
+    return git(work, "rev-parse", "HEAD").out;
+  };
+  const first = commit("ships.txt", "ketch\nsloop\nyawl\n", "Three ships");
+  commit("README.md", "# Dock\n\nA Harbour for small ships.\n", "Say what it is");
+  const third = commit("ships.txt", "ketch\nsloop\nyawl\nbarque\n", "A fourth");
+  expect(git(work, "push", "-q", origin, "main").err).toBe("");
+
+  // ---- Search: repositories by a word, code by its text.
+  expect((await anyone("GET", "/search?q=ships")).data.repos).toMatchObject([{ owner: "quay", name: "dock" }]);
+  expect((await anyone("GET", "/search?q=quay")).data.repos).toHaveLength(1);
+  expect((await anyone("GET", "/search?q=100%25")).data.repos).toEqual([]);
+  const found = (await anyone("GET", `${dock}/search?q=harbour`)).data;
+  expect(found).toMatchObject({ matches: 1, truncated: false, files: [{ path: "README.md", matches: [{ line: 3, text: "A Harbour for small ships." }] }] });
+  expect((await anyone("GET", `${dock}/search?q=harbour&case=1`)).data.matches).toBe(0);
+  expect((await anyone("GET", `${dock}/search?q=${encodeURIComponent("^(ketch|yawl)$")}&regex=1`)).data.matches).toBe(2);
+  expect((await anyone("GET", `${dock}/search?q=ships.txt`)).data.paths).toEqual(["ships.txt"]);
+  expect((await anyone("GET", `${dock}/search?q=${encodeURIComponent("(")}&regex=1`)).status).toBe(400);
+
+  // ---- Blame and the history of one file.
+  const blame = (await anyone("GET", `${dock}/blame?path=ships.txt`)).data;
+  expect(blame.hunks).toEqual([{ start: 1, lines: 3, oid: first }, { start: 4, lines: 1, oid: third }]);
+  expect(blame.commits[first]).toMatchObject({ message: "Three ships\n", author: { name: "Alice" } });
+  expect((await anyone("GET", `${dock}/blame?path=nope.txt`)).status).toBe(404);
+  const history = (await anyone("GET", `${dock}/commits?path=ships.txt`)).data;
+  expect(history.commits.map((c: any) => c.oid)).toEqual([third, first]);
+
+  // ---- Comments on lines of a pull request.
+  git(work, "checkout", "-q", "-b", "more");
+  commit("ships.txt", "ketch\nschooner\nyawl\nbarque\nbrig\n", "Change one, add one");
+  expect(git(work, "push", "-q", origin, "more").err).toBe("");
+  expect((await vic("POST", `${dock}/pulls`, { title: "More ships", base: "main", head: "more" })).data).toEqual({ number: 1 });
+  const threads = `${dock}/pulls/1/threads`;
+  expect((await anyone("POST", threads, { path: "ships.txt", side: "new", line: 2, body: "?" })).status).toBe(401);
+  expect((await uma("POST", threads, { path: "README.md", side: "new", line: 1, body: "?" })).status).toBe(404);
+  expect((await uma("POST", threads, { path: "ships.txt", side: "new", line: 0, body: "?" })).status).toBe(400);
+  expect((await uma("POST", threads, { path: "ships.txt", side: "new", line: 2, body: "Why a schooner?" })).data).toEqual({ id: 1 });
+  expect((await uma("POST", threads, { path: "ships.txt", side: "old", line: 2, body: "The sloop was fine." })).status).toBe(201);
+  expect((await vic("POST", `${threads}/1/comments`, { body: "It has two masts." })).status).toBe(201);
+  expect((await vic("POST", `${threads}/99/comments`, { body: "?" })).status).toBe(404);
+  let pull = (await anyone("GET", `${dock}/pulls/1`)).data;
+  expect(pull.threads).toMatchObject([
+    { id: 1, path: "ships.txt", side: "new", line: 2, outdated: false, resolved: false, comments: [{ author: "uma", body: "Why a schooner?" }, { author: "vic", body: "It has two masts." }] },
+    { id: 2, side: "old", line: 2, outdated: false, comments: [{ author: "uma" }] },
+  ]);
+  expect((await anyone("GET", `${dock}/pulls`)).data.pulls[0].comments).toBe(3);
+  // Settled by those in it; a stranger may not.
+  const wes = browser();
+  await wes("POST", "/signup", { username: "wes", password: "correct horse" });
+  expect((await wes("PATCH", `${threads}/1`, { resolved: true })).status).toBe(403);
+  expect((await vic("PATCH", `${threads}/1`, { resolved: true })).status).toBe(200);
+  pull = (await anyone("GET", `${dock}/pulls/1`)).data;
+  expect(pull.threads[0]).toMatchObject({ resolved: true, resolvedBy: "vic" });
+  // The branch moves on: a comment on a version of the file that is no longer there is outdated; one on the base's is not.
+  commit("ships.txt", "ketch\nschooner\nyawl\nbarque\nbrig\ncutter\n", "One more");
+  expect(git(work, "push", "-q", origin, "more").err).toBe("");
+  pull = (await anyone("GET", `${dock}/pulls/1`)).data;
+  expect(pull.threads.map((thread: any) => [thread.id, thread.outdated])).toEqual([[1, true], [2, false]]);
+  expect((await uma("POST", `${dock}/pulls/1/merge`, {})).status).toBe(200);
+  expect((await uma("POST", threads, { path: "ships.txt", side: "new", line: 1, body: "late" })).status).toBe(409);
+
+  // ---- The audit log: what was changed about access and settings, for those who own it.
+  expect((await uma("POST", `${dock}/rules`, { pattern: "main", approvals: 1 })).status).toBe(200);
+  expect((await uma("PATCH", dock, { private: true })).status).toBe(200);
+  expect((await anyone("POST", "/login", { username: "uma", password: "wrong" })).status).toBe(401);
+  expect((await vic("GET", `${dock}/audit`)).status).toBe(403);
+  const repoLog = (await uma("GET", `${dock}/audit`)).data.entries;
+  expect(repoLog.map((entry: any) => [entry.actor, entry.action])).toEqual([["uma", "repo.visibility"], ["uma", "rule.set"], ["uma", "pull.merge"], ["uma", "repo.create"]]);
+  expect(repoLog[1]).toMatchObject({ subject: "quay/dock", detail: { pattern: "main", approvals: 1, requirePulls: true } });
+  expect(repoLog[2].detail).toMatchObject({ number: 1, base: "main", head: "more", approvedBy: [] });
+  const orgLog = (await uma("GET", "/owners/quay/audit")).data.entries;
+  expect(orgLog.map((entry: any) => entry.action)).toEqual(["repo.visibility", "rule.set", "pull.merge", "member.set", "repo.create", "org.create"]);
+  expect(orgLog[3]).toMatchObject({ subject: "vic", detail: { role: "member" } });
+  expect((await vic("GET", "/owners/quay/audit")).status).toBe(404);
+  // One's own account: sign-ins, failed ones too, and tokens. Nobody else's.
+  const own = (await uma("GET", "/owners/uma/audit")).data.entries;
+  expect(own.map((entry: any) => [entry.actor, entry.action])).toEqual([[null, "account.sign-in-failed"], ["uma", "token.create"], ["uma", "account.create"]]);
+  expect((await vic("GET", "/owners/uma/audit")).status).toBe(404);
+  expect((await anyone("GET", "/owners/uma/audit")).status).toBe(401);
+  // A deleted repository stays in its owner's log.
+  expect((await uma("POST", "/repos", { owner: "quay", name: "gone" })).status).toBe(201);
+  expect((await uma("DELETE", "/repos/quay/gone")).status).toBe(200);
+  expect((await uma("GET", "/owners/quay/audit")).data.entries.slice(0, 2)).toMatchObject([{ action: "repo.delete", subject: "quay/gone" }, { action: "repo.create", subject: "quay/gone" }]);
+
+  // ---- Large files, with the real client where there is one.
+  if (!Bun.which("git-lfs")) {
+    console.warn("git-lfs is not installed: large files are not tested with it here");
+    return;
+  }
+  expect((await uma("PATCH", dock, { private: true })).status).toBe(200);
+  expect((await uma("DELETE", `${dock}/rules/${(await uma("GET", `${dock}/rules`)).data.rules[0].id}`)).status).toBe(200);
+  git(work, "checkout", "-q", "main");
+  git(work, "pull", "-q", origin, "main");
+  expect(git(work, "lfs", "install", "--local").ok).toBe(true);
+  git(work, "lfs", "track", "*.bin");
+  const large = crypto.getRandomValues(new Uint8Array(65536));
+  for (let i = 0; i < 4; i++) writeFileSync(join(work, "chart.bin"), large, { flag: i ? "a" : "w" });
+  const sum = new Bun.CryptoHasher("sha256").update(readFileSync(join(work, "chart.bin"))).digest("hex");
+  git(work, "add", ".");
+  git(work, "commit", "-q", "-m", "A chart");
+  const pushed = git(work, "push", "-q", origin, "main");
+  expect(pushed.err).toBe("");
+  // What git holds is the note; the hub shows it as one, and hands out the content when asked.
+  const noted = await uma("GET", `${dock}/blob?path=chart.bin`);
+  expect(noted.data).toContain(`oid sha256:${sum}`);
+  const cookie = (await signInAs("uma", "correct horse")).cookie;
+  const whole = await fetch(`${hub}/api${dock}/blob?path=chart.bin&resolve=1`, { headers: { cookie } });
+  expect(new Bun.CryptoHasher("sha256").update(await whole.arrayBuffer()).digest("hex")).toBe(sum);
+  expect((await anyone("GET", `${dock}/blob?path=chart.bin&resolve=1`)).status).toBe(404);
+
+  // A clone over SSH is told where to fetch the content, and is let in there with what it is given.
+  const path = join(tmp, "ssh-uma-lfs");
+  expect(Bun.spawnSync(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "uma", "-f", path]).exitCode).toBe(0);
+  expect((await uma("POST", "/keys", { key: readFileSync(`${path}.pub`, "utf8") })).status).toBe(201);
+  const smudge = ["-c", "filter.lfs.smudge=git-lfs smudge -- %f", "-c", "filter.lfs.process=git-lfs filter-process", "-c", "filter.lfs.required=true"];
+  const cloned = gitAs(path, tmp, ...smudge, "clone", "-q", `ssh://git@127.0.0.1:${sshPort}/quay/dock.git`, "dock-clone");
+  expect(cloned.err).toBe("");
+  expect(new Bun.CryptoHasher("sha256").update(readFileSync(join(tmp, "dock-clone/chart.bin"))).digest("hex")).toBe(sum);
+  // Someone who may not read the repository gets neither the note nor the content.
+  const stranger = gitWith({}, tmp, ...smudge, "clone", "-q", remote("wes:correct%20horse", "quay/dock"), "dock-stranger");
+  expect(stranger.ok).toBe(false);
+}, 60_000);
+
+/** A session as someone with a password, for requests the browser helper cannot make. */
+async function signInAs(username: string, password: string) {
+  const response = await fetch(`${hub}/api/login`, { method: "POST", headers: { origin: hub, "content-type": "application/json" }, body: JSON.stringify({ username, password }) });
+  return { cookie: response.headers.get("set-cookie")!.split(";")[0]! };
+}

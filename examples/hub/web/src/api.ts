@@ -53,6 +53,11 @@ export type Named = { name: string; oid: string; /** For a branch: whether a rul
 export type Rule = { id: number; pattern: string; noForce: boolean; noDelete: boolean; requirePulls: boolean; approvals: number; requireSigned: boolean; checks: string[] };
 export type Webhook = { id: number; url: string; events: string[]; active: boolean; hasSecret: boolean; createdAt: number; last: { state: "pending" | "delivered" | "failed"; status: number | null; error: string | null; time: number } | null };
 export type Status = { context: string; state: "pending" | "success" | "failure" | "error"; description: string; targetUrl: string; createdAt: number; creator: string | null };
+export type AuditEntry = { id: number; time: number; actor: string | null; action: string; subject: string; detail: Record<string, unknown> };
+export type Blame = { commit: string; path: string; lines: number; hunks: { start: number; lines: number; oid: string }[]; commits: Record<string, Commit>; truncated: boolean };
+export type CodeSearch = { commit: string; files: { path: string; matches: { line: number; text: string; cut: boolean }[]; more: boolean }[]; paths: string[]; matches: number; truncated: boolean };
+/** A conversation on a line of one of a pull request's files. */
+export type Thread = { id: number; path: string; side: "old" | "new"; line: number; outdated: boolean; resolved: boolean; resolvedBy: string | null; comments: { id: number; author: string; body: string; createdAt: number }[] };
 export type TeamSummary = { name: string; description: string; members: number; repos: number; ssoProvider: string | null; ssoGroup: string | null };
 export type TeamDetail = {
   org: string;
@@ -113,6 +118,7 @@ export type PullDetail = Pull & {
   mergeable: boolean | null;
   conflicts: string[];
   reviews: { id: number; author: string; state: "approved" | "changes_requested" | "commented"; body: string; createdAt: number; stale: boolean }[];
+  threads: Thread[];
   /** Each reviewer's last verdict. */
   reviewers: { author: string; state: "approved" | "changes_requested"; stale: boolean; counts: boolean }[];
   /** What was reported about its latest commit. */

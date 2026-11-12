@@ -1,6 +1,7 @@
 // Branch rules: what a branch asks of the changes that reach it, by push or
 // by merging a pull request. And commit statuses, which rules can ask for.
 import type { Hono } from "hono";
+import { auditRepo } from "./audit";
 import { fail, REPO, signedIn, text, type Env } from "./common";
 import { canWrite, db, now, type Repo } from "./db";
 import { strata, StrataError } from "./strata";
@@ -94,12 +95,16 @@ export function addRuleRoutes(api: Hono<Env>) {
          approvals = excluded.approvals, require_signed = excluded.require_signed, checks = excluded.checks`,
       [repo.id, pattern, body.noForce === false ? 0 : 1, body.noDelete === false ? 0 : 1, requirePulls ? 1 : 0, approvals, body.requireSigned ? 1 : 0, JSON.stringify(checks)],
     );
+    auditRepo(c, "rule.set", repo, { pattern, noForce: body.noForce !== false, noDelete: body.noDelete !== false, requirePulls, approvals, checks, requireSigned: !!body.requireSigned });
     return c.json({ rules: await rulesOf(repo) });
   });
 
   api.delete(`${REPO}/rules/:id`, (c) => {
     admin(c.get("level"));
-    db.run("DELETE FROM branch_rules WHERE id = ? AND repo_id = ?", [Number(c.req.param("id")), c.get("repo").id]);
+    const repo = c.get("repo");
+    const gone = db.query<{ pattern: string }, [number, string]>("SELECT pattern FROM branch_rules WHERE id = ? AND repo_id = ?").get(Number(c.req.param("id")), repo.id);
+    db.run("DELETE FROM branch_rules WHERE id = ? AND repo_id = ?", [Number(c.req.param("id")), repo.id]);
+    if (gone) auditRepo(c, "rule.remove", repo, { pattern: gone.pattern });
     return c.json({});
   });
 

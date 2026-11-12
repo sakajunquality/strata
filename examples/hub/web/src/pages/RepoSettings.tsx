@@ -2,6 +2,7 @@ import { App, Button, Card, Form, Input, Modal, Radio, Select, Typography } from
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api";
+import { AuditCard } from "./Audit";
 import type { RepoContext } from "./Repo";
 import { Access, BranchRules, Webhooks } from "./RepoRules";
 
@@ -70,6 +71,8 @@ export function RepoSettings(context: RepoContext) {
           <Button onClick={() => api(`${base}/mirror`, "DELETE").then(reload, (e) => message.error((e as Error).message))}>Stop mirroring</Button>
         </Card>
       )}
+
+      <AuditCard path={`${base}/audit`} about="this repository" />
 
       <Card title="Delete this repository" className="stack danger">
         <Typography.Paragraph>Its history and files are gone for good.</Typography.Paragraph>

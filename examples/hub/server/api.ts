@@ -3,6 +3,7 @@
 import { Hono, type Context } from "hono";
 import { csrf } from "hono/csrf";
 import { HTTPException } from "hono/http-exception";
+import { addAuditRoutes, audit, auditRepo } from "./audit";
 import { apiUser, checkPassword, createToken, endSession, sessionUser, startSession } from "./auth";
 import { fail, REPO, signedIn, text, type Env } from "./common";
 import { config, signInAt } from "./config";
@@ -19,7 +20,7 @@ import { addWebhookRoutes } from "./webhooks";
 export const api = new Hono<Env>();
 
 // Names that would collide with the UI's own routes.
-const RESERVED = new Set(["api", "hooks", "assets", "login", "signup", "new", "settings", "explore", "orgs"]);
+const RESERVED = new Set(["api", "hooks", "assets", "login", "signup", "new", "settings", "explore", "orgs", "search"]);
 const OWNER_NAME = /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$/;
 const REPO_NAME = /^[a-zA-Z0-9_-][a-zA-Z0-9._-]{0,99}$/;
 
@@ -45,7 +46,7 @@ api.use("*", async (c, next) => {
 
 api.onError((error, c) => {
   if (error instanceof HTTPException) return c.json({ error: error.message }, error.status);
-  if (error instanceof StrataError) return c.json({ error: error.message }, error.status as 400 | 404 | 409 | 502);
+  if (error instanceof StrataError) return c.json({ error: error.message }, error.status as 400 | 404 | 409 | 422 | 502);
   console.error(error);
   return c.json({ error: "something went wrong" }, 500);
 });
@@ -76,6 +77,7 @@ api.post("/signup", async (c) => {
   const hash = await Bun.password.hash(password);
   const { lastInsertRowid } = db.run("INSERT INTO owners (name, kind, display_name, password_hash, created_at) VALUES (?, 'user', ?, ?, ?)", [name, text(body.displayName, 100), hash, now()]);
   startSession(c, Number(lastInsertRowid));
+  audit(name, "account.create", { owner: Number(lastInsertRowid), subject: name }, { by: "password" });
   return c.json({ user: { name, displayName: text(body.displayName, 100) } }, 201);
 });
 
@@ -83,8 +85,14 @@ api.post("/login", async (c) => {
   if (!config.passwords) throw fail(403, "passwords are not used here");
   const body = await c.req.json();
   const user = await checkPassword(String(body.username ?? ""), String(body.password ?? ""));
-  if (!user) throw fail(401, "wrong user name or password");
+  if (!user) {
+    // Noted for the account that was tried, if there is one, for its owner to see.
+    const tried = ownerByName(String(body.username ?? ""));
+    if (tried?.kind === "user") audit(null, "account.sign-in-failed", { owner: tried.id, subject: tried.name }, { by: "password" });
+    throw fail(401, "wrong user name or password");
+  }
   startSession(c, user.id);
+  audit(user.name, "account.sign-in", { owner: user.id, subject: user.name }, { by: "password" });
   return c.json({ user: publicUser(user) });
 });
 
@@ -103,13 +111,16 @@ api.post("/tokens", async (c) => {
   const user = signedIn(c);
   const name = text((await c.req.json()).name, 100);
   if (!name) throw fail(400, "give the token a name");
+  audit(c, "token.create", { owner: user.id, subject: name });
   // Shown once; only its hash is kept.
   return c.json({ token: createToken(user.id, name) }, 201);
 });
 
 api.delete("/tokens/:id", (c) => {
   const user = signedIn(c);
+  const token = db.query<{ name: string }, [number, number]>("SELECT name FROM tokens WHERE id = ? AND user_id = ?").get(Number(c.req.param("id")), user.id);
   db.run("DELETE FROM tokens WHERE id = ? AND user_id = ?", [Number(c.req.param("id")), user.id]);
+  if (token) audit(c, "token.delete", { owner: user.id, subject: token.name });
   return c.json({});
 });
 
@@ -123,11 +134,15 @@ api.post("/keys", async (c) => {
   } catch (error) {
     throw fail(400, (error as Error).message);
   }
+  audit(c, "key.add", { owner: user.id, subject: text(body.title, 100) || "Key" });
   return c.json({}, 201);
 });
 
 api.delete("/keys/:id", (c) => {
-  removeKey(signedIn(c).id, Number(c.req.param("id")));
+  const user = signedIn(c);
+  const key = keysOf(user.id).find((key) => key.id === Number(c.req.param("id")));
+  removeKey(user.id, Number(c.req.param("id")));
+  if (key) audit(c, "key.remove", { owner: user.id, subject: key.title }, { fingerprint: key.fingerprint });
   return c.json({});
 });
 
@@ -156,6 +171,7 @@ api.post("/orgs", async (c) => {
   db.transaction(() => {
     const { lastInsertRowid } = db.run("INSERT INTO owners (name, kind, display_name, created_at) VALUES (?, 'org', ?, ?)", [name, text(body.displayName, 100), now()]);
     db.run("INSERT INTO members (org_id, user_id, role) VALUES (?, ?, 'owner')", [Number(lastInsertRowid), user.id]);
+    audit(c, "org.create", { owner: Number(lastInsertRowid), subject: name });
   })();
   return c.json({ name }, 201);
 });
@@ -191,6 +207,7 @@ api.put("/owners/:name/members/:username", async (c) => {
   if (role === "member" && roleIn(org.id, member.id) === "owner" && ownerCount(org.id) === 1) throw fail(409, "an organization needs at least one owner");
   // Set by hand, it is no longer a sign-in group's to take away.
   db.run("INSERT INTO members (org_id, user_id, role) VALUES (?, ?, ?) ON CONFLICT (org_id, user_id) DO UPDATE SET role = excluded.role, synced = 0", [org.id, member.id, role]);
+  audit(c, "member.set", { owner: org.id, subject: member.name }, { role });
   return c.json({});
 });
 
@@ -200,6 +217,7 @@ api.delete("/owners/:name/members/:username", (c) => {
   if (!member) throw fail(404, "no such user");
   if (roleIn(org.id, member.id) === "owner" && ownerCount(org.id) === 1) throw fail(409, "an organization needs at least one owner");
   removeMember(org.id, member.id);
+  audit(c, "member.remove", { owner: org.id, subject: member.name });
   return c.json({});
 });
 
@@ -212,6 +230,15 @@ const activityJson = (row: ActivityRow) => ({ id: row.id, owner: row.owner_name,
 const ACTIVITY = "SELECT activity.*, repos.name, owners.name AS owner_name FROM activity JOIN repos ON repos.id = activity.repo_id JOIN owners ON owners.id = repos.owner_id";
 
 api.get("/repos", (c) => c.json({ repos: visibleRepos(c.get("user")?.id ?? null).map(repoSummary) }));
+
+/** Repositories by a word in their name, their owner's or their description. */
+api.get("/search", (c) => {
+  const q = text(c.req.query("q"), 100);
+  if (!q) return c.json({ repos: [] });
+  const like = `%${q.replace(/[\\%_]/g, "\\$&")}%`;
+  const found = visibleRepos(c.get("user")?.id ?? null, "(repos.name LIKE ? ESCAPE '\\' OR owners.name LIKE ? ESCAPE '\\' OR repos.description LIKE ? ESCAPE '\\')", [like, like, like]);
+  return c.json({ repos: found.slice(0, 50).map(repoSummary) });
+});
 
 /** Pushes to the repositories the user owns or belongs to, newest first. */
 api.get("/activity", (c) => {
@@ -249,6 +276,7 @@ api.post("/repos", async (c) => {
     throw error;
   }
   if (source) requestSync(id);
+  audit(c, "repo.create", { owner: owner.id, repo: repoByPath(owner.name, name) }, { private: !!body.private, ...(source ? { mirror: source } : {}) });
   return c.json({ owner: owner.name, name }, 201);
 });
 
@@ -314,6 +342,7 @@ api.delete(`${REPO}/mirror`, (c) => {
   if (c.get("level") !== "admin") throw fail(403, "only the repository's owners can change its settings");
   db.run("DELETE FROM mirrors WHERE repo_id = ?", [found.id]);
   forget(found.id);
+  auditRepo(c, "repo.mirror-stop", found);
   return c.json({});
 });
 
@@ -329,12 +358,11 @@ api.patch(REPO, async (c) => {
     if (other && other.id !== found.id) throw fail(409, `${found.owner_name}/${name} already exists`);
   }
   // A rename happens here and nowhere else: Strata keeps serving the same id.
-  db.run("UPDATE repos SET name = ?, description = ?, private = ? WHERE id = ?", [
-    name,
-    body.description === undefined ? found.description : text(body.description, 300),
-    body.private === undefined ? found.private : body.private ? 1 : 0,
-    found.id,
-  ]);
+  const isPrivate = body.private === undefined ? found.private : body.private ? 1 : 0;
+  db.run("UPDATE repos SET name = ?, description = ?, private = ? WHERE id = ?", [name, body.description === undefined ? found.description : text(body.description, 300), isPrivate, found.id]);
+  if (name !== found.name) auditRepo(c, "repo.rename", found, { to: name });
+  if (isPrivate !== found.private) auditRepo(c, "repo.visibility", found, { private: !!isPrivate });
+  if (body.defaultBranch !== undefined) auditRepo(c, "repo.default-branch", found, { branch: String(body.defaultBranch) });
   return c.json({ owner: found.owner_name, name });
 });
 
@@ -344,27 +372,52 @@ api.delete(REPO, async (c) => {
   // Gone from the hub first: from then on nobody is let through to it.
   db.run("DELETE FROM repos WHERE id = ?", [found.id]);
   forget(found.id);
+  auditRepo(c, "repo.delete", found);
   await strata.remove(found.id).catch((error) => console.error(`repository ${found.id} is left behind in Strata:`, error));
   return c.json({});
 });
 
+/** A branch's history; with `path`, that of one file or directory. */
 api.get(`${REPO}/commits`, async (c) => {
   const skip = Math.max(0, Number(c.req.query("skip")) || 0);
-  const page = await strata.commits(c.get("repo").id, c.req.query("rev") ?? "", skip, 30);
+  const page = await strata.commits(c.get("repo").id, c.req.query("rev") ?? "", skip, 30, c.req.query("path"));
   return c.json({ ...page, commits: await withVerification(page.commits) });
+});
+
+/** For each line of a file, the commit that last changed it. */
+api.get(`${REPO}/blame`, async (c) => c.json(await strata.blame(c.get("repo").id, c.req.query("rev") ?? "", c.req.query("path") ?? "")));
+
+/** Where some text stands in the files of a revision. */
+api.get(`${REPO}/search`, async (c) => {
+  const { q, rev, path, regex, case: exact } = c.req.query();
+  return c.json(await strata.search(c.get("repo").id, { q, rev, path, regex: regex ? "1" : undefined, case: exact ? "1" : undefined }));
 });
 
 api.get(`${REPO}/commit`, async (c) => c.json((await withVerification([await strata.commit(c.get("repo").id, c.req.query("rev") ?? "")]))[0]));
 
 api.get(`${REPO}/tree`, async (c) => c.json(await strata.tree(c.get("repo").id, c.req.query("rev") ?? "", c.req.query("path") ?? "")));
 
+/** What a Git LFS pointer file says, if the text is one. */
+function lfsPointer(text: string): { oid: string; size: number } | null {
+  if (!text.startsWith("version https://git-lfs.github.com/spec/v1\n")) return null;
+  const oid = /^oid sha256:([0-9a-f]{64})$/m.exec(text)?.[1];
+  const size = /^size (\d+)$/m.exec(text)?.[1];
+  return oid && size ? { oid, size: Number(size) } : null;
+}
+
 const IMAGES: Record<string, string> = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml", ico: "image/x-icon" };
 
 /** A file's bytes, by path at a revision or by object id. */
 api.get(`${REPO}/blob`, async (c) => {
-  const { rev, path, oid, download } = c.req.query();
-  const response = await strata.blob(c.get("repo").id, oid ? { oid } : { rev, path });
+  const { rev, path, oid, download, resolve } = c.req.query();
+  let response = await strata.blob(c.get("repo").id, oid ? { oid } : { rev, path });
   const name = (path ?? "").split("/").pop() || "file";
+  if (resolve) {
+    // What git holds for a large file is a note saying where its content is. Asked to, the content is given instead.
+    const noted = await response.arrayBuffer();
+    const pointer = noted.byteLength < 1024 ? lfsPointer(new TextDecoder().decode(noted)) : null;
+    response = pointer ? await strata.lfs(c.get("repo").id, pointer.oid) : new Response(noted);
+  }
   const headers = new Headers({
     "content-type": IMAGES[name.split(".").pop()?.toLowerCase() ?? ""] ?? "application/octet-stream",
     // Pushed content is untrusted: it must never run with the hub's origin.
@@ -384,3 +437,4 @@ api.get(`${REPO}/activity`, (c) => {
 addPullRoutes(api);
 addRuleRoutes(api);
 addWebhookRoutes(api);
+addAuditRoutes(api);
