@@ -17,7 +17,7 @@ RUN bun run build
 # What the server needs at run time, without the UI's build tools.
 RUN rm -rf node_modules && bun install --frozen-lockfile --production
 
-FROM litestream/litestream@sha256:f45ca298a567bef6edd23d43429b5f80721473a9a9719e467f11d7888999403e AS litestream
+FROM litestream/litestream@sha256:0ba1cdbb2d0be8876e27b1e646dc031309b7e3928e0ed91503ebaa73ff7e2c5d AS litestream
 
 FROM oven/bun:1-slim
 # git fetches mirrors; certificates are for Strata, sign-in providers and webhooks over TLS.
