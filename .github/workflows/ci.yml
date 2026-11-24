@@ -16,7 +16,7 @@ jobs:
   engine:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -42,7 +42,7 @@ jobs:
             run: scripts/s3-smoke.sh
     name: backends (${{ matrix.name }})
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install stable --profile minimal && rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -56,7 +56,7 @@ jobs:
       run:
         working-directory: examples/hub
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install stable --profile minimal && rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -73,7 +73,7 @@ jobs:
   images:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: docker build -t strata .
       - run: docker run --rm strata --help
       - run: docker build -t strata-hub examples/hub
