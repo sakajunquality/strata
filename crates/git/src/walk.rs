@@ -145,8 +145,8 @@ impl Filter {
                 "tag" => ObjectKind::Tag,
                 _ => return None,
             };
-            for slot in 0..4 {
-                self.omitted_kinds[slot] |= slot != kind_slot(kind);
+            for (slot, omitted) in self.omitted_kinds.iter_mut().enumerate() {
+                *omitted |= slot != kind_slot(kind);
             }
         } else if let Some(name) = spec.strip_prefix("sparse:oid=") {
             if name.is_empty() {
