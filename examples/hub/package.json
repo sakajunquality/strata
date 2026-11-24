@@ -1,6 +1,7 @@
 {
   "name": "strata-hub",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "bun run scripts/dev.ts",
