@@ -1,0 +1,36 @@
+# Looks for known vulnerabilities in what the engine and the hub depend on:
+# every week, and whenever a lockfile changes.
+name: audit
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  push:
+    branches: [main]
+    paths: ["Cargo.lock", "examples/hub/bun.lock", ".github/workflows/audit.yml"]
+  pull_request:
+    paths: ["Cargo.lock", "examples/hub/bun.lock", ".github/workflows/audit.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
+  bun:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/hub
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - run: bun audit
