@@ -6,7 +6,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use moka::sync::Cache;
 use object_store::path::Path;
-use object_store::{ObjectStore, WriteMultipart};
+use object_store::{ObjectStore, ObjectStoreExt, WriteMultipart};
 use strata_git::{CommitGraph, Object, ObjectCache, ObjectKind, PackBitmaps, PackData, PackFile, PackIndex, PackSet};
 use tokio::runtime::Handle;
 use tokio_stream::StreamExt;
@@ -73,7 +73,7 @@ impl PackData for RemotePack {
         let bytes = blocks
             .cache
             .try_get_with((self.id, block), || {
-                blocks.runtime.block_on(blocks.store.get_range(&self.path, start as usize..end as usize))
+                blocks.runtime.block_on(blocks.store.get_range(&self.path, start..end))
             })
             .map_err(|e| strata_git::Error::Io(format!("reading {}: {e}", self.path)))?;
         Ok(bytes.slice((offset - start) as usize..))
@@ -319,7 +319,7 @@ impl PackStore {
         let store = &self.blocks.store;
         let idx = store.get(&object_path(pool_id, pack_id, INDEX)).await.context("downloading pack index")?;
         let index = PackIndex::decode(idx.bytes().await?)?;
-        let size = store.head(&object_path(pool_id, pack_id, PACK)).await.context("locating pack")?.size as u64;
+        let size = store.head(&object_path(pool_id, pack_id, PACK)).await.context("locating pack")?.size;
         let graph = self.optional(&object_path(pool_id, pack_id, GRAPH)).await?.map(CommitGraph::decode).transpose()?;
         let bitmaps = self.optional(&object_path(pool_id, pack_id, BITMAP)).await?.map(PackBitmaps::decode).transpose()?;
         self.remote(pool_id, pack_id, size, index, graph, bitmaps)
@@ -366,7 +366,7 @@ impl PackStore {
     /// The size of a large file kept for a pool (Git LFS), or `None` if it is not there.
     pub async fn lfs_size(&self, pool_id: &str, oid: &str) -> anyhow::Result<Option<u64>> {
         match self.blocks.store.head(&lfs_path(pool_id, oid)).await {
-            Ok(meta) => Ok(Some(meta.size as u64)),
+            Ok(meta) => Ok(Some(meta.size)),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e).with_context(|| format!("looking for large file {oid}")),
         }

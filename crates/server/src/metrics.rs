@@ -14,10 +14,12 @@ use bytes::Bytes;
 use futures_core::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult, UploadPart,
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    UploadPart,
 };
 use prometheus::{Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
 use strata_store::{Event, Garbage, MetaError, MetaStore, RefScope, RepoState, Txn};
+use tokio_stream::StreamExt;
 
 /// From a ref lookup to a large clone or compaction.
 const SECONDS: &[f64] = &[0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0, 1800.0];
@@ -328,20 +330,24 @@ impl fmt::Display for MeteredStore {
     }
 }
 
+/// How a call to the object store ended, as a label.
+fn store_outcome<T>(result: &object_store::Result<T>) -> &'static str {
+    match result {
+        Ok(_) => "ok",
+        // Asked for on purpose, to learn whether something is there.
+        Err(object_store::Error::NotFound { .. }) => "not_found",
+        Err(_) => "error",
+    }
+}
+
 impl MeteredStore {
     fn done<T>(&self, op: &str, started: Instant, result: object_store::Result<T>) -> object_store::Result<T> {
-        let outcome = match &result {
-            Ok(_) => "ok",
-            // Asked for on purpose, to learn whether something is there.
-            Err(object_store::Error::NotFound { .. }) => "not_found",
-            Err(_) => "error",
-        };
-        self.metrics.called(&self.metrics.store, &self.metrics.store_seconds, op, outcome, started);
+        self.metrics.called(&self.metrics.store, &self.metrics.store_seconds, op, store_outcome(&result), started);
         result
     }
 
-    fn read(&self, bytes: usize) {
-        self.metrics.store_bytes.with_label_values(&["read"]).inc_by(bytes as u64);
+    fn read(&self, bytes: u64) {
+        self.metrics.store_bytes.with_label_values(&["read"]).inc_by(bytes);
     }
 
     fn written(&self, bytes: usize) {
@@ -360,41 +366,49 @@ impl ObjectStore for MeteredStore {
         result
     }
 
-    async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOpts) -> object_store::Result<Box<dyn MultipartUpload>> {
+    async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> object_store::Result<Box<dyn MultipartUpload>> {
         let started = Instant::now();
         let upload = self.done("put_multipart", started, self.inner.put_multipart_opts(location, opts).await)?;
         Ok(Box::new(MeteredUpload { inner: upload, metrics: self.metrics.clone() }))
     }
 
+    // Reading a range and asking whether something is there both arrive
+    // here; they keep the names they have always been counted under.
     async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
         let started = Instant::now();
-        let result = self.done("get", started, self.inner.get_opts(location, options).await);
-        if let Ok(got) = &result {
+        let (head, op) = match (options.head, options.range.is_some()) {
+            (true, _) => (true, "head"),
+            (false, true) => (false, "get_range"),
+            (false, false) => (false, "get"),
+        };
+        let result = self.done(op, started, self.inner.get_opts(location, options).await);
+        if let (false, Ok(got)) = (head, &result) {
             self.read(got.range.end.saturating_sub(got.range.start));
         }
         result
     }
 
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> object_store::Result<Bytes> {
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> object_store::Result<Vec<Bytes>> {
         let started = Instant::now();
-        let result = self.done("get_range", started, self.inner.get_range(location, range).await);
-        if let Ok(bytes) = &result {
-            self.read(bytes.len());
+        let result = self.done("get_range", started, self.inner.get_ranges(location, ranges).await);
+        if let Ok(parts) = &result {
+            self.read(parts.iter().map(|part| part.len() as u64).sum());
         }
         result
     }
 
-    async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
-        let started = Instant::now();
-        self.done("head", started, self.inner.head(location).await)
+    fn delete_stream(&self, locations: BoxStream<'static, object_store::Result<Path>>) -> BoxStream<'static, object_store::Result<Path>> {
+        let metrics = self.metrics.clone();
+        // Each deletion is timed from the one before it.
+        let mut started = Instant::now();
+        Box::pin(self.inner.delete_stream(locations).map(move |result| {
+            metrics.called(&metrics.store, &metrics.store_seconds, "delete", store_outcome(&result), started);
+            started = Instant::now();
+            result
+        }))
     }
 
-    async fn delete(&self, location: &Path) -> object_store::Result<()> {
-        let started = Instant::now();
-        self.done("delete", started, self.inner.delete(location).await)
-    }
-
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         self.metrics.store.with_label_values(&["list", "ok"]).inc();
         self.inner.list(prefix)
     }
@@ -404,14 +418,9 @@ impl ObjectStore for MeteredStore {
         self.done("list", started, self.inner.list_with_delimiter(prefix).await)
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> object_store::Result<()> {
         let started = Instant::now();
-        self.done("copy", started, self.inner.copy(from, to).await)
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
-        let started = Instant::now();
-        self.done("copy", started, self.inner.copy_if_not_exists(from, to).await)
+        self.done("copy", started, self.inner.copy_opts(from, to, options).await)
     }
 }
 
