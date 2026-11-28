@@ -90,10 +90,12 @@ multipart uploads.
 ### As a container
 
 The server is published as an image for amd64 and arm64, one tag for each
-version: `ghcr.io/sakajunquality/strata:v0.1.0`. It listens on
-`0.0.0.0:8080` and takes the same flags and `STRATA_*` settings as the
-binary; [examples/k8s](examples/k8s) and [examples/cloud-run](examples/cloud-run)
-run it that way. Each image is attested to have been built here:
+version: `ghcr.io/sakajunquality/strata:v0.1.0`. It takes the same flags
+and `STRATA_*` settings as the binary, as [examples/k8s](examples/k8s) and
+[examples/cloud-run](examples/cloud-run) give them. Started without
+arguments it is given `--listen 0.0.0.0:8080`, which `STRATA_LISTEN` does not
+change: to listen elsewhere, pass `--listen` yourself. Each image is attested
+to have been built here:
 
 ```sh
 gh attestation verify oci://ghcr.io/sakajunquality/strata:v0.1.0 --repo sakajunquality/strata

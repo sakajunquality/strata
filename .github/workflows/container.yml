@@ -61,6 +61,9 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      # Only to stop early: before the first image there is no repository to
+      # ask, so a lookup that fails is let through here. The one that decides
+      # is made before the tag is given, and stops unless the answer is no.
       - name: Refuse to replace a published version
         run: |
           if docker buildx imagetools inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
@@ -141,8 +144,10 @@ jobs:
         env:
           DIGEST: ${{ steps.index.outputs.digest }}
         run: |
-          if docker buildx imagetools inspect "$IMAGE:$VERSION" >/dev/null 2>&1; then
+          if found="$(docker buildx imagetools inspect "$IMAGE:$VERSION" 2>&1)"; then
             echo "::error::$IMAGE:$VERSION is already published"; exit 1
+          elif ! grep -qi "not found" <<<"$found"; then
+            echo "::error::could not tell whether $IMAGE:$VERSION is published: $found"; exit 1
           fi
           docker buildx imagetools create -t "$IMAGE:$VERSION" "$IMAGE@$DIGEST"
           tagged="$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)"
